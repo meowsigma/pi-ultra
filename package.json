@@ -1,0 +1,25 @@
+{
+  "name": "pi-ultra",
+  "version": "0.1.0",
+  "description": "Configurable parallel worker waves for Pi: /ultra launches bounded implementation lanes, binds models via named agents, and keeps the manager as auditor.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "subagents",
+    "prompt-template"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "prompts",
+    "examples",
+    "README.md"
+  ],
+  "pi": {
+    "prompts": ["./prompts"]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/meowsigma/pi-ultra.git"
+  }
+}
