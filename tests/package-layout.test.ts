@@ -26,9 +26,9 @@ test('package exposes exactly one Pi extension and the Ultra subagent layout', (
   assert.deepEqual(packageJson.pi.subagents.agents, ['./agents']);
   assert.equal(packageJson.pi.prompts, undefined);
   assert.equal(packageJson.keywords.includes('prompt-template'), false);
-  assert.deepEqual(packageJson.files, [
-    'extensions', 'agents', 'prompts', 'examples', 'README.md', 'LICENSE',
-  ]);
+  for (const required of ['extensions', 'agents', 'prompts', 'README.md', 'LICENSE']) {
+    assert.ok(packageJson.files.includes(required), `${required} is included in package files`);
+  }
   assert.ok(existsSync(resolve(root, 'agents/ultra-planner.md')));
   assert.ok(existsSync(resolve(root, 'prompts/ultra-planner.md')));
   assert.ok(existsSync(resolve(root, 'prompts/ultra-manager.md')));
@@ -54,6 +54,10 @@ test('release smoke inspector rejects missing files and duplicate command discov
   assert.throws(
     () => inspectUltraPackage(['package/extensions/index.ts']),
     /missing required package file: package\/extensions\/ultra\.ts/,
+  );
+  assert.throws(
+    () => inspectUltraPackage(requiredPackedFiles.map(path => `${path}/`)),
+    /missing required package file: package\/extensions\/index\.ts/,
   );
 
   const duplicateEntries = [

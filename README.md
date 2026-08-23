@@ -32,7 +32,7 @@ Lane bounds are inclusive `1`–`8`; the default is `2`–`4`. Choose lanes from
 - `/ultra help` shows command usage.
 - `/ultra <task>` explicitly asks Ultra to assess and, when appropriate, run a wave.
 
-When disabled, an explicit task is not delegated and reports that `/ultra on` is required. Passive input is also left to the main session unchanged. Passive eligibility is deliberately conservative: commands, social conversation, and ordinary prose bypass Ultra; only implementation-shaped requests are considered. A considered request that does not qualify for a wave is returned to the main session instead of forcing delegation.
+When disabled, an explicit task is not delegated and reports that `/ultra on` is required. Passive input is also left to the main session unchanged. Passive eligibility is deliberately conservative: commands and social conversation bypass Ultra; only requests matching implementation-oriented signals are considered. This heuristic can conservatively miss unusual coding requests and may consider generic technical prose, which is returned to the main session when it does not qualify for a wave. A considered request that does not qualify for a wave is returned to the main session instead of forcing delegation.
 
 A fleet is logical rather than a standing worker pool: only planned lanes are launched, so no idle paid workers are kept alive.
 

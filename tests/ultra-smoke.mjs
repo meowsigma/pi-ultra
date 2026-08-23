@@ -14,7 +14,9 @@ const STALE_PROMPT = 'package/prompts/ultra.md';
 const ULTRA_COMMAND = /\bregisterCommand\s*\(\s*(['"`])ultra\1/g;
 
 function normalizeEntry(entry) {
-  return entry.replace(/^\.\//u, '').replace(/\/+$/u, '');
+  // Preserve a trailing slash: tar uses it to identify directory entries, and
+  // a directory must never satisfy a required regular-file check.
+  return entry.replace(/^\.\//u, '');
 }
 
 /**
