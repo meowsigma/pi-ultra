@@ -29,6 +29,8 @@ test('bundled Ultra API and a distinct active-extension copy share one authority
       const admitted = await activeApi.authorizeSubagentLaunch({ sessionId, params, permits: [token], domain: 'rpc.spawn' });
       assert.equal(admitted.ok, true);
       assert.equal(admitted.authorities[0]?.source, 'pi-ultra');
+      const committed = await admitted.commit([{ key: 'a', agent: 'ultra-scout', modelCandidates: ['openai/test'], launchContractDigest: 'a'.repeat(64) }]);
+      assert.equal(committed.ok, true);
     } finally {
       authority.dispose();
     }

@@ -378,6 +378,7 @@ export async function launchUltraWave(input: {
   authority: UltraLaunchAuthorityHandle;
   prepared: UltraPreparedWave;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }): Promise<unknown> {
   const timeoutMs = input.timeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) throw new Error('RPC timeout must be a positive integer no greater than 60000ms.');
@@ -390,6 +391,10 @@ export async function launchUltraWave(input: {
     maxLanes: input.prepared.settings.maxLanes,
     lanes: permitManifest(input.prepared),
   });
+  if (input.signal?.aborted) {
+    input.authority.revokeUnused();
+    throw input.signal.reason instanceof Error ? input.signal.reason : new Error('Ultra launch aborted.');
+  }
   const requestId = randomUUID();
   const replyEvent = subagentRpcReply(requestId);
   return new Promise((resolve, reject) => {
@@ -399,13 +404,23 @@ export async function launchUltraWave(input: {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      input.signal?.removeEventListener('abort', abort);
       if (typeof dispose === 'function') dispose();
       callback();
+    };
+    const abort = () => {
+      input.authority.revokeUnused();
+      finish(() => reject(input.signal?.reason instanceof Error ? input.signal.reason : new Error('Ultra launch aborted.')));
     };
     const timer = setTimeout(() => {
       input.authority.revokeUnused();
       finish(() => reject(new Error(`Subagent spawn RPC timed out after ${timeoutMs}ms.`)));
     }, timeoutMs);
+    input.signal?.addEventListener('abort', abort, { once: true });
+    if (input.signal?.aborted) {
+      abort();
+      return;
+    }
     dispose = input.events.on(replyEvent, (payload) => {
       if (!isRecord(payload) || payload.requestId !== requestId) return;
       if (payload.version !== 1 || (payload.method !== undefined && payload.method !== 'spawn')) {

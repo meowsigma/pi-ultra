@@ -45,7 +45,8 @@ test('module exports all required symbols', async () => {
 
   assert.equal(typeof ultra.normalizeUltraSettings, 'function');
   assert.equal(typeof ultra.loadUltraSettings, 'function');
-  assert.equal(typeof ultra.saveUltraSettings, 'function');
+  assert.equal(typeof ultra.saveUltraSettings, 'undefined');
+  assert.equal(typeof ultra.updateUltraSettings, 'function');
   assert.equal(typeof ultra.effectiveUniformModel, 'function');
   assert.equal(typeof ultra.UltraSettings, 'undefined'); // interface only
 });
@@ -234,119 +235,37 @@ test('loadUltraSettings returns kind:invalid for invalid shape (bad version)', a
   await rm(dir, { recursive: true, force: true });
 });
 
-// ── SAVE – REJECT INVALID INPUT ───────────────────────────────────
-test('saveUltraSettings rejects invalid settings', async () => {
+// ── TRANSACTIONAL UPDATE VALIDATION ───────────────────────────────
+test('updateUltraSettings rejects invalid patches and preserves invalid files', async () => {
   await loadUltraModule();
-  const { saveUltraSettings } = ultra;
-
-  const dir = await tmpDir();
-  await assert.rejects(() => saveUltraSettings({ version: 99 } as any, join(dir, 'pi-ultra.json')));
-  await assert.rejects(() => saveUltraSettings({ enabled: 'yes' } as any, join(dir, 'pi-ultra.json')));
-  await assert.rejects(() => saveUltraSettings({ minLanes: 0 } as any, join(dir, 'pi-ultra.json')));
-  await rm(dir, { recursive: true, force: true });
-});
-
-// ── SAVE – REJECT SAVE OVER INVALID FILE ──────────────────────────
-test('saveUltraSettings rejects saving over invalid existing file', async () => {
-  await loadUltraModule();
-  const { saveUltraSettings } = ultra;
-
+  const { updateUltraSettings } = ultra;
   const dir = await tmpDir();
   const p = join(dir, 'pi-ultra.json');
+  await assert.rejects(() => updateUltraSettings({ version: 99 } as any, p));
+  await assert.rejects(() => updateUltraSettings({ enabled: 'yes' } as any, p));
+  await assert.rejects(() => updateUltraSettings({ minLanes: 0 } as any, p));
   await writeFile(p, 'broken json{{{');
-
-  await assert.rejects(() => saveUltraSettings({ enabled: true } as any, p));
-
-  // Original bytes preserved
-  const bytes = await readFile(p, 'utf8');
-  assert.equal(bytes, 'broken json{{{');
+  await assert.rejects(() => updateUltraSettings({ enabled: true }, p));
+  assert.equal(await readFile(p, 'utf8'), 'broken json{{{');
   await rm(dir, { recursive: true, force: true });
 });
 
-// ── SAVE – REJECT OVER INVALID SHAPE ──────────────────────────────
-test('saveUltraSettings rejects saving over invalid-shape file', async () => {
+test('transactional update then load returns committed settings and preserves unknown fields', async () => {
   await loadUltraModule();
-  const { saveUltraSettings } = ultra;
-
-  const dir = await tmpDir();
-  const p = await writeSettings(dir, { version: 99, enabled: true, routingMode: 'uniform' });
-
-  await assert.rejects(() => saveUltraSettings({ enabled: false } as any, p));
-
-  // File unchanged
-  const saved = JSON.parse(await readFile(p, 'utf8'));
-  assert.equal(saved.version, 99);
-  await rm(dir, { recursive: true, force: true });
-});
-
-// ── SAVE -> LOAD CYCLE ────────────────────────────────────────────
-test('save then load yields loaded with saved settings (false)', async () => {
-  await loadUltraModule();
-  const { saveUltraSettings, loadUltraSettings } = ultra;
-
+  const { updateUltraSettings, loadUltraSettings } = ultra;
   const dir = await tmpDir();
   const p = join(dir, 'pi-ultra.json');
-  await saveUltraSettings({ enabled: false, routingMode: 'uniform', minLanes: 1, maxLanes: 3, workerModel: 'openai/gpt-4o' }, p);
-
+  await writeFile(p, JSON.stringify({
+    version: 1, enabled: true, routingMode: 'role-defaults', minLanes: 2, maxLanes: 4,
+    customField: 'keep-me', anotherExtra: { nested: true },
+  }));
+  await updateUltraSettings({ enabled: false, routingMode: 'uniform', minLanes: 1, maxLanes: 3, workerModel: 'openai/gpt-4o' }, p);
   const result = await loadUltraSettings(p);
   assert.equal(result.kind, 'loaded');
-  assert.equal(result.settings.enabled, false);
-  assert.equal(result.settings.routingMode, 'uniform');
-  assert.equal(result.settings.minLanes, 1);
-  assert.equal(result.settings.maxLanes, 3);
-  assert.equal(result.settings.workerModel, 'openai/gpt-4o');
-  await rm(dir, { recursive: true, force: true });
-});
-
-// ── SAVE PRESERVES UNKNOWN TOP-LEVEL FIELDS ───────────────────────
-test('save preserves unknown top-level fields while replacing Ultra fields', async () => {
-  await loadUltraModule();
-  const { saveUltraSettings, loadUltraSettings } = ultra;
-
-  const dir = await tmpDir();
-  const p = join(dir, 'pi-ultra.json');
-
-  await writeFile(p, JSON.stringify({
-    version: 1,
-    enabled: true,
-    routingMode: 'role-defaults',
-    minLanes: 2,
-    maxLanes: 4,
-    customField: 'keep-me',
-    anotherExtra: { nested: true },
-  }));
-
-  await saveUltraSettings({ enabled: false, routingMode: 'uniform', minLanes: 1, maxLanes: 3 }, p);
-
+  assert.deepEqual(result.settings, { version: 1, enabled: false, routingMode: 'uniform', minLanes: 1, maxLanes: 3, workerModel: 'openai/gpt-4o' });
   const saved = JSON.parse(await readFile(p, 'utf8'));
-  assert.equal(saved.enabled, false);
   assert.equal(saved.customField, 'keep-me');
   assert.deepEqual(saved.anotherExtra, { nested: true });
-  assert.equal(saved.version, 1);
-  await rm(dir, { recursive: true, force: true });
-});
-
-// ── CONCURRENT SAVES ──────────────────────────────────────────────
-test('Promise.all two saves leaves parseable normalized JSON', async () => {
-  await loadUltraModule();
-  const { saveUltraSettings, loadUltraSettings } = ultra;
-
-  const dir = await tmpDir();
-  const p = join(dir, 'pi-ultra.json');
-
-  await Promise.all([
-    saveUltraSettings({ enabled: true, routingMode: 'uniform', minLanes: 2, maxLanes: 6, workerModel: 'provider/model-a' }, p),
-    saveUltraSettings({ enabled: false, routingMode: 'role-defaults', minLanes: 3, maxLanes: 5, workerModel: 'provider/model-b' }, p),
-  ]);
-
-  const content = await readFile(p, 'utf8');
-  const parsed = JSON.parse(content);
-  assert.equal(typeof parsed, 'object');
-  assert.ok(parsed.version === 1);
-  assert.equal(typeof parsed.enabled, 'boolean');
-
-  const result = await loadUltraSettings(p);
-  assert.equal(result.kind, 'loaded');
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -439,6 +358,18 @@ test('invalid files expose no executable defaults and explicit recovery preserve
   assert.equal(loaded.kind, 'loaded');
   assert.equal(loaded.settings.enabled, false);
   assert.equal(existsSync(`${p}.lock`), false);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test('recovery preserves invalid UTF-8 bytes exactly', async () => {
+  await loadUltraModule();
+  const { backupAndResetUltraSettings } = ultra;
+  const dir = await tmpDir();
+  const p = join(dir, 'pi-ultra.json');
+  const bytes = Buffer.from([0x7b, 0x22, 0xff, 0x00, 0x7d]);
+  await writeFile(p, bytes);
+  const recovery = await backupAndResetUltraSettings(p);
+  assert.deepEqual(await readFile(recovery.backupPath), bytes);
   await rm(dir, { recursive: true, force: true });
 });
 

@@ -14,6 +14,7 @@ import {
   showUltraMenu,
   type UltraMenuContext,
 } from '../extensions/ultra-menu.js';
+import { UltraSettingsCleanupError } from '../extensions/ultra-config.js';
 import type { LoadUltraSettingsResult, UltraSettings, UltraSettingsPatch } from '../extensions/ultra-config.js';
 
 const SETTINGS: UltraSettings = {
@@ -44,14 +45,15 @@ function rpcContext(rpc: RpcHarness, models: PiModel[] = []) {
   return { ctx, notifications };
 }
 
-function tuiContext(tui: TuiHarness, models: PiModel[] = [], input?: string, confirm = true) {
+function tuiContext(tui: TuiHarness, models: PiModel[] = [], input?: string | Array<string | undefined>, confirm = true) {
   const notifications: string[] = [];
+  const drafts = Array.isArray(input) ? [...input] : [input];
   const ctx: UltraMenuContext = {
     mode: 'tui', hasUI: true, model: undefined, scopedModels: [],
     modelRegistry: { getAvailable: () => models },
     ui: {
       custom: tui.custom,
-      input: async () => input,
+      input: async () => drafts.shift(),
       select: async () => undefined,
       confirm: async () => confirm,
       notify: (message) => notifications.push(message),
@@ -112,6 +114,11 @@ test('full registry catalog deduplicates deterministically and unions searchable
   assert.deepEqual(forward, reverse);
   assert.deepEqual(forward.map((entry) => entry.id), ['openai/model-a', 'zeta/m']);
   assert.match(forward[0]?.searchText ?? '', /openai.*model-a.*Alpha.*Alternate/);
+  assert.deepEqual(buildModelCatalog([
+    { provider: 'p', id: 'é', name: 'é' },
+    { provider: 'p', id: 'Z', name: 'Z' },
+    { provider: 'p', id: 'a', name: 'a' },
+  ]).map((entry) => entry.id), ['p/Z', 'p/a', 'p/é']);
 });
 
 test('model ChoiceScreen enables fuzzy search, bounds viewport, saves raw ids, and recovers unavailable selection', () => {
@@ -169,10 +176,10 @@ test('preset selection performs one paired update transaction', async () => {
   assert.deepEqual(updates.patches, [{ minLanes: 4, maxLanes: 8 }]);
 });
 
-test('invalid custom draft causes zero saves while valid draft saves one pair', async () => {
-  for (const [draft, expected] of [['bad', []], ['3–6', [{ minLanes: 3, maxLanes: 6 }]]] as const) {
+test('invalid custom draft remains available for correction and saves exactly one valid pair', async () => {
+  for (const [drafts, expected] of [[['bad', undefined], []], [['bad', '3–6'], [{ minLanes: 3, maxLanes: 6 }]]] as const) {
     const tui = createTuiHarness({ width: 50, rows: 10 });
-    const { ctx } = tuiContext(tui, [], draft);
+    const { ctx } = tuiContext(tui, [], [...drafts]);
     const updates = updater();
     const running = showUltraMenu({ ctx, state: VALID, update: updates.update, recover: async () => assert.fail('not blocked') });
     await tui.waitForOpen();
@@ -190,7 +197,7 @@ test('invalid custom draft causes zero saves while valid draft saves one pair', 
     tui.press('tui.select.confirm');
     await tui.waitForPending();
     await tui.waitForOpen();
-    assert.deepEqual(updates.patches, expected, draft);
+    assert.deepEqual(updates.patches, expected, JSON.stringify(drafts));
     tui.press('ctrl+c');
     await running;
   }
@@ -219,6 +226,24 @@ test('TUI fuzzy search filters a large catalog and remains usable at narrow widt
   assert.match(tui.render().join('\n'), /no match/i);
   tui.press('ctrl+c');
   await running;
+});
+
+test('committed cleanup errors refresh menu state instead of rolling back the displayed value', async () => {
+  const rpc = createRpcHarness([
+    { kind: 'select', response: 'Disable Ultra' },
+    { kind: 'select', response: 'Close' },
+  ]);
+  const { ctx, notifications } = rpcContext(rpc);
+  const committed = { kind: 'loaded' as const, settings: { ...SETTINGS, enabled: false }, revision: 'r2', path: '/tmp/pi-ultra.json' };
+  await showUltraMenu({
+    ctx,
+    state: VALID,
+    update: async () => { throw new UltraSettingsCleanupError('committed but cleanup failed', committed); },
+    recover: async () => assert.fail('not blocked'),
+  });
+  rpc.assertConsumed();
+  assert.match(rpc.dialogs[1]?.title ?? '', /Ultra: Disabled/);
+  assert.match(notifications[0] ?? '', /cleanup failed/i);
 });
 
 test('blocked recovery confirms, calls backup/reset once, and reports backup path', async () => {

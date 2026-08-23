@@ -44,7 +44,7 @@
   },
   "dependencies": {
     "@narumitw/pi-tui-kit": "^0.57.0",
-    "pi-subagents": "github:meowsigma/pi-subagents#9abcc3adf54d9196cbaba2b4262a53e97ef1f2e8"
+    "pi-subagents": "https://github.com/meowsigma/pi-subagents/archive/a80adf12fd6bb696cdc7f6222350b5cd3d42762f.tar.gz"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.84.2",

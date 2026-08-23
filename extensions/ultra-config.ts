@@ -55,6 +55,16 @@ export type LoadUltraSettingsResult = ValidUltraSettingsResult | InvalidUltraSet
 export type UltraSettingsPatch = Partial<Omit<UltraSettings, 'version'>> & { version?: 1 };
 export type UltraSettingsMutator = (current: Readonly<UltraSettings>) => UltraSettingsPatch | UltraSettings;
 
+export class UltraSettingsCleanupError extends Error {
+  readonly committed: ValidUltraSettingsResult;
+
+  constructor(message: string, committed: ValidUltraSettingsResult, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'UltraSettingsCleanupError';
+    this.committed = committed;
+  }
+}
+
 export interface UltraConfigLockOptions {
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -263,7 +273,11 @@ async function atomicWrite(path: string, content: string): Promise<void> {
     await writeFile(tempPath, content, { flag: 'wx', mode: 0o600 });
     await rename(tempPath, path);
   } catch (error) {
-    try { await rm(tempPath, { force: true }); } catch { /* original error remains primary */ }
+    try {
+      await rm(tempPath, { force: true });
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], `Atomic write and temporary-file cleanup both failed for ${path}.`);
+    }
     throw error;
   }
 }
@@ -277,6 +291,7 @@ export async function updateUltraSettings(
   await mkdir(dirname(path), { recursive: true });
   const lock = await acquireLock(path, options);
   let operationError: unknown;
+  let committed: ValidUltraSettingsResult | undefined;
   try {
     const parsed = await readParsed(path);
     const current = cloneSettings(parsed?.settings);
@@ -286,7 +301,8 @@ export async function updateUltraSettings(
     if (!normalized) throw new Error('Invalid settings update: normalization failed.');
     const content = `${JSON.stringify(mergeOutput(parsed?.raw ?? {}, normalized), null, 2)}\n`;
     await atomicWrite(path, content);
-    return { kind: 'loaded', settings: cloneSettings(normalized), revision: digest(content), path };
+    committed = { kind: 'loaded', settings: cloneSettings(normalized), revision: digest(content), path };
+    return committed;
   } catch (error) {
     operationError = error;
     throw error;
@@ -295,16 +311,10 @@ export async function updateUltraSettings(
       await releaseLock(lock);
     } catch (releaseError) {
       if (operationError !== undefined) throw new AggregateError([operationError, releaseError], 'Settings update and lock cleanup both failed.');
+      if (committed) throw new UltraSettingsCleanupError('Settings committed, but lock cleanup failed.', committed, { cause: releaseError });
       throw releaseError;
     }
   }
-}
-
-/** Compatibility full-state save. Runtime commands use updateUltraSettings patches instead. */
-export async function saveUltraSettings(settings: Record<string, unknown>, pathInput?: string): Promise<void> {
-  const normalized = normalizeUltraSettings(settings);
-  if (!normalized) throw new Error('Invalid settings: normalization failed.');
-  await updateUltraSettings(normalized, pathInput);
 }
 
 export function watchUltraSettings(
@@ -351,13 +361,14 @@ export async function backupAndResetUltraSettings(
   const lock = await acquireLock(path, options);
   let operationError: unknown;
   try {
-    let content: string;
+    let bytes: Buffer;
     try {
-      content = await readFile(path, 'utf8');
+      bytes = await readFile(path);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error(`No invalid settings file exists at ${path}.`);
       throw error;
     }
+    const content = bytes.toString('utf8');
     try {
       parseContent(content, path);
       throw new Error(`Settings file at ${path} is valid; recovery was not performed.`);
@@ -366,7 +377,7 @@ export async function backupAndResetUltraSettings(
     }
     const stamp = new Date(options.now?.() ?? Date.now()).toISOString().replace(/[:.]/gu, '-');
     const backupPath = `${path}.invalid-${stamp}-${randomUUID()}.bak`;
-    await writeFile(backupPath, content, { flag: 'wx', mode: 0o600 });
+    await writeFile(backupPath, bytes, { flag: 'wx', mode: 0o600 });
     const reset = { ...DEFAULT_ULTRA_SETTINGS, enabled: false };
     const resetContent = `${JSON.stringify(reset, null, 2)}\n`;
     await atomicWrite(path, resetContent);

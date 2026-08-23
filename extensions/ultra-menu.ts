@@ -10,6 +10,7 @@ import type {
   SettingsScreen,
 } from '@narumitw/pi-tui-kit';
 import type { ExtensionCommandContext } from '@earendil-works/pi-coding-agent';
+import { UltraSettingsCleanupError } from './ultra-config.js';
 import type {
   InvalidUltraSettingsResult,
   LoadUltraSettingsResult,
@@ -130,6 +131,10 @@ interface CatalogEntry {
   searchText: string;
 }
 
+function codePointCompare(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 export function buildModelCatalog(models: ReadonlyArray<{ provider: string; id: string; name?: string }>): CatalogEntry[] {
   const grouped = new Map<string, Set<string>>();
   for (const model of models) {
@@ -142,8 +147,8 @@ export function buildModelCatalog(models: ReadonlyArray<{ provider: string; id: 
     if (typeof model.name === 'string' && model.name.trim()) names.add(model.name.trim());
     grouped.set(canonical, names);
   }
-  return [...grouped.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([canonical, names]) => {
-    const sortedNames = [...names].sort((left, right) => left.localeCompare(right));
+  return [...grouped.entries()].sort(([left], [right]) => codePointCompare(left, right)).map(([canonical, names]) => {
+    const sortedNames = [...names].sort(codePointCompare);
     const displayName = sortedNames[0];
     return {
       id: canonical,
@@ -221,6 +226,11 @@ export async function showUltraMenu(options: ShowUltraMenuOptions): Promise<RunM
       current = await options.update(patch);
       return { kind: 'stay' as const };
     } catch (error) {
+      if (error instanceof UltraSettingsCleanupError) {
+        current = error.committed;
+        options.ctx.ui.notify(error.message, 'warning');
+        return { kind: 'stay' as const };
+      }
       return { kind: 'rejected' as const, error };
     }
   };
@@ -252,11 +262,15 @@ export async function showUltraMenu(options: ShowUltraMenuOptions): Promise<RunM
       if (preset) return apply({ minLanes: preset.minLanes, maxLanes: preset.maxLanes });
       if (ctx.itemId !== 'custom') return { kind: 'rejected', error: 'Invalid lane range selection.' };
       return (async () => {
-        const draft = await options.ctx.ui.input('Custom lane range', 'MIN-MAX (1–8)');
-        if (draft === undefined) return { kind: 'stay' as const };
-        const parsed = parseCustomLaneRange(draft);
-        if (!parsed) return { kind: 'rejected' as const, error: 'Enter MIN-MAX with 1 <= MIN <= MAX <= 8.' };
-        return apply(parsed);
+        let previousDraft: string | undefined;
+        while (true) {
+          const draft = await options.ctx.ui.input(previousDraft ? 'Correct custom lane range' : 'Custom lane range', previousDraft ?? 'MIN-MAX (1–8)');
+          if (draft === undefined) return { kind: 'stay' as const };
+          const parsed = parseCustomLaneRange(draft);
+          if (parsed) return apply(parsed);
+          previousDraft = draft;
+          options.ctx.ui.notify('Enter MIN-MAX with 1 <= MIN <= MAX <= 8.', 'warning');
+        }
       })();
     },
     'recover-config': async () => {

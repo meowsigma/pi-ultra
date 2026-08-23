@@ -45,6 +45,7 @@ function harness(options: {
   loaded?: LoadUltraSettingsResult;
   capabilities?: boolean;
   launchReceipt?: unknown;
+  queryResult?: unknown;
 } = {}) {
   let loaded: LoadUltraSettingsResult = options.loaded ?? { kind: 'loaded', settings: { ...ENABLED }, revision: 'revision-1', path: '/tmp/pi-ultra.json' };
   const policyInstalls: Array<'blocked' | 'enabled'> = [];
@@ -85,7 +86,7 @@ function harness(options: {
     watchSettings: (onChange, onError) => { watcher = onChange; watcherError = onError; return () => { watcher = undefined; watcherError = undefined; }; },
     prepareWave: async (value) => { preparedInputs.push(value); return prepared(value.settings, value.revision); },
     launchWave: async (value) => { launches.push(value); return options.launchReceipt ?? { text: 'Async workflow', details: { runId: 'run-1', asyncDir: '/tmp/run-1' } }; },
-    queryStatus: async () => undefined,
+    queryStatus: async () => options.queryResult,
     randomId: () => `op-${++uuid}`,
   };
   const pi = new FakePi('tui', '/repo');
@@ -201,6 +202,19 @@ test('completion before or after receipt produces one normal-path duplicate-safe
   assert.equal(h.pi.messages.length, 1);
 });
 
+test('structured result replay finalizes a missed completion after receipt or reload', async () => {
+  const h = harness({ queryResult: { runId: 'run-1', state: 'complete', results: [
+    { workflowKey: 'inspect', agent: 'ultra-scout', model: 'openai/test-model', launchContractDigest: 'a'.repeat(64), status: 'completed' },
+    { workflowKey: 'worker', agent: 'ultra-worker', model: 'openai/test-model', launchContractDigest: 'b'.repeat(64), status: 'completed', outputPath: '/tmp/output.md' },
+  ] } });
+  await h.start();
+  await h.pi.tool('ultra_delegate', delegateInput());
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(h.pi.messages.length, 1);
+  assert.match(h.pi.messages[0]?.message.content ?? '', /output\.md/);
+  assert.match(h.pi.messages[0]?.message.content ?? '', /expected agent=ultra-worker.*actual agent=ultra-worker/is);
+});
+
 test('restores a ready outbox after reload and retries with the same operation id', async () => {
   const first = harness();
   await first.start();
@@ -237,6 +251,47 @@ test('watcher failure remains blocked until a successful watcher change resynchr
   assert.equal(blocked.isError, true);
   await h.change();
   assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on');
+});
+
+test('shutdown fences delayed policy install, preflight, and spawn continuations', async () => {
+  const policyHarness = harness();
+  let releasePolicy!: () => void;
+  const policyPending = new Promise<void>((resolve) => { releasePolicy = resolve; });
+  const delayedRegistration: any = { mode: 'blocked', operational: false, disposed: false, dispose() { this.disposed = true; } };
+  policyHarness.deps.installPolicy = async () => { await policyPending; return delayedRegistration; };
+  const starting = policyHarness.pi.emit('session_start', { type: 'session_start' });
+  await new Promise((resolve) => setImmediate(resolve));
+  await policyHarness.pi.emit('session_shutdown', { type: 'session_shutdown' });
+  releasePolicy();
+  await starting;
+  assert.equal(delayedRegistration.disposed, true);
+  assert.notEqual(policyHarness.pi.statuses.at(-1)?.value, 'Ultra: on');
+
+  const preflightHarness = harness();
+  await preflightHarness.start();
+  let releasePreflight!: () => void;
+  const preflightPending = new Promise<void>((resolve) => { releasePreflight = resolve; });
+  preflightHarness.deps.prepareWave = async (value) => { await preflightPending; return prepared(value.settings, value.revision); };
+  const preflighting = preflightHarness.pi.tool('ultra_delegate', delegateInput()) as Promise<any>;
+  await new Promise((resolve) => setImmediate(resolve));
+  await preflightHarness.pi.emit('session_shutdown', { type: 'session_shutdown' });
+  releasePreflight();
+  const preflightResult = await preflighting;
+  assert.equal(preflightResult.isError, true);
+  assert.equal(preflightHarness.launches.length, 0);
+  assert.equal(preflightHarness.pi.entries.length, 0);
+
+  const spawnHarness = harness();
+  await spawnHarness.start();
+  spawnHarness.deps.launchWave = async ({ signal }) => new Promise((_resolve, reject) => {
+    signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+  });
+  const spawning = spawnHarness.pi.tool('ultra_delegate', delegateInput()) as Promise<any>;
+  await new Promise((resolve) => setImmediate(resolve));
+  await spawnHarness.pi.emit('session_shutdown', { type: 'session_shutdown' });
+  const spawnResult = await spawning;
+  assert.equal(spawnResult.isError, true);
+  assert.equal(spawnHarness.pi.entries.length, 0);
 });
 
 test('shutdown disposes policy, watcher, completion listeners, and prevents stale delivery', async () => {

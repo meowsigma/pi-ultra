@@ -20,12 +20,27 @@ export interface UltraOperationLane {
 
 export interface UltraActualLane {
   id: string;
+  status?: string;
   agent?: string;
   model?: string;
   launchContractDigest?: string;
   changedFiles: string[];
+  artifactPaths: string[];
   mismatches: string[];
 }
+
+export interface UltraRepairReservation {
+  version: 1;
+  kind: 'repair-reservation';
+  reservationId: string;
+  repairOf: string;
+  rootOperationId: string;
+  state: 'reserved' | 'released' | 'consumed';
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type UltraOperationEntry = UltraOperation | UltraRepairReservation;
 
 export interface UltraOperation {
   version: 1;
@@ -91,6 +106,13 @@ function normalizePath(value: unknown): string | undefined {
   return path;
 }
 
+function collectArtifactPaths(result: Record<string, unknown>): string[] {
+  const values: unknown[] = [];
+  for (const field of ['artifactPath', 'outputPath', 'savedOutputPath', 'sessionPath', 'sessionFile']) values.push(result[field]);
+  if (isRecord(result.artifactPaths)) values.push(...Object.values(result.artifactPaths));
+  return [...new Set(values.filter((value): value is string => typeof value === 'string' && value.trim().length > 0).map((value) => value.trim().slice(0, 4_096)))].slice(0, 32);
+}
+
 function collectChangedFiles(result: Record<string, unknown>): string[] {
   const values: unknown[] = [];
   if (Array.isArray(result.changedFiles)) values.push(...result.changedFiles);
@@ -106,10 +128,12 @@ function withinOwnedPath(path: string, owned: readonly string[]): boolean {
 }
 
 function actualForLane(expected: UltraOperationLane, result: Record<string, unknown>): UltraActualLane {
+  const status = typeof result.status === 'string' ? result.status : typeof result.state === 'string' ? result.state : undefined;
   const agent = typeof result.agent === 'string' ? result.agent : undefined;
   const model = typeof result.model === 'string' ? result.model : undefined;
   const launchContractDigest = typeof result.launchContractDigest === 'string' ? result.launchContractDigest : undefined;
   const changedFiles = collectChangedFiles(result);
+  const artifactPaths = collectArtifactPaths(result);
   const mismatches: string[] = [];
   if (agent && agent !== expected.agent) mismatches.push(`agent expected '${expected.agent}' but ran '${agent}'`);
   if (!agent) mismatches.push(`actual agent was not reported for '${expected.id}'`);
@@ -126,22 +150,34 @@ function actualForLane(expected: UltraOperationLane, result: Record<string, unkn
   } else if (changedFiles.length > 0) {
     mismatches.push(`read-only lane reported changed paths: ${changedFiles.join(', ')}`);
   }
-  return { id: expected.id, ...(agent ? { agent } : {}), ...(model ? { model } : {}), ...(launchContractDigest ? { launchContractDigest } : {}), changedFiles, mismatches };
+  return { id: expected.id, ...(status ? { status } : {}), ...(agent ? { agent } : {}), ...(model ? { model } : {}), ...(launchContractDigest ? { launchContractDigest } : {}), changedFiles, artifactPaths, mismatches };
 }
 
 function outboxFor(operation: UltraOperation): UltraOutboxItem {
   const actual = operation.actualLanes ?? [];
   const mismatchCount = actual.reduce((total, lane) => total + lane.mismatches.length, 0);
+  const laneLines = operation.lanes.map((expected) => {
+    const actualLane = actual.find((lane) => lane.id === expected.id);
+    const expectedModel = expected.expectedFixedModel ?? `[${expected.modelCandidates.join(', ')}]`;
+    const actualModel = actualLane?.model ?? '(unreported)';
+    const actualAgent = actualLane?.agent ?? '(unreported)';
+    const laneStatus = actualLane?.status ?? '(unreported)';
+    const artifacts = actualLane?.artifactPaths.length ? actualLane.artifactPaths.join(', ') : '(none reported)';
+    const mismatches = actualLane?.mismatches.length ? actualLane.mismatches.join('; ') : 'none';
+    return `- ${expected.id}: status=${laneStatus}; expected agent=${expected.agent}, model=${expectedModel}; actual agent=${actualAgent}, model=${actualModel}; artifacts=${artifacts}; mismatches=${mismatches}`;
+  });
   const lines = [
     `Ultra operation ${operation.operationId} reached terminal state '${operation.status}' for run ${operation.runId}.`,
-    `Lanes: ${operation.lanes.map((lane) => lane.id).join(', ') || '(none)'}. Routing/authority mismatches: ${mismatchCount}.`,
+    `Acceptance: ${operation.acceptance.join(' | ') || '(none)'}`,
+    `Routing/authority mismatches: ${mismatchCount}.`,
+    ...laneLines,
     'This packet is evidence only. Inspect referenced artifacts and diffs, run acceptance checks, and decide independently.',
     'If this same operation ID appears again, treat it as an at-least-once delivery retry rather than a second wave.',
   ];
   return {
     operationId: operation.operationId,
     runId: operation.runId,
-    content: lines.join('\n'),
+    content: lines.join('\n').slice(0, 32_768),
     details: {
       kind: 'terminal',
       operationId: operation.operationId,
@@ -156,6 +192,16 @@ function outboxFor(operation: UltraOperation): UltraOutboxItem {
   };
 }
 
+function validReservation(value: unknown): value is UltraRepairReservation {
+  return isRecord(value)
+    && value.version === 1
+    && value.kind === 'repair-reservation'
+    && typeof value.reservationId === 'string'
+    && typeof value.repairOf === 'string'
+    && typeof value.rootOperationId === 'string'
+    && (value.state === 'reserved' || value.state === 'released' || value.state === 'consumed');
+}
+
 function validSnapshot(value: unknown): value is UltraOperation {
   if (!isRecord(value) || value.version !== 1) return false;
   if (typeof value.operationId !== 'string' || typeof value.rootOperationId !== 'string' || typeof value.runId !== 'string') return false;
@@ -167,10 +213,11 @@ function validSnapshot(value: unknown): value is UltraOperation {
 }
 
 export function createUltraOperationStore(options: {
-  append(data: UltraOperation): void;
+  append(data: UltraOperationEntry): void;
   now?: () => number;
 }) {
   const operations = new Map<string, UltraOperation>();
+  const reservations = new Map<string, UltraRepairReservation>();
   const runToOperation = new Map<string, string>();
   const now = options.now ?? Date.now;
 
@@ -182,13 +229,27 @@ export function createUltraOperationStore(options: {
     return operationClone(snapshot);
   };
 
+  const persistReservation = (reservation: UltraRepairReservation): UltraRepairReservation => {
+    const snapshot = safeJsonClone(reservation, 'Ultra repair reservation');
+    reservations.set(snapshot.reservationId, snapshot);
+    options.append(safeJsonClone(snapshot, 'Ultra repair reservation'));
+    return safeJsonClone(snapshot, 'Ultra repair reservation');
+  };
+
   const api = {
     restore(entries: readonly unknown[]): void {
       operations.clear();
+      reservations.clear();
       runToOperation.clear();
       for (const entry of entries.slice(-10_000)) {
-        if (!isRecord(entry) || entry.type !== 'custom' || entry.customType !== ULTRA_OPERATION_ENTRY || !validSnapshot(entry.data)) continue;
+        if (!isRecord(entry) || entry.type !== 'custom' || entry.customType !== ULTRA_OPERATION_ENTRY) continue;
         try {
+          if (validReservation(entry.data)) {
+            const reservation = safeJsonClone(entry.data, 'Ultra repair reservation');
+            reservations.set(reservation.reservationId, reservation);
+            continue;
+          }
+          if (!validSnapshot(entry.data)) continue;
           const snapshot = operationClone(entry.data);
           operations.set(snapshot.operationId, snapshot);
           runToOperation.set(snapshot.runId, snapshot.operationId);
@@ -213,11 +274,37 @@ export function createUltraOperationStore(options: {
       const source = operations.get(repairOf);
       if (!source) throw new Error(`Repair operation '${repairOf}' was not found.`);
       const rootOperationId = source.rootOperationId;
-      if ([...operations.values()].some((operation) => operation.rootOperationId === rootOperationId && operation.repairCount === 1)) {
-        throw new Error(`Ultra permits one repair for root operation '${rootOperationId}'; the main model must take over.`);
+      if ([...operations.values()].some((operation) => operation.rootOperationId === rootOperationId && operation.repairCount === 1)
+        || [...reservations.values()].some((reservation) => reservation.rootOperationId === rootOperationId && reservation.state !== 'released')) {
+        throw new Error(`Ultra permits one repair for root operation '${rootOperationId}'; a repair is already reserved/consumed and the main model must take over.`);
       }
       if (!['completed', 'failed', 'stopped'].includes(source.status)) throw new Error(`Repair operation '${repairOf}' is not terminal.`);
       return { rootOperationId, repairCount: 1 };
+    },
+
+    reserveRepair(repairOf: string, reservationId: string): UltraRepairReservation {
+      if (reservations.has(reservationId)) throw new Error(`Duplicate repair reservation '${reservationId}'.`);
+      const allowed = api.assertRepairAllowed(repairOf);
+      const timestamp = now();
+      return persistReservation({
+        version: 1,
+        kind: 'repair-reservation',
+        reservationId,
+        repairOf,
+        rootOperationId: allowed.rootOperationId,
+        state: 'reserved',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      });
+    },
+
+    releaseRepair(reservationId: string): UltraRepairReservation {
+      const reservation = reservations.get(reservationId);
+      if (!reservation) throw new Error(`Repair reservation '${reservationId}' was not found.`);
+      if (reservation.state !== 'reserved') return safeJsonClone(reservation, 'Ultra repair reservation');
+      reservation.state = 'released';
+      reservation.updatedAt = now();
+      return persistReservation(reservation);
     },
 
     recordLaunch(input: {
@@ -228,10 +315,20 @@ export function createUltraOperationStore(options: {
       lanes: UltraOperationLane[];
       receipt: unknown;
       repairOf?: string;
+      repairReservationId?: string;
     }): UltraOperation {
       if (operations.has(input.operationId)) throw new Error(`Duplicate Ultra operation '${input.operationId}'.`);
       if (runToOperation.has(input.runId)) throw new Error(`Duplicate Ultra run '${input.runId}'.`);
-      const repair = input.repairOf ? api.assertRepairAllowed(input.repairOf) : undefined;
+      let repair: { rootOperationId: string; repairCount: 1 } | undefined;
+      if (input.repairOf) {
+        if (!input.repairReservationId) throw new Error('Repair launch requires a durable reservation.');
+        const reservation = reservations.get(input.repairReservationId);
+        if (!reservation || reservation.state !== 'reserved' || reservation.repairOf !== input.repairOf) throw new Error('Repair reservation is missing, stale, or mismatched.');
+        reservation.state = 'consumed';
+        reservation.updatedAt = now();
+        persistReservation(reservation);
+        repair = { rootOperationId: reservation.rootOperationId, repairCount: 1 };
+      }
       const timestamp = now();
       const operation: UltraOperation = {
         version: 1,
@@ -270,10 +367,21 @@ export function createUltraOperationStore(options: {
       const terminal = terminalStatus(state);
       if (!terminal) return undefined;
       const results = Array.isArray(payload.results) ? payload.results.filter(isRecord).slice(0, MAX_RESULTS) : [];
+      const hasStableKeys = results.some((candidate) => typeof candidate.workflowKey === 'string' || typeof candidate.key === 'string');
       operation.actualLanes = operation.lanes.map((expected, index) => {
-        const result = results.find((candidate) => candidate.workflowKey === expected.id || candidate.key === expected.id) ?? results[index] ?? {};
-        return actualForLane(expected, result);
+        const keyed = results.filter((candidate) => candidate.workflowKey === expected.id || candidate.key === expected.id);
+        const result = hasStableKeys ? keyed[0] ?? {} : results[index] ?? {};
+        const actual = actualForLane(expected, result);
+        if (keyed.length > 1) actual.mismatches.push(`duplicate result key '${expected.id}'`);
+        return actual;
       });
+      if (hasStableKeys && operation.actualLanes.length > 0) {
+        const expectedKeys = new Set(operation.lanes.map((lane) => lane.id));
+        for (const result of results) {
+          const key = typeof result.workflowKey === 'string' ? result.workflowKey : typeof result.key === 'string' ? result.key : undefined;
+          if (key && !expectedKeys.has(key)) operation.actualLanes[0]!.mismatches.push(`unknown result key '${key}'`);
+        }
+      }
       operation.status = terminal;
       operation.outbox = 'ready';
       operation.updatedAt = now();

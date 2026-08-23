@@ -49,13 +49,32 @@ test('resolves one root repair slot and rejects paused, sibling, repair-of-repai
   store.applyCompletion({ runId: 'run-1', state: 'failed', results: [] });
   const allowed = store.assertRepairAllowed('op-1');
   assert.deepEqual(allowed, { rootOperationId: 'op-1', repairCount: 1 });
-  launch(store, { operationId: 'op-repair', runId: 'run-repair', repairOf: 'op-1' });
+  const reservation = store.reserveRepair('op-1', 'reservation-1');
+  assert.equal(reservation.state, 'reserved');
+  store.recordLaunch({
+    operationId: 'op-repair', runId: 'run-repair', objective: 'Repair.', acceptance: ['Test.'], lanes: [lane()], receipt: {},
+    repairOf: 'op-1', repairReservationId: 'reservation-1',
+  });
   assert.throws(() => store.assertRepairAllowed('op-1'), /one repair|take over/i);
   assert.throws(() => store.assertRepairAllowed('op-repair'), /one repair|take over/i);
 
   const restored = createUltraOperationStore({ append: () => undefined, now: () => 200 });
   restored.restore(snapshots);
   assert.throws(() => restored.assertRepairAllowed('op-1'), /one repair|take over/i);
+});
+
+test('a crash-persisted repair reservation blocks a second repair after reload', () => {
+  const entries: any[] = [];
+  const store = createUltraOperationStore({ append: (data) => entries.push({ type: 'custom', customType: ULTRA_OPERATION_ENTRY, data }) });
+  launch(store);
+  store.applyCompletion({ runId: 'run-1', state: 'failed', results: [] });
+  store.reserveRepair('op-1', 'reservation-release');
+  store.releaseRepair('reservation-release');
+  assert.deepEqual(store.assertRepairAllowed('op-1'), { rootOperationId: 'op-1', repairCount: 1 });
+  store.reserveRepair('op-1', 'reservation-crash');
+  const restored = createUltraOperationStore({ append: () => undefined });
+  restored.restore(entries);
+  assert.throws(() => restored.assertRepairAllowed('op-1'), /reserved|one repair|take over/i);
 });
 
 test('treats paused as nonterminal, dedupes terminal events, and records actual binding mismatches', () => {
@@ -100,6 +119,8 @@ test('uses a durable at-least-once outbox with stable duplicate-safe content', (
   const terminal = store.applyCompletion({ runId: 'run-1', state: 'failed', results: [] });
   assert.ok(terminal);
   assert.match(terminal.content, /operation op-1/i);
+  assert.match(terminal.content, /Acceptance: Run tests\./i);
+  assert.match(terminal.content, /worker-a.*expected agent=ultra-worker.*actual agent=/is);
   assert.match(terminal.content, /evidence only/i);
   assert.deepEqual(store.pendingOutbox().map((item) => item.operationId), ['op-1']);
 
@@ -108,6 +129,20 @@ test('uses a durable at-least-once outbox with stable duplicate-safe content', (
   assert.deepEqual(uncertainReload.pendingOutbox().map((item) => item.operationId), ['op-1']);
   uncertainReload.markOutboxSent('op-1');
   assert.deepEqual(uncertainReload.pendingOutbox(), []);
+});
+
+test('never positionally reuses keyed partial results for a missing lane', () => {
+  const store = createUltraOperationStore({ append: () => undefined });
+  store.recordLaunch({
+    operationId: 'op-keyed', runId: 'run-keyed', objective: 'Two lanes.', acceptance: ['Check.'], receipt: {},
+    lanes: [lane({ id: 'a' }), lane({ id: 'b', ownedPaths: ['src/b'] })],
+  });
+  const terminal = store.applyCompletion({ runId: 'run-keyed', state: 'complete', results: [
+    { workflowKey: 'b', agent: 'ultra-worker', model: 'openai/test', launchContractDigest: 'a'.repeat(64), changedFiles: ['src/b/file.ts'] },
+  ] });
+  assert.ok(terminal);
+  assert.equal(terminal.operation.actualLanes?.[0]?.agent, undefined);
+  assert.equal(terminal.operation.actualLanes?.[1]?.agent, 'ultra-worker');
 });
 
 test('bounds malformed restore entries and unknown completions', () => {

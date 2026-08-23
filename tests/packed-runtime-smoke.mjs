@@ -2,7 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { cpSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -50,9 +50,16 @@ async function main() {
     env: { ...process.env, npm_config_audit: 'false', npm_config_fund: 'false' },
   });
   const ultraRoot = join(installDir, 'node_modules', 'pi-ultra');
-  const subagentsRoot = join(ultraRoot, 'node_modules', 'pi-subagents');
+  const bundledSubagentsRoot = join(ultraRoot, 'node_modules', 'pi-subagents');
+  const subagentsRoot = join(temp, 'active-pi-subagents');
   assert.equal(existsSync(join(ultraRoot, 'extensions', 'index.ts')), true);
-  assert.equal(existsSync(join(subagentsRoot, 'src', 'api', 'launch-authority.ts')), true);
+  assert.equal(existsSync(join(bundledSubagentsRoot, 'src', 'api', 'launch-authority.ts')), true);
+  cpSync(bundledSubagentsRoot, subagentsRoot, { recursive: true });
+  mkdirSync(join(subagentsRoot, 'node_modules'), { recursive: true });
+  for (const dependency of ['acorn', 'jiti', 'yaml']) {
+    cpSync(join(ultraRoot, 'node_modules', dependency), join(subagentsRoot, 'node_modules', dependency), { recursive: true });
+  }
+  assert.notEqual(subagentsRoot, bundledSubagentsRoot);
 
   writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({
     packages: [subagentsRoot, ultraRoot],
@@ -123,7 +130,13 @@ export default function probe(pi) {
   } catch (error) {
     throw new Error(`${error.message}\nstdout:\n${stdout}\nstderr:\n${stderr}`);
   } finally {
-    child.kill('SIGTERM');
+    if (child.exitCode === null) {
+      child.kill('SIGTERM');
+      await new Promise((resolveExit) => {
+        const hard = setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); }, 2_000);
+        child.once('exit', () => { clearTimeout(hard); resolveExit(); });
+      });
+    }
   }
 
   const result = JSON.parse(readFileSync(resultPath, 'utf8'));
@@ -149,7 +162,8 @@ export default function probe(pi) {
     tarball,
     packageIntegrity: packed[0].integrity,
     ultraRoot,
-    subagentsRoot,
+    activeSubagentsRoot: subagentsRoot,
+    bundledSubagentsRoot,
     toolCount: result.tools.length,
     commandCount: result.commands.length,
     directLaunchBlocked: true,

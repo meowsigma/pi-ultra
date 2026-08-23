@@ -109,8 +109,9 @@ async function defaultCheckCapabilities(events: ExtensionAPI['events']): Promise
       const data = isRecord(payload.data) ? payload.data : undefined;
       const capabilities = data && isRecord(data.capabilities) ? data.capabilities : undefined;
       const authority = capabilities && isRecord(capabilities.launchAuthority) ? capabilities.launchAuthority : undefined;
+      const replay = capabilities && isRecord(capabilities.resultReplay) ? capabilities.resultReplay : undefined;
       const methods = data && Array.isArray(data.methods) ? data.methods : [];
-      finish(payload.success === true && authority?.version === 1 && methods.includes('spawn'));
+      finish(payload.success === true && authority?.version === 1 && replay?.version === 1 && methods.includes('spawn') && methods.includes('result'));
     });
     events.emit(SUBAGENT_RPC_REQUEST, { version: 1, requestId, method: 'ping', source: { extension: 'pi-ultra' } });
   });
@@ -186,7 +187,7 @@ async function defaultQueryStatus(events: ExtensionAPI['events'], runId: string,
       if (!isRecord(payload) || payload.requestId !== requestId) return;
       finish(payload.success === true ? payload.data : undefined);
     });
-    events.emit(SUBAGENT_RPC_REQUEST, { version: 1, requestId, method: 'status', params: { id: runId }, source: { extension: 'pi-ultra' } });
+    events.emit(SUBAGENT_RPC_REQUEST, { version: 1, requestId, method: 'result', params: { id: runId }, source: { extension: 'pi-ultra' } });
   });
 }
 
@@ -264,6 +265,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
     let watcherFailed: string | undefined;
     let lastContext: ExtensionContext | undefined;
     let disposed = false;
+    let lifecycleGeneration = 0;
     let disposeWatcher: (() => void) | undefined;
     const timers = new Set<ReturnType<typeof setTimeout>>();
     const reconciliationAbort = new AbortController();
@@ -289,10 +291,14 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
     const synchronize = (ctx: ExtensionContext): Promise<void> => {
       const run = async () => {
         if (disposed) return;
+        const generation = lifecycleGeneration;
+        const stale = () => disposed || generation !== lifecycleGeneration;
         lastContext = ctx;
-        const guard = await dependencies.installPolicy({ sessionId: sessionIdentity(ctx), mode: 'blocked', validateRevision });
+        let guard: UltraPolicyRegistration | undefined;
         let next: UltraPolicyRegistration | undefined;
         try {
+          guard = await dependencies.installPolicy({ sessionId: sessionIdentity(ctx), mode: 'blocked', validateRevision });
+          if (stale()) { guard.dispose(); return; }
           if (watcherFailed) {
             policy?.dispose();
             policy = guard;
@@ -301,6 +307,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             return;
           }
           const loaded = await dependencies.loadSettings();
+          if (stale()) { guard.dispose(); return; }
           current = loaded;
           if (loaded.kind === 'invalid') {
             policy?.dispose();
@@ -317,6 +324,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             return;
           }
           capabilityCompatible ??= await dependencies.checkCapabilities(pi.events);
+          if (stale()) { guard.dispose(); return; }
           if (!capabilityCompatible) {
             policy?.dispose();
             policy = guard;
@@ -325,14 +333,18 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             return;
           }
           next = await dependencies.installPolicy({ sessionId: sessionIdentity(ctx), mode: 'enabled', validateRevision });
+          if (stale()) { next.dispose(); guard.dispose(); return; }
           policy?.dispose();
           policy = next;
           guard.dispose();
           status(ctx, 'on');
         } catch (error) {
           next?.dispose();
-          policy?.dispose();
-          policy = guard;
+          if (stale()) { guard?.dispose(); return; }
+          if (guard) {
+            policy?.dispose();
+            policy = guard;
+          }
           current = { kind: 'invalid', reason: boundedMessage(error), path: 'unknown' };
           status(ctx, 'blocked');
           notify(ctx, `Ultra is blocked: ${boundedMessage(error)}`, 'error');
@@ -394,9 +406,14 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
       promptSnippet: 'Delegate one bounded, atomic worker wave while the active model remains manager.',
       executionMode: 'sequential',
       parameters: ULTRA_DELEGATE_SCHEMA,
-      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      async execute(_toolCallId, params, toolSignal, _onUpdate, ctx) {
+        const generation = lifecycleGeneration;
+        const stale = () => disposed || generation !== lifecycleGeneration;
+        const signal = toolSignal ? AbortSignal.any([toolSignal, reconciliationAbort.signal]) : reconciliationAbort.signal;
+        let repairReservationId: string | undefined;
         try {
           const loaded = await dependencies.loadSettings();
+          if (stale()) throw new Error('Ultra extension reloaded before delegation completed.');
           current = loaded;
           if (loaded.kind === 'invalid') return toolError(`Ultra configuration is blocked: ${loaded.reason}`);
           if (!loaded.settings.enabled) return toolError(ENABLE_FIRST);
@@ -413,10 +430,22 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             parentModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
             capabilityCeiling: policy.capabilityCeiling,
           });
-          const receipt = await dependencies.launchWave({ events: pi.events, authority: policy.authority, prepared });
-          const runId = receiptRunId(receipt);
-          if (!runId) return toolError('Ultra launch receipt did not contain a run ID. No operation was accepted.');
+          if (stale()) throw new Error('Ultra extension reloaded during wave preflight.');
           const operationId = dependencies.randomId();
+          if (input.repairOf) {
+            repairReservationId = `${operationId}.repair`;
+            operations.reserveRepair(input.repairOf, repairReservationId);
+          }
+          let receipt: unknown;
+          try {
+            receipt = await dependencies.launchWave({ events: pi.events, authority: policy.authority, prepared, signal });
+          } catch (error) {
+            if (repairReservationId && !signal.aborted && !stale()) operations.releaseRepair(repairReservationId);
+            throw error;
+          }
+          if (stale()) throw new Error('Ultra extension reloaded after wave admission; the durable repair reservation remains fail-closed.');
+          const runId = receiptRunId(receipt);
+          if (!runId) return toolError('Ultra launch receipt could not be correlated. Do not relaunch; inspect subagent status and let the main model take over.');
           const operation = operations.recordLaunch({
             operationId,
             runId,
@@ -424,7 +453,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             acceptance: prepared.acceptance,
             lanes: operationLanes(prepared),
             receipt,
-            ...(input.repairOf ? { repairOf: input.repairOf } : {}),
+            ...(input.repairOf ? { repairOf: input.repairOf, repairReservationId } : {}),
           });
           const buffered = completionBuffer.get(runId);
           if (buffered) {
@@ -537,7 +566,8 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
     pi.on('session_shutdown', () => {
       if (disposed) return;
       disposed = true;
-      reconciliationAbort.abort();
+      lifecycleGeneration += 1;
+      reconciliationAbort.abort(new Error('Ultra extension session shut down.'));
       disposeWatcher?.();
       disposeWatcher = undefined;
       policy?.dispose();
