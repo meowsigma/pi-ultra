@@ -149,6 +149,33 @@ test('preflights fixed uniform, automatic, and role-default model contracts exac
   assert.equal(calls.every((call) => call.model === undefined), true);
 });
 
+test('uses active pi-subagents RPC preflight when no test resolver is supplied', async () => {
+  const events = new FakeEventBus();
+  events.on('subagents:rpc:v1:request', (request: any) => {
+    if (request.method !== 'preflight') return;
+    const agent = request.params.agent;
+    events.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
+      version: 1, requestId: request.requestId, method: 'preflight', success: true,
+      data: {
+        agent: { name: agent }, context: 'fresh', model: request.params.model,
+        modelCandidates: [request.params.model],
+        tools: {
+          effectiveAllowlist: agent === 'ultra-worker' ? ['read', 'bash', 'edit', 'write'] : ['read', 'grep', 'find', 'ls'],
+          runtimeExtensions: [], configuredExtensions: [], disableAmbientExtensions: true,
+        },
+        launchContractDigest: 'a'.repeat(64),
+      },
+    });
+  });
+  const wave = await prepareUltraWave({
+    input: input(), settings: FIXED, cwd: '/repo', sessionId: 'session', revision: 'revision', events,
+    availableModels: [{ provider: 'openai', id: 'test-model' }], parentModel: { provider: 'openai', id: 'manager' },
+  });
+  assert.equal(wave.lanes.length, 2);
+  const requests = events.emissions.filter((entry) => entry.event === 'subagents:rpc:v1:request').map((entry) => (entry.data as any).method);
+  assert.deepEqual(requests, ['preflight', 'preflight']);
+});
+
 test('fails complete preflight for fallback uniform models or role authority drift', async () => {
   const common = {
     input: input(), settings: FIXED, cwd: '/repo', sessionId: 'session', revision: 'revision',

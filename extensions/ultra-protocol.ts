@@ -136,14 +136,36 @@ export interface UltraEventBus {
   emit(event: string, data: unknown): void;
 }
 
-const PREFLIGHT_MODULE = 'pi-subagents/preflight';
 const AUTHORITY_MODULE = 'pi-subagents/launch-authority';
 
-async function defaultResolveContract(input: Record<string, unknown>): Promise<UltraLaunchContractResult> {
-  const module = await import(PREFLIGHT_MODULE) as {
-    resolveSubagentLaunchContract(value: Record<string, unknown>): Promise<UltraLaunchContractResult>;
-  };
-  return module.resolveSubagentLaunchContract(input);
+async function requestPreflight(events: UltraEventBus, input: Record<string, unknown>, timeoutMs = DEFAULT_RPC_TIMEOUT_MS): Promise<UltraLaunchContractResult> {
+  const requestId = randomUUID();
+  const replyEvent = subagentRpcReply(requestId);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let dispose: (() => void) | void;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (typeof dispose === 'function') dispose();
+      callback();
+    };
+    const timer = setTimeout(() => finish(() => reject(new Error(`Subagent preflight RPC timed out after ${timeoutMs}ms.`))), timeoutMs);
+    dispose = events.on(replyEvent, (payload) => {
+      if (!isRecord(payload) || payload.requestId !== requestId) return;
+      if (payload.version !== 1 || payload.method !== 'preflight') {
+        finish(() => reject(new Error('Subagent preflight RPC returned an incompatible reply.')));
+      } else if (payload.success === true && isRecord(payload.data)) {
+        finish(() => resolve({ ok: true, contract: payload.data as unknown as UltraLaunchContract }));
+      } else {
+        const message = isRecord(payload.error) && typeof payload.error.message === 'string' ? payload.error.message : 'Subagent preflight RPC failed.';
+        finish(() => resolve({ ok: false, code: 'rpc_preflight', message }));
+      }
+    });
+    const params = Object.fromEntries(['agent', 'task', 'cwd', 'context', 'model'].flatMap((key) => input[key] === undefined ? [] : [[key, input[key]]]));
+    events.emit(SUBAGENT_RPC_REQUEST, { version: 1, requestId, method: 'preflight', params, source: { extension: 'pi-ultra' } });
+  });
 }
 
 async function requestDigest(params: Record<string, unknown>): Promise<string> {
@@ -266,7 +288,8 @@ function validateRoleContract(role: UltraRole, requestedAgent: string, contract:
     const mutation = [...MUTATING_TOOLS].find((tool) => tools.has(tool));
     if (mutation) throw new Error(`${role} role is not read-only; mutation tool '${mutation}' is present.`);
   }
-  if (contract.tools.runtimeExtensions.length > 0 || contract.tools.configuredExtensions.length > 0 || contract.tools.disableAmbientExtensions !== true) {
+  const unexpectedRuntimeExtension = contract.tools.runtimeExtensions.find((extension) => !/subagent-prompt-runtime\.(?:ts|js)$/u.test(extension));
+  if (unexpectedRuntimeExtension || contract.tools.configuredExtensions.length > 0 || contract.tools.disableAmbientExtensions !== true) {
     throw new Error(`Lane role '${role}' must deny ambient/configured extensions.`);
   }
 }
@@ -277,7 +300,9 @@ async function preflight(
   model?: string,
 ): Promise<UltraLaunchContract> {
   const agent = ROLE_AGENTS[lane.role];
-  const result = await (input.resolveContract ?? defaultResolveContract)({
+  const resolver = input.resolveContract ?? (input.events ? (value: Record<string, unknown>) => requestPreflight(input.events!, value) : undefined);
+  if (!resolver) throw new Error('Lane preflight requires the active pi-subagents RPC bridge.');
+  const result = await resolver({
     agent,
     cwd: input.cwd,
     task: lane.task,
@@ -301,6 +326,7 @@ export interface PrepareUltraWaveInput {
   availableModels: ReadonlyArray<{ provider: string; id: string; fullId?: string; reasoning?: boolean }>;
   parentModel?: { provider: string; id?: string };
   capabilityCeiling?: UltraCapabilityCeiling;
+  events?: UltraEventBus;
   resolveContract?: ResolveLaunchContract;
 }
 

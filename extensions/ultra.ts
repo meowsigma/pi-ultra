@@ -111,8 +111,9 @@ async function defaultCheckCapabilities(events: ExtensionAPI['events']): Promise
       const capabilities = data && isRecord(data.capabilities) ? data.capabilities : undefined;
       const authority = capabilities && isRecord(capabilities.launchAuthority) ? capabilities.launchAuthority : undefined;
       const replay = capabilities && isRecord(capabilities.resultReplay) ? capabilities.resultReplay : undefined;
+      const preflight = capabilities && isRecord(capabilities.launchPreflight) ? capabilities.launchPreflight : undefined;
       const methods = data && Array.isArray(data.methods) ? data.methods : [];
-      finish(payload.success === true && authority?.version === 1 && replay?.version === 1 && methods.includes('spawn') && methods.includes('result'));
+      finish(payload.success === true && authority?.version === 1 && replay?.version === 1 && preflight?.version === 1 && methods.includes('spawn') && methods.includes('result') && methods.includes('preflight'));
     });
     events.emit(SUBAGENT_RPC_REQUEST, { version: 1, requestId, method: 'ping', source: { extension: 'pi-ultra' } });
   });
@@ -432,6 +433,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             availableModels: ctx.modelRegistry.getAvailable().map((model) => ({ provider: model.provider, id: model.id, fullId: `${model.provider}/${model.id}`, reasoning: model.reasoning })),
             parentModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
             capabilityCeiling: policy.capabilityCeiling,
+            events: pi.events,
           });
           if (stale()) throw new Error('Ultra extension reloaded during wave preflight.');
           const operationId = dependencies.randomId();
