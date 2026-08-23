@@ -1,5 +1,2 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-
-export default function (pi: ExtensionAPI): void {
-  void pi;
-}
+export { default } from './ultra.js';
+export * from './ultra.js';
