@@ -383,7 +383,6 @@ export function buildUltraWorkflow(lanes: readonly UltraPreparedLane[]): string 
       context: 'fresh' as const,
       ...(prepared.requestedModel ? { model: prepared.requestedModel } : {}),
       ...(prepared.lane.role === 'worker' ? { worktree: true as const } : {}),
-      output: true as const,
     };
   });
   return `return await runs.all(${JSON.stringify(items)});`;

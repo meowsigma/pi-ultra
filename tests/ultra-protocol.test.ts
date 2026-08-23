@@ -97,7 +97,7 @@ test('builds one strict static runs.all workflow preserving roles and worker-onl
   assert.deepEqual(items.map((item: any) => item.worktree), [undefined, true, undefined]);
   assert.ok(items[0].task.includes('READ-ONLY'));
   assert.ok(items[1].task.includes('Owned paths: src/worker'));
-  assert.equal(items.every((item: any) => item.context === 'fresh' && item.output === true), true);
+  assert.equal(items.every((item: any) => item.context === 'fresh' && item.output === undefined), true, 'runtime-generated output paths must not destabilize launch digests');
 });
 
 test('preflights fixed uniform, automatic, and role-default model contracts exactly', async () => {
