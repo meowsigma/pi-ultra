@@ -131,6 +131,21 @@ test('uses a durable at-least-once outbox with stable duplicate-safe content', (
   assert.deepEqual(uncertainReload.pendingOutbox(), []);
 });
 
+test('outbox budgets preserve every lane and final audit instruction under maximum acceptance input', () => {
+  const store = createUltraOperationStore({ append: () => undefined });
+  store.recordLaunch({
+    operationId: 'op-bounded', runId: 'run-bounded', objective: 'Bound output.', receipt: {},
+    acceptance: Array.from({ length: 32 }, (_, index) => `${index}-${'x'.repeat(2_048)}`),
+    lanes: Array.from({ length: 8 }, (_, index) => lane({ id: `lane-${index}`, ownedPaths: [`src/${index}`] })),
+  });
+  const terminal = store.applyCompletion({ runId: 'run-bounded', state: 'complete', results: [] });
+  assert.ok(terminal);
+  assert.ok(terminal.content.length < 32_768);
+  for (let index = 0; index < 8; index += 1) assert.match(terminal.content, new RegExp(`lane-${index}:`));
+  assert.match(terminal.content, /evidence only/i);
+  assert.match(terminal.content, /omitted/i);
+});
+
 test('never positionally reuses keyed partial results for a missing lane', () => {
   const store = createUltraOperationStore({ append: () => undefined });
   store.recordLaunch({

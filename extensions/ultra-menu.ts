@@ -282,6 +282,11 @@ export async function showUltraMenu(options: ShowUltraMenuOptions): Promise<RunM
         options.ctx.ui.notify(`Ultra configuration backed up to ${recovered.backupPath} and reset disabled.`, 'info');
         return { kind: 'stay' };
       } catch (error) {
+        if (error instanceof UltraSettingsCleanupError) {
+          current = error.committed;
+          options.ctx.ui.notify(`${error.message}${error.backupPath ? ` Backup: ${error.backupPath}` : ''}`, 'warning');
+          return { kind: 'stay' };
+        }
         return { kind: 'rejected', error };
       }
     },

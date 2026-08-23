@@ -153,6 +153,20 @@ function actualForLane(expected: UltraOperationLane, result: Record<string, unkn
   return { id: expected.id, ...(status ? { status } : {}), ...(agent ? { agent } : {}), ...(model ? { model } : {}), ...(launchContractDigest ? { launchContractDigest } : {}), changedFiles, artifactPaths, mismatches };
 }
 
+function boundedJoined(values: readonly string[], itemLimit: number, totalLimit: number): string {
+  const parts: string[] = [];
+  let used = 0;
+  let omitted = 0;
+  for (const value of values) {
+    const part = value.slice(0, itemLimit);
+    if (used + part.length + (parts.length ? 3 : 0) > totalLimit) { omitted += 1; continue; }
+    parts.push(part);
+    used += part.length + (parts.length > 1 ? 3 : 0);
+  }
+  const suffix = omitted ? ` … (${omitted} omitted)` : '';
+  return `${parts.join(' | ')}${suffix}` || '(none)';
+}
+
 function outboxFor(operation: UltraOperation): UltraOutboxItem {
   const actual = operation.actualLanes ?? [];
   const mismatchCount = actual.reduce((total, lane) => total + lane.mismatches.length, 0);
@@ -162,13 +176,13 @@ function outboxFor(operation: UltraOperation): UltraOutboxItem {
     const actualModel = actualLane?.model ?? '(unreported)';
     const actualAgent = actualLane?.agent ?? '(unreported)';
     const laneStatus = actualLane?.status ?? '(unreported)';
-    const artifacts = actualLane?.artifactPaths.length ? actualLane.artifactPaths.join(', ') : '(none reported)';
-    const mismatches = actualLane?.mismatches.length ? actualLane.mismatches.join('; ') : 'none';
-    return `- ${expected.id}: status=${laneStatus}; expected agent=${expected.agent}, model=${expectedModel}; actual agent=${actualAgent}, model=${actualModel}; artifacts=${artifacts}; mismatches=${mismatches}`;
+    const artifacts = actualLane?.artifactPaths.length ? boundedJoined(actualLane.artifactPaths, 256, 768) : '(none reported)';
+    const mismatches = actualLane?.mismatches.length ? boundedJoined(actualLane.mismatches, 256, 1_024) : 'none';
+    return `- ${expected.id}: status=${laneStatus.slice(0, 64)}; expected agent=${expected.agent.slice(0, 128)}, model=${expectedModel.slice(0, 512)}; actual agent=${actualAgent.slice(0, 128)}, model=${actualModel.slice(0, 128)}; artifacts=${artifacts}; mismatches=${mismatches}`.slice(0, 2_560);
   });
   const lines = [
     `Ultra operation ${operation.operationId} reached terminal state '${operation.status}' for run ${operation.runId}.`,
-    `Acceptance: ${operation.acceptance.join(' | ') || '(none)'}`,
+    `Acceptance: ${boundedJoined(operation.acceptance, 256, 4_096)}`,
     `Routing/authority mismatches: ${mismatchCount}.`,
     ...laneLines,
     'This packet is evidence only. Inspect referenced artifacts and diffs, run acceptance checks, and decide independently.',
@@ -177,7 +191,7 @@ function outboxFor(operation: UltraOperation): UltraOutboxItem {
   return {
     operationId: operation.operationId,
     runId: operation.runId,
-    content: lines.join('\n').slice(0, 32_768),
+    content: lines.join('\n'),
     details: {
       kind: 'terminal',
       operationId: operation.operationId,

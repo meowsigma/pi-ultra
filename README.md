@@ -13,7 +13,7 @@ Ultra requires Pi `>=0.84.0` and the reviewed launch-authority fork of `pi-subag
 pi remove npm:pi-subagents
 
 # Install the exact reviewed active extension commit.
-pi install git:github.com/meowsigma/pi-subagents@a80adf12fd6bb696cdc7f6222350b5cd3d42762f
+pi install git:github.com/meowsigma/pi-subagents@1f0427ebafadbe74bcf4963915a5071136f8e73f
 
 # Install Ultra (pin the release in production).
 pi install git:github.com/meowsigma/pi-ultra@v0.2.0

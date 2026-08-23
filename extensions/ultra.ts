@@ -6,6 +6,7 @@ import {
   updateUltraSettings,
   watchUltraSettings,
   type LoadUltraSettingsResult,
+  UltraSettingsCleanupError,
   type UltraSettings,
   type UltraSettingsMutator,
   type UltraSettingsPatch,
@@ -387,10 +388,12 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
 
     const scheduleReconciliation = (operation: UltraOperation, attempt = 0): void => {
       if (disposed || attempt >= RECONCILE_DELAYS.length) return;
+      const generation = lifecycleGeneration;
       const timer = setTimeout(async () => {
         timers.delete(timer);
-        if (disposed || reconciliationAbort.signal.aborted) return;
+        if (disposed || generation !== lifecycleGeneration || reconciliationAbort.signal.aborted) return;
         const payload = await dependencies.queryStatus(pi.events, operation.runId, reconciliationAbort.signal);
+        if (disposed || generation !== lifecycleGeneration || reconciliationAbort.signal.aborted) return;
         if (payload && applyCompletion(payload)) return;
         const latest = operations.get(operation.operationId);
         if (latest && (latest.status === 'running' || latest.status === 'paused')) scheduleReconciliation(latest, attempt + 1);
@@ -488,14 +491,24 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
               ctx,
               state,
               update: async (patch) => {
-                const committed = await dependencies.updateSettings(patch);
-                await synchronize(ctx);
-                return committed;
+                try {
+                  const committed = await dependencies.updateSettings(patch);
+                  await synchronize(ctx);
+                  return committed;
+                } catch (error) {
+                  if (error instanceof UltraSettingsCleanupError) await synchronize(ctx);
+                  throw error;
+                }
               },
               recover: async () => {
-                const recovered = await dependencies.backupAndReset();
-                await synchronize(ctx);
-                return recovered;
+                try {
+                  const recovered = await dependencies.backupAndReset();
+                  await synchronize(ctx);
+                  return recovered;
+                } catch (error) {
+                  if (error instanceof UltraSettingsCleanupError) await synchronize(ctx);
+                  throw error;
+                }
               },
             });
           } catch (error) {
@@ -512,7 +525,12 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             await dependencies.updateSettings((settings) => ({ enabled: keyword === 'toggle' ? !settings.enabled : keyword === 'on' }));
             await synchronize(ctx);
           } catch (error) {
-            notify(ctx, boundedMessage(error), 'error');
+            if (error instanceof UltraSettingsCleanupError) {
+              await synchronize(ctx);
+              notify(ctx, error.message, 'warning');
+            } else {
+              notify(ctx, boundedMessage(error), 'error');
+            }
           }
           return;
         }
@@ -543,9 +561,11 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
     });
 
     pi.on('session_start', async (_event, ctx) => {
+      const generation = lifecycleGeneration;
       lastContext = ctx;
       operations.restore(ctx.sessionManager.getBranch());
       await synchronize(ctx);
+      if (disposed || generation !== lifecycleGeneration) return;
       deliverPendingOutbox();
       for (const operation of operations.list()) if (operation.status === 'running' || operation.status === 'paused') scheduleReconciliation(operation);
       disposeWatcher?.();

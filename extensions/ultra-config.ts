@@ -57,11 +57,13 @@ export type UltraSettingsMutator = (current: Readonly<UltraSettings>) => UltraSe
 
 export class UltraSettingsCleanupError extends Error {
   readonly committed: ValidUltraSettingsResult;
+  readonly backupPath?: string;
 
-  constructor(message: string, committed: ValidUltraSettingsResult, options?: ErrorOptions) {
+  constructor(message: string, committed: ValidUltraSettingsResult, options?: ErrorOptions & { backupPath?: string }) {
     super(message, options);
     this.name = 'UltraSettingsCleanupError';
     this.committed = committed;
+    this.backupPath = options?.backupPath;
   }
 }
 
@@ -360,6 +362,8 @@ export async function backupAndResetUltraSettings(
   await mkdir(dirname(path), { recursive: true });
   const lock = await acquireLock(path, options);
   let operationError: unknown;
+  let committed: ValidUltraSettingsResult | undefined;
+  let committedBackupPath: string | undefined;
   try {
     let bytes: Buffer;
     try {
@@ -381,10 +385,9 @@ export async function backupAndResetUltraSettings(
     const reset = { ...DEFAULT_ULTRA_SETTINGS, enabled: false };
     const resetContent = `${JSON.stringify(reset, null, 2)}\n`;
     await atomicWrite(path, resetContent);
-    return {
-      backupPath,
-      committed: { kind: 'loaded', settings: reset, revision: digest(resetContent), path },
-    };
+    committedBackupPath = backupPath;
+    committed = { kind: 'loaded', settings: reset, revision: digest(resetContent), path };
+    return { backupPath, committed };
   } catch (error) {
     operationError = error;
     throw error;
@@ -393,6 +396,7 @@ export async function backupAndResetUltraSettings(
       await releaseLock(lock);
     } catch (releaseError) {
       if (operationError !== undefined) throw new AggregateError([operationError, releaseError], 'Settings recovery and lock cleanup both failed.');
+      if (committed) throw new UltraSettingsCleanupError('Settings recovery committed, but lock cleanup failed.', committed, { cause: releaseError, backupPath: committedBackupPath });
       throw releaseError;
     }
   }

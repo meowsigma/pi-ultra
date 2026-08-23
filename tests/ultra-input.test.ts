@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { UltraSettingsCleanupError } from '../extensions/ultra-config.js';
 import type { UltraSettings, LoadUltraSettingsResult } from '../extensions/ultra-config.js';
 import {
   createUltraExtension,
@@ -100,6 +101,7 @@ function harness(options: {
     async start() { await pi.emit('session_start', { type: 'session_start' }); },
     async change() { await watcher?.(); await new Promise((resolve) => setImmediate(resolve)); },
     async failWatcher(message = 'watch failed') { await watcherError?.(new Error(message)); await new Promise((resolve) => setImmediate(resolve)); },
+    get watcherActive() { return watcher !== undefined; },
     get menuCalls() { return menuCalls; },
   };
 }
@@ -265,6 +267,7 @@ test('shutdown fences delayed policy install, preflight, and spawn continuations
   releasePolicy();
   await starting;
   assert.equal(delayedRegistration.disposed, true);
+  assert.equal(policyHarness.watcherActive, false);
   assert.notEqual(policyHarness.pi.statuses.at(-1)?.value, 'Ultra: on');
 
   const preflightHarness = harness();
@@ -292,6 +295,65 @@ test('shutdown fences delayed policy install, preflight, and spawn continuations
   const spawnResult = await spawning;
   assert.equal(spawnResult.isError, true);
   assert.equal(spawnHarness.pi.entries.length, 0);
+});
+
+test('shutdown fences a reconciliation reply resolved immediately before shutdown', async () => {
+  const h = harness();
+  let release!: (value: unknown) => void;
+  let queryStarted!: () => void;
+  const started = new Promise<void>((resolve) => { queryStarted = resolve; });
+  h.deps.queryStatus = async () => {
+    queryStarted();
+    return new Promise((resolve) => { release = resolve; });
+  };
+  await h.start();
+  await h.pi.tool('ultra_delegate', delegateInput());
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await started;
+  release({ runId: 'run-1', state: 'complete', results: [] });
+  await h.pi.emit('session_shutdown', { type: 'session_shutdown' });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.pi.messages.length, 0);
+  assert.equal(h.pi.entries.filter((entry) => (entry.data as any)?.status === 'completed').length, 0);
+});
+
+test('committed cleanup errors still resynchronize direct commands, menu updates, and recovery', async () => {
+  const direct = harness();
+  await direct.start();
+  const off = { kind: 'loaded' as const, settings: { ...DISABLED }, revision: 'off-cleanup', path: '/tmp/pi-ultra.json' };
+  direct.deps.updateSettings = async () => {
+    direct.setLoaded(off);
+    throw new UltraSettingsCleanupError('committed cleanup warning', off);
+  };
+  await direct.pi.command('ultra', 'off');
+  assert.equal(direct.pi.statuses.at(-1)?.value, 'Ultra: off');
+  assert.equal(direct.pi.notifications.at(-1)?.level, 'warning');
+
+  const menu = harness();
+  await menu.start();
+  menu.deps.updateSettings = async () => {
+    menu.setLoaded(off);
+    throw new UltraSettingsCleanupError('committed cleanup warning', off);
+  };
+  menu.deps.showMenu = async ({ update }) => {
+    await assert.rejects(() => update({ enabled: false }), UltraSettingsCleanupError);
+    return {};
+  };
+  await menu.pi.command('ultra');
+  assert.equal(menu.pi.statuses.at(-1)?.value, 'Ultra: off');
+
+  const recovery = harness({ loaded: { kind: 'invalid', reason: 'bad', path: '/tmp/pi-ultra.json' } });
+  await recovery.start();
+  recovery.deps.backupAndReset = async () => {
+    recovery.setLoaded(off);
+    throw new UltraSettingsCleanupError('recovery cleanup warning', off, { backupPath: '/tmp/backup.bak' });
+  };
+  recovery.deps.showMenu = async ({ recover }) => {
+    await assert.rejects(() => recover(), UltraSettingsCleanupError);
+    return {};
+  };
+  await recovery.pi.command('ultra');
+  assert.equal(recovery.pi.statuses.at(-1)?.value, 'Ultra: off');
 });
 
 test('shutdown disposes policy, watcher, completion listeners, and prevents stale delivery', async () => {
