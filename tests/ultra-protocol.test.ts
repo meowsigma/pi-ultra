@@ -166,21 +166,57 @@ test('buildWaveWorkflow safely quotes input, uses fresh context/output, and isol
   assert.doesNotThrow(() => new Function('runs', `return (async () => { ${script} })();`));
 });
 
-test('preflightLane rejects a uniform model mismatch', async () => {
+test('preflightLane never forwards automatic as a requested or expected fixed model', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'pi-ultra-preflight-'));
+  await mkdir(join(cwd, '.pi', 'agents'), { recursive: true });
+  await writeFile(join(cwd, '.pi', 'agents', 'test-lane.md'), `---\nname: test-lane\ndescription: test lane\nmodel: provider/agent-default\ntools: read\n---\nStay bounded.\n`);
+  const availableModels = [
+    { provider: 'provider', id: 'agent-default', fullId: 'provider/agent-default' },
+    { provider: 'provider', id: 'uniform-fixed', fullId: 'provider/uniform-fixed' },
+  ];
+  try {
+    const explicitAutomatic = await preflightLane({
+      agent: 'test-lane',
+      task: 'Inspect only.',
+      cwd,
+      availableModels,
+      model: 'automatic',
+      uniformModel: 'provider/uniform-fixed',
+    });
+    assert.equal(explicitAutomatic.model, 'provider/agent-default');
+
+    const uniformAutomatic = await preflightLane({
+      agent: 'test-lane',
+      task: 'Inspect only.',
+      cwd,
+      availableModels,
+      uniformModel: 'automatic',
+    });
+    assert.equal(uniformAutomatic.model, 'provider/agent-default');
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('preflightLane gives an explicit fixed model request precedence but enforces a uniform binding', async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'pi-ultra-preflight-'));
   await mkdir(join(cwd, '.pi', 'agents'), { recursive: true });
   await writeFile(join(cwd, '.pi', 'agents', 'test-lane.md'), `---\nname: test-lane\ndescription: test lane\nmodel: inherit\ntools: read\n---\nStay bounded.\n`);
+  const availableModels = [
+    { provider: 'provider', id: 'explicit', fullId: 'provider/explicit' },
+    { provider: 'provider', id: 'uniform', fullId: 'provider/uniform' },
+  ];
   try {
     await assert.rejects(
       preflightLane({
         agent: 'test-lane',
         task: 'Inspect only.',
         cwd,
-        availableModels: [],
-        model: 'automatic',
-        expectedModel: 'provider/required-model',
+        availableModels,
+        model: 'provider/explicit',
+        uniformModel: 'provider/uniform',
       }),
-      /model mismatch/i,
+      /model mismatch.*provider\/uniform.*provider\/explicit/i,
     );
   } finally {
     await rm(cwd, { recursive: true, force: true });

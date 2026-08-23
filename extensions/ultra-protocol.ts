@@ -67,11 +67,11 @@ export interface PreflightLaneInput {
   task: string;
   cwd: string;
   availableModels?: ReadonlyArray<unknown>;
-  /** Model sent to package-owned launch resolution. */
+  /** Explicit requested model; takes precedence over uniformModel. "automatic" requests no fixed model. */
   model?: string;
-  /** When set, fail closed unless the resolved model is exactly this value. */
+  /** Fallback expected model when no uniform binding is supplied. */
   expectedModel?: string;
-  /** Convenience alias for a uniform requested and expected model. */
+  /** Uniform requested/expected binding; "automatic" binds neither. */
   uniformModel?: string;
 }
 
@@ -309,14 +309,42 @@ export function validatePlan(plan: unknown, bounds: UltraPlanBounds): UltraPlan 
   return plan as unknown as UltraPlan;
 }
 
+function fixedModel(value: string | undefined): string | undefined {
+  return value === undefined || value === 'automatic' ? undefined : value;
+}
+
+function resolvePreflightModelBinding(input: PreflightLaneInput): {
+  requestedModel?: string;
+  expectedModel?: string;
+} {
+  if (input.model !== undefined) {
+    if (input.model === 'automatic') return {};
+    const expectedModel = input.uniformModel !== undefined
+      ? fixedModel(input.uniformModel)
+      : fixedModel(input.expectedModel);
+    return {
+      requestedModel: input.model,
+      ...(expectedModel !== undefined ? { expectedModel } : {}),
+    };
+  }
+
+  if (input.uniformModel !== undefined) {
+    const uniformModel = fixedModel(input.uniformModel);
+    return uniformModel === undefined
+      ? {}
+      : { requestedModel: uniformModel, expectedModel: uniformModel };
+  }
+
+  const expectedModel = fixedModel(input.expectedModel);
+  return expectedModel === undefined ? {} : { expectedModel };
+}
+
 export async function preflightLane(input: PreflightLaneInput): Promise<UltraLaunchContract> {
   boundedString(input.agent, 'Preflight agent', 96);
   boundedString(input.task, 'Preflight task', MAX_TASK_LENGTH);
   boundedString(input.cwd, 'Preflight cwd', 4_096);
 
-  const uniformModel = input.uniformModel;
-  const requestedModel = input.model ?? (uniformModel === 'automatic' ? undefined : uniformModel);
-  const expectedModel = input.expectedModel ?? (uniformModel === 'automatic' ? undefined : uniformModel);
+  const { requestedModel, expectedModel } = resolvePreflightModelBinding(input);
   const result = await resolveLaunchContract({
     agent: input.agent,
     task: input.task,
