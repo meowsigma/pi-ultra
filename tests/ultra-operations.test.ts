@@ -85,7 +85,7 @@ test('treats paused as nonterminal, dedupes terminal events, and records actual 
   assert.equal(store.get('op-1')?.status, 'paused');
   const terminal = store.applyCompletion({
     runId: 'run-1', state: 'complete',
-    results: [{ workflowKey: 'worker-a', agent: 'other-worker', model: 'openai/other', launchContractDigest: 'b'.repeat(64), changedFiles: ['src/other.ts'] }],
+    results: [{ workflowKey: 'worker-a', agent: 'other-worker', model: 'openai/other', launchContractDigest: 'b'.repeat(64), authorityLaunchContractDigest: 'b'.repeat(64), changedFiles: ['src/other.ts'] }],
   });
   assert.ok(terminal);
   assert.equal(terminal.operation.status, 'completed');
@@ -93,7 +93,7 @@ test('treats paused as nonterminal, dedupes terminal events, and records actual 
   assert.deepEqual(terminal.operation.actualLanes?.[0]?.mismatches, [
     "agent expected 'ultra-worker' but ran 'other-worker'",
     "model expected fixed 'openai/test' but ran 'openai/other'",
-    'launch-contract digest mismatch',
+    'authority launch-contract digest mismatch',
     "changed path 'src/other.ts' is outside owned paths",
   ]);
   const count = appended.length;
@@ -107,7 +107,7 @@ test('accepts role-default fallback only inside the exact candidate list', () =>
     operationId: 'op-role', runId: 'run-role', objective: 'Review.', acceptance: ['Check.'], receipt: {},
     lanes: [lane({ requestedModel: undefined, expectedFixedModel: undefined, modelCandidates: ['openai/one', 'openai/two'], role: 'reviewer', ownedPaths: undefined })],
   });
-  const terminal = store.applyCompletion({ runId: 'run-role', state: 'complete', results: [{ workflowKey: 'worker-a', agent: 'ultra-worker', model: 'openai/two', launchContractDigest: 'a'.repeat(64) }] });
+  const terminal = store.applyCompletion({ runId: 'run-role', state: 'complete', results: [{ workflowKey: 'worker-a', agent: 'ultra-worker', model: 'openai/two', launchContractDigest: 'runtime'.padEnd(64, 'a'), authorityLaunchContractDigest: 'a'.repeat(64) }] });
   assert.ok(terminal);
   assert.equal(terminal.operation.actualLanes?.[0]?.mismatches.some((item) => item.includes('model')), false);
 });

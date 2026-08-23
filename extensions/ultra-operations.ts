@@ -24,6 +24,7 @@ export interface UltraActualLane {
   agent?: string;
   model?: string;
   launchContractDigest?: string;
+  authorityLaunchContractDigest?: string;
   changedFiles: string[];
   artifactPaths: string[];
   mismatches: string[];
@@ -132,6 +133,7 @@ function actualForLane(expected: UltraOperationLane, result: Record<string, unkn
   const agent = typeof result.agent === 'string' ? result.agent : undefined;
   const model = typeof result.model === 'string' ? result.model : undefined;
   const launchContractDigest = typeof result.launchContractDigest === 'string' ? result.launchContractDigest : undefined;
+  const authorityLaunchContractDigest = typeof result.authorityLaunchContractDigest === 'string' ? result.authorityLaunchContractDigest : undefined;
   const changedFiles = collectChangedFiles(result);
   const artifactPaths = collectArtifactPaths(result);
   const mismatches: string[] = [];
@@ -143,14 +145,14 @@ function actualForLane(expected: UltraOperationLane, result: Record<string, unkn
   } else if (model && !expected.modelCandidates.includes(model)) {
     mismatches.push(`model '${model}' was outside the permitted candidate list`);
   }
-  if (launchContractDigest && launchContractDigest !== expected.launchContractDigest) mismatches.push('launch-contract digest mismatch');
-  if (!launchContractDigest) mismatches.push(`launch-contract digest was not reported for '${expected.id}'`);
+  if (authorityLaunchContractDigest && authorityLaunchContractDigest !== expected.launchContractDigest) mismatches.push('authority launch-contract digest mismatch');
+  if (!authorityLaunchContractDigest) mismatches.push(`authority launch-contract digest was not reported for '${expected.id}'`);
   if (expected.role === 'worker' && expected.ownedPaths) {
     for (const path of changedFiles) if (!withinOwnedPath(path, expected.ownedPaths)) mismatches.push(`changed path '${path}' is outside owned paths`);
   } else if (changedFiles.length > 0) {
     mismatches.push(`read-only lane reported changed paths: ${changedFiles.join(', ')}`);
   }
-  return { id: expected.id, ...(status ? { status } : {}), ...(agent ? { agent } : {}), ...(model ? { model } : {}), ...(launchContractDigest ? { launchContractDigest } : {}), changedFiles, artifactPaths, mismatches };
+  return { id: expected.id, ...(status ? { status } : {}), ...(agent ? { agent } : {}), ...(model ? { model } : {}), ...(launchContractDigest ? { launchContractDigest } : {}), ...(authorityLaunchContractDigest ? { authorityLaunchContractDigest } : {}), changedFiles, artifactPaths, mismatches };
 }
 
 function boundedJoined(values: readonly string[], itemLimit: number, totalLimit: number): string {
