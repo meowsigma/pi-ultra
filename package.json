@@ -1,6 +1,6 @@
 {
   "name": "pi-ultra",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Session-wide, permit-governed Pi worker waves with the active model as manager and final reviewer.",
   "keywords": [
     "pi-package",
@@ -39,12 +39,12 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.84.0",
-    "pi-subagents": "0.55.1-ultra.1",
+    "pi-subagents": "0.55.1-ultra.2",
     "typebox": "*"
   },
   "dependencies": {
     "@narumitw/pi-tui-kit": "^0.57.0",
-    "pi-subagents": "https://github.com/meowsigma/pi-subagents/archive/c6323a739c167b9e13d9a2e41e1ca80bd9f2b0d7.tar.gz"
+    "pi-subagents": "https://github.com/meowsigma/pi-subagents/archive/a3d45034927cb7e1fbca799472d656d9a8dd885c.tar.gz"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.84.2",
