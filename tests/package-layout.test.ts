@@ -30,8 +30,8 @@ test('package exposes exactly one Pi extension and the Ultra subagent layout', (
   assert.deepEqual(packageJson.pi.subagents.agents, ['./agents']);
   assert.equal(packageJson.pi.prompts, undefined);
   assert.equal(packageJson.keywords.includes('prompt-template'), false);
-  assert.equal(packageJson.dependencies['pi-subagents'], 'https://github.com/meowsigma/pi-subagents/archive/c6323a739c167b9e13d9a2e41e1ca80bd9f2b0d7.tar.gz');
-  assert.equal(packageJson.peerDependencies['pi-subagents'], '0.55.1-ultra.1');
+  assert.equal(packageJson.dependencies['pi-subagents'], 'https://github.com/meowsigma/pi-subagents/archive/a3d45034927cb7e1fbca799472d656d9a8dd885c.tar.gz');
+  assert.equal(packageJson.peerDependencies['pi-subagents'], '0.55.1-ultra.2');
   assert.deepEqual(packageJson.bundledDependencies.sort(), ['@narumitw/pi-tui-kit', 'pi-subagents']);
   for (const required of ['extensions', 'agents', 'README.md', 'LICENSE']) {
     assert.ok(packageJson.files.includes(required), `${required} is included in package files`);
