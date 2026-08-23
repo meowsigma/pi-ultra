@@ -305,7 +305,7 @@ async function preflight(
   const result = await resolver({
     agent,
     cwd: input.cwd,
-    task: lane.task,
+    task: taskForLane(lane),
     context: 'fresh',
     ...(model ? { model } : {}),
     availableModels: input.availableModels,
@@ -363,8 +363,7 @@ export async function prepareUltraWave(input: PrepareUltraWaveInput): Promise<Ul
   return { objective: validated.objective, acceptance: validated.acceptance, revision: input.revision, settings: { ...input.settings }, lanes, script, params };
 }
 
-function taskForLane(prepared: UltraPreparedLane): string {
-  const { lane } = prepared;
+function taskForLane(lane: UltraDelegateLane): string {
   const authority = lane.role === 'worker'
     ? `WRITE only for the declared deliverable inside this managed worktree.\nOwned paths: ${lane.ownedPaths!.join(', ')}`
     : 'READ-ONLY. Inspect and report; do not mutate files or run mutation-capable tools.';
@@ -380,7 +379,7 @@ export function buildUltraWorkflow(lanes: readonly UltraPreparedLane[]): string 
     return {
       key: prepared.lane.id,
       agent: prepared.agent,
-      task: taskForLane(prepared),
+      task: taskForLane(prepared.lane),
       context: 'fresh' as const,
       ...(prepared.requestedModel ? { model: prepared.requestedModel } : {}),
       ...(prepared.lane.role === 'worker' ? { worktree: true as const } : {}),

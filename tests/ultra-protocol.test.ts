@@ -136,6 +136,9 @@ test('preflights fixed uniform, automatic, and role-default model contracts exac
   assert.deepEqual(fixed.lanes.map((lane) => lane.agent), ['ultra-scout', 'ultra-worker']);
   assert.deepEqual(fixed.lanes.map((lane) => lane.modelCandidates), [['openai/test-model'], ['openai/test-model']]);
   assert.equal(calls.every((call) => call.model === 'openai/test-model'), true);
+  assert.match(calls[0]?.task ?? '', /Ultra role: scout.*Deliverable: Parser evidence\..*Inspect parser behavior\./s);
+  const fixedItems = JSON.parse(fixed.script.slice('return await runs.all('.length, -2));
+  assert.equal(fixedItems[0].task, calls[0].task, 'runtime workflow task must exactly match preflight task');
 
   calls.length = 0;
   const automatic = await prepareUltraWave({ ...common, settings: AUTOMATIC });

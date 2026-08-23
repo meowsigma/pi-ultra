@@ -16,7 +16,7 @@ pi remove npm:pi-subagents
 pi install git:github.com/meowsigma/pi-subagents@c6323a739c167b9e13d9a2e41e1ca80bd9f2b0d7
 
 # Install Ultra (pin the release in production).
-pi install git:github.com/meowsigma/pi-ultra@v0.2.1
+pi install git:github.com/meowsigma/pi-ultra@v0.2.2
 ```
 
 Ultra bundles the same fork commit from its immutable HTTPS archive as a runtime API dependency because Pi packages have separate module roots. The separately installed fork is the active `subagent` extension; both copies share a versioned process registry. If the active extension does not advertise launch-authority v1, Ultra shows **blocked** and denies new subagent execution instead of partially enforcing policy.
