@@ -59,16 +59,36 @@ The toggle is stored atomically at:
 ~/.pi/agent/pi-ultra.json
 ```
 
-The optional `note` property is appended to the manager policy, which is useful for local rules such as a lane cap or worker preference:
+Additional properties configure mechanical guards:
 
 ```json
 {
   "enabled": true,
+  "maxWorkers": 4,
+  "requireWorktree": false,
   "note": "Use at most two concurrent workers unless the task has disjoint ownership."
 }
 ```
 
+| Property | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Manager mode toggle |
+| `maxWorkers` | `4` | Hard cap on concurrent `subagent` lanes while Ultra is on. Excess launches are blocked until a lane finishes. |
+| `requireWorktree` | `false` | Fail-closed isolation: blocks non-worktree delegations inside git repositories (workflow scripts and resumes are exempt). |
+| `note` | — | Free text appended to the manager policy |
+
 Treat this as trusted local configuration: the note becomes part of the system prompt.
+
+## Mechanical guards
+
+While Ultra is on, the extension also enforces (not just suggests):
+
+- **Admission control** — launches beyond `maxWorkers` concurrent lanes are blocked with a recovery hint instead of silently fanning out.
+- **Isolation rule** — with `requireWorktree`, un-isolated write-capable delegations are refused inside git repositories.
+- **Routing verification** — child results are checked against named-agent frontmatter (`model:` plus `fallbackModels:`) from `~/.pi/agent/agents/*.md` and `<cwd>/.pi/agents/*.md`; provable mismatches are prepended to the tool result as failed-launch warnings.
+- **Lane telemetry** — the footer shows `⚡ultra <active>/<maxWorkers>` while lanes are in flight.
+
+Guards apply only while `enabled` is true; disabling Ultra restores standard solo operation with no interception.
 
 ## Migrating from v0.1
 

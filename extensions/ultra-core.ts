@@ -8,15 +8,25 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	evaluateLaunch,
+	formatStatus,
+	isLaunchCall,
+	parseAgentBindings,
+	summarizeMismatches,
+} from "./ultra-guards.ts";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const STATUS_KEY = "ultra";
 
 interface UltraState {
 	enabled: boolean;
+	maxWorkers: number;
+	requireWorktree: boolean;
 	note?: string;
 }
 
@@ -33,15 +43,22 @@ type UltraPi = Pick<ExtensionAPI, "registerCommand" | "on">;
 
 export interface UltraToggleOptions {
 	statePath: string;
+	/** Directories scanned for named-agent frontmatter bindings. Defaults to
+	 *  the agent dir's `agents/` plus `<cwd>/.pi/agents`. */
+	agentsDirs?: string[];
 }
 
 function normalizeState(raw: unknown): UltraState {
+	if (raw === undefined || raw === null) raw = {};
 	if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
 		throw new Error("Ultra state must be a JSON object");
 	}
 	const obj = raw as Record<string, unknown>;
+	const maxWorkersRaw = typeof obj.maxWorkers === "number" ? Math.floor(obj.maxWorkers) : 4;
 	return {
 		enabled: obj.enabled === true,
+		maxWorkers: Math.min(64, Math.max(1, Number.isFinite(maxWorkersRaw) ? maxWorkersRaw : 4)),
+		requireWorktree: obj.requireWorktree === true,
 		note: typeof obj.note === "string" && obj.note.trim() ? obj.note.trim() : undefined,
 	};
 }
@@ -51,10 +68,10 @@ function readState(statePath: string): { state: UltraState; error?: string } {
 		return { state: normalizeState(JSON.parse(readFileSync(statePath, "utf8"))) };
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-			return { state: { enabled: false } };
+			return { state: normalizeState(null) };
 		}
 		return {
-			state: { enabled: false },
+			state: normalizeState(undefined),
 			error: error instanceof Error ? error.message : String(error),
 		};
 	}
@@ -114,14 +131,37 @@ Rules:
  * path. Exported for testability; the package entrypoint supplies Pi's agent
  * directory automatically.
  */
-export function createUltraToggle({ statePath }: UltraToggleOptions) {
+export function createUltraToggle({ statePath, agentsDirs }: UltraToggleOptions) {
+	const agentDirFallback = join(dirname(statePath), "agents");
 	return (pi: UltraPi): void => {
 		let restored = readState(statePath);
 		let state = restored.state;
 		let stateReadError = restored.error;
+		let activeSubagents = 0;
+		let currentAgentsDirs = agentsDirs ?? [agentDirFallback];
+		let cachedBindings = parseAgentBindings(currentAgentsDirs);
+		const gitRepoCache = new Map<string, boolean>();
+
+		function isGitRepo(cwd: string): boolean {
+			const cached = gitRepoCache.get(cwd);
+			if (cached !== undefined) return cached;
+			let inside = false;
+			try {
+				execFileSync("git", ["rev-parse", "--is-inside-work-tree"], {
+					cwd,
+					timeout: 2000,
+					stdio: "ignore",
+				});
+				inside = true;
+			} catch {
+				inside = false;
+			}
+			gitRepoCache.set(cwd, inside);
+			return inside;
+		}
 
 		const syncStatus = (ctx: UltraContext): void => {
-			ctx.ui.setStatus(STATUS_KEY, state.enabled ? "⚡ultra" : undefined);
+			ctx.ui.setStatus(STATUS_KEY, formatStatus(state, activeSubagents, state.maxWorkers));
 		};
 
 		pi.registerCommand("ultra", {
@@ -163,6 +203,9 @@ export function createUltraToggle({ statePath }: UltraToggleOptions) {
 			restored = readState(statePath);
 			state = restored.state;
 			stateReadError = restored.error;
+			activeSubagents = 0;
+			currentAgentsDirs = agentsDirs ?? [agentDirFallback, join(ctx?.cwd ?? process.cwd(), ".pi", "agents")];
+			cachedBindings = parseAgentBindings(currentAgentsDirs);
 			syncStatus(ctx);
 			if (stateReadError) {
 				ctx.ui.notify(`Ultra is OFF: unable to read ${statePath}: ${stateReadError}`, "warning");
@@ -173,6 +216,49 @@ export function createUltraToggle({ statePath }: UltraToggleOptions) {
 			if (!state.enabled) return undefined;
 			const systemPrompt = (event as { systemPrompt: string }).systemPrompt;
 			return { systemPrompt: systemPrompt + managerBlock(state.note) };
+		});
+
+		// ── Mechanical guards (ultracode-inspired) ──────────────────
+		pi.on("tool_execution_start", async (event, ctx) => {
+			if (!state.enabled) return undefined;
+			if (event.toolName !== "subagent") return undefined;
+			if (!isLaunchCall(event.args)) return undefined;
+			activeSubagents += 1;
+			syncStatus(ctx);
+			return undefined;
+		});
+
+		pi.on("tool_execution_end", async (event, ctx) => {
+			if (!state.enabled) return undefined;
+			if (event.toolName !== "subagent") return undefined;
+			activeSubagents = Math.max(0, activeSubagents - 1);
+			syncStatus(ctx);
+			return undefined;
+		});
+
+		pi.on("tool_call", async (event, ctx) => {
+			if (!state.enabled) return undefined;
+			if (event.toolName !== "subagent") return undefined;
+			const needsGitCheck = state.requireWorktree === true && isLaunchCall(event.input);
+			const verdict = evaluateLaunch({
+				state,
+				input: event.input,
+				activeCount: activeSubagents,
+				isGitRepo: needsGitCheck ? isGitRepo(ctx.cwd) : false,
+			});
+			if (verdict.block) return { block: true, reason: verdict.block };
+			return undefined;
+		});
+
+		pi.on("tool_result", async (event) => {
+			if (!state.enabled) return undefined;
+			if (event.toolName !== "subagent") return undefined;
+			const details = event.details as { results?: unknown } | undefined;
+			const mismatches = summarizeMismatches(details?.results, cachedBindings);
+			if (mismatches.length === 0) return undefined;
+			return {
+				content: [{ type: "text" as const, text: mismatches.join("\n") }, ...event.content],
+			};
 		});
 	};
 }

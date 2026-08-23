@@ -1,6 +1,6 @@
 {
   "name": "pi-ultra",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Persistent /ultra manager-mode toggle for Pi: delegate bounded work to workers and audit the integrated result.",
   "keywords": [
     "pi-package",
@@ -16,7 +16,9 @@
     "LICENSE"
   ],
   "pi": {
-    "extensions": ["./extensions/ultra.ts"]
+    "extensions": [
+      "./extensions/ultra.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.84.0 <1.0.0"
