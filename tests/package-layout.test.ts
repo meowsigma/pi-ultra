@@ -13,9 +13,13 @@ const { inspectUltraPackage } = await import('./ultra-smoke.mjs');
 const requiredPackedFiles = [
   'package/extensions/index.ts',
   'package/extensions/ultra.ts',
-  'package/agents/ultra-planner.md',
-  'package/prompts/ultra-planner.md',
-  'package/prompts/ultra-manager.md',
+  'package/extensions/ultra-protocol.ts',
+  'package/agents/ultra-scout.md',
+  'package/agents/ultra-worker.md',
+  'package/agents/ultra-reviewer.md',
+  'package/node_modules/pi-subagents/src/api/launch-authority.ts',
+  'package/node_modules/pi-subagents/src/extension/rpc.ts',
+  'package/node_modules/@narumitw/pi-tui-kit/dist/types.d.ts',
 ];
 
 test('package exposes exactly one Pi extension and the Ultra subagent layout', () => {
@@ -26,13 +30,21 @@ test('package exposes exactly one Pi extension and the Ultra subagent layout', (
   assert.deepEqual(packageJson.pi.subagents.agents, ['./agents']);
   assert.equal(packageJson.pi.prompts, undefined);
   assert.equal(packageJson.keywords.includes('prompt-template'), false);
-  for (const required of ['extensions', 'agents', 'prompts', 'README.md', 'LICENSE']) {
+  assert.equal(packageJson.dependencies['pi-subagents'], 'https://github.com/meowsigma/pi-subagents/archive/1f0427ebafadbe74bcf4963915a5071136f8e73f.tar.gz');
+  assert.equal(packageJson.peerDependencies['pi-subagents'], '0.55.1-ultra.0');
+  assert.deepEqual(packageJson.bundledDependencies.sort(), ['@narumitw/pi-tui-kit', 'pi-subagents']);
+  for (const required of ['extensions', 'agents', 'README.md', 'LICENSE']) {
     assert.ok(packageJson.files.includes(required), `${required} is included in package files`);
   }
-  assert.ok(existsSync(resolve(root, 'agents/ultra-planner.md')));
-  assert.ok(existsSync(resolve(root, 'prompts/ultra-planner.md')));
-  assert.ok(existsSync(resolve(root, 'prompts/ultra-manager.md')));
-  assert.equal(existsSync(resolve(root, 'prompts/ultra.md')), false);
+  assert.equal(packageJson.files.includes('prompts'), false);
+  assert.equal(existsSync(resolve(root, 'agents/ultra-planner.md')), false);
+  assert.equal(existsSync(resolve(root, 'prompts')), false);
+  for (const role of ['scout', 'worker', 'reviewer']) {
+    const source = readFileSync(resolve(root, `agents/ultra-${role}.md`), 'utf8');
+    const tools = source.match(/^tools:.*$/m)?.[0] ?? '';
+    assert.doesNotMatch(tools, /\bsubagent\b/, `${role} must not expose subagent`);
+    if (role !== 'worker') assert.doesNotMatch(tools, /\b(?:bash|edit|write)\b/);
+  }
 
   const ultraSource = readFileSync(resolve(root, 'extensions/ultra.ts'), 'utf8');
   assert.equal([...ultraSource.matchAll(/\bregisterCommand\s*\(\s*(['"`])ultra\1/g)].length, 1);

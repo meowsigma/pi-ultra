@@ -1,7 +1,7 @@
 {
   "name": "pi-ultra",
-  "version": "0.1.0",
-  "description": "Configurable parallel worker waves for Pi: /ultra launches bounded implementation lanes, binds models via named agents, and keeps the manager as auditor.",
+  "version": "0.2.0",
+  "description": "Session-wide, permit-governed Pi worker waves with the active model as manager and final reviewer.",
   "keywords": [
     "pi-package",
     "pi",
@@ -12,7 +12,6 @@
   "files": [
     "extensions",
     "agents",
-    "prompts",
     "examples",
     "README.md",
     "LICENSE"
@@ -21,7 +20,8 @@
     "test": "node --import tsx --test tests/*.test.ts",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test",
-    "pack:check": "npm pack --dry-run"
+    "pack:check": "npm pack --dry-run",
+    "smoke:packed": "node tests/packed-runtime-smoke.mjs"
   },
   "pi": {
     "extensions": [
@@ -39,17 +39,23 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.84.0",
-    "pi-subagents": ">=0.54.0"
+    "pi-subagents": "0.55.1-ultra.0",
+    "typebox": "*"
   },
   "dependencies": {
-    "@narumitw/pi-tui-kit": "^0.57.0"
+    "@narumitw/pi-tui-kit": "^0.57.0",
+    "pi-subagents": "https://github.com/meowsigma/pi-subagents/archive/1f0427ebafadbe74bcf4963915a5071136f8e73f.tar.gz"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.84.2",
     "@earendil-works/pi-tui": "0.84.2",
     "@types/node": "^26.2.0",
-    "pi-subagents": "0.54.0",
     "tsx": "^4.20.0",
+    "typebox": "1.3.7",
     "typescript": "^5.9.0"
-  }
+  },
+  "bundledDependencies": [
+    "@narumitw/pi-tui-kit",
+    "pi-subagents"
+  ]
 }

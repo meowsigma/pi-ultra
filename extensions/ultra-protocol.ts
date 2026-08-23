@@ -1,445 +1,448 @@
 import { randomUUID } from 'node:crypto';
-import {
-  SUBAGENT_DELEGATION_REQUEST_EVENT,
-  SUBAGENT_DELEGATION_RESPONSE_EVENT,
-  type SubagentDelegationRequest,
-  type SubagentDelegationResponse,
-} from 'pi-subagents/delegation';
+import { posix } from 'node:path';
+import { Type } from 'typebox';
 import {
   ULTRA_MAX_LANES,
-  ULTRA_MIN_LANES,
   ULTRA_ROLE_NAMES,
   type UltraRole,
+  type UltraSettings,
 } from './ultra-config.js';
 
-export const SUBAGENT_RPC_READY = 'subagents:rpc:v1:ready' as const;
 export const SUBAGENT_RPC_REQUEST = 'subagents:rpc:v1:request' as const;
 export const subagentRpcReply = (id: string): string => `subagents:rpc:v1:reply:${id}`;
+export const ROLE_AGENTS = {
+  scout: 'ultra-scout',
+  worker: 'ultra-worker',
+  reviewer: 'ultra-reviewer',
+} as const satisfies Record<UltraRole, string>;
 
-const DEFAULT_PROTOCOL_TIMEOUT_MS = 1_500;
-const DEFAULT_PLAN_TIMEOUT_MS = 120_000;
-const MAX_OBJECTIVE_LENGTH = 4_096;
-const MAX_TASK_LENGTH = 16_384;
-const MAX_LIST_STRING_LENGTH = 2_048;
-const MAX_LIST_ITEMS = 32;
-const MAX_PLANNED_LANES = 64;
-const LANE_ID = /^[a-z][a-z0-9-]{0,47}$/;
-const ROLE_NAMES: ReadonlySet<string> = new Set(ULTRA_ROLE_NAMES);
+const ROLE_SET = new Set<string>(ULTRA_ROLE_NAMES);
+const LANE_ID = /^[a-z][a-z0-9-]{0,47}$/u;
+const OPERATION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+const DIGEST = /^[a-f0-9]{64}$/u;
+const MAX_OBJECTIVE = 4_096;
+const MAX_TASK = 16_384;
+const MAX_DELIVERABLE = 2_048;
+const MAX_ACCEPTANCE = 32;
+const MAX_ACCEPTANCE_ITEM = 2_048;
+const MAX_PATHS = 32;
+const MAX_PATH = 512;
+const DEFAULT_RPC_TIMEOUT_MS = 1_500;
+const PERMIT_EXPIRY_MS = 5_000;
+const MUTATING_TOOLS = new Set(['bash', 'edit', 'write', 'subagent']);
+
+export const ULTRA_DELEGATE_SCHEMA = Type.Object({
+  objective: Type.String({ minLength: 1, maxLength: MAX_OBJECTIVE }),
+  lanes: Type.Array(Type.Object({
+    id: Type.String({ pattern: LANE_ID.source, minLength: 1, maxLength: 48 }),
+    role: Type.Union(ULTRA_ROLE_NAMES.map((role) => Type.Literal(role))),
+    task: Type.String({ minLength: 1, maxLength: MAX_TASK }),
+    deliverable: Type.String({ minLength: 1, maxLength: MAX_DELIVERABLE }),
+    ownedPaths: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: MAX_PATH }), { minItems: 1, maxItems: MAX_PATHS })),
+  }, { additionalProperties: false }), { minItems: 1, maxItems: ULTRA_MAX_LANES }),
+  acceptance: Type.Array(Type.String({ minLength: 1, maxLength: MAX_ACCEPTANCE_ITEM }), { minItems: 1, maxItems: MAX_ACCEPTANCE }),
+  repairOf: Type.Optional(Type.String({ pattern: OPERATION_ID.source, minLength: 1, maxLength: 128 })),
+}, { additionalProperties: false });
+
+export interface UltraDelegateLane {
+  id: string;
+  role: UltraRole;
+  task: string;
+  deliverable: string;
+  ownedPaths?: string[];
+}
+
+export interface UltraDelegateInput {
+  objective: string;
+  lanes: UltraDelegateLane[];
+  acceptance: string[];
+  repairOf?: string;
+}
+
+export interface UltraLaunchAuthorityLane {
+  key: string;
+  agent: string;
+  modelCandidates: string[];
+  launchContractDigest: string;
+}
+
+export interface UltraLaunchAuthorityHandle {
+  issueOnce(input: {
+    configRevision: string;
+    expiresInMs: number;
+    requestDigest: string;
+    minLanes: number;
+    maxLanes: number;
+    lanes: UltraLaunchAuthorityLane[];
+  }): string;
+  revokeUnused(): void;
+  dispose(): void;
+}
+
+export interface UltraCapabilityCeiling {
+  version: 1;
+  allowedTools?: string[];
+  allowedAgents?: string[];
+  denyExtensions: boolean;
+  sources: string[];
+}
+
+export interface UltraLaunchContract {
+  agent: { name: string; localName?: string };
+  context: 'fresh' | 'fork';
+  model?: string;
+  modelCandidates: string[];
+  tools: {
+    effectiveAllowlist: string[];
+    runtimeExtensions: string[];
+    configuredExtensions: string[];
+    disableAmbientExtensions: boolean;
+  };
+  launchContractDigest: string;
+}
+
+export type UltraLaunchContractResult =
+  | { ok: true; contract: UltraLaunchContract }
+  | { ok: false; code: string; message: string };
+
+export type ResolveLaunchContract = (input: Record<string, unknown>) => Promise<UltraLaunchContractResult>;
+
+export interface UltraPreparedLane {
+  lane: UltraDelegateLane;
+  agent: string;
+  modelCandidates: string[];
+  requestedModel?: string;
+  launchContractDigest: string;
+}
+
+export interface UltraPreparedWave {
+  objective: string;
+  acceptance: string[];
+  revision: string;
+  settings: UltraSettings;
+  lanes: UltraPreparedLane[];
+  script: string;
+  params: {
+    workflowScript: string;
+    cwd: string;
+    context: 'fresh';
+    async: true;
+    mission: false;
+  };
+}
 
 export interface UltraEventBus {
   on(event: string, handler: (data: unknown) => void): (() => void) | void;
   emit(event: string, data: unknown): void;
 }
 
-export interface UltraLane {
-  id: string;
-  role: UltraRole;
-  task: string;
-  write: boolean;
-}
-
-export type UltraPlanMode = 'wave' | 'no-wave' | 'over-cap';
-
-export interface UltraPlan {
-  objective: string;
-  evidence: string[];
-  mode: UltraPlanMode;
-  lanes: UltraLane[];
-  acceptance: string[];
-}
-
-export interface UltraPlanBounds {
-  minLanes: number;
-  maxLanes: number;
-}
-
-export interface RequestPlanInput {
-  events: UltraEventBus;
-  task: string;
-  cwd: string;
-  /** Foreground delegation and local correlation timeout in milliseconds. */
-  timeout?: number;
-  timeoutMs?: number;
-}
-
-export interface PreflightLaneInput {
-  agent: string;
-  task: string;
-  cwd: string;
-  availableModels?: ReadonlyArray<unknown>;
-  /** Explicit requested model; takes precedence over uniformModel. "automatic" requests no fixed model. */
-  model?: string;
-  /** Fallback expected model when no uniform binding is supplied. */
-  expectedModel?: string;
-  /** Uniform requested/expected binding; "automatic" binds neither. */
-  uniformModel?: string;
-}
-
-export interface UltraLaunchContract {
-  context: 'fresh' | 'fork';
-  model?: string;
-  [key: string]: unknown;
-}
-
-type PreflightResult =
-  | { ok: true; contract: UltraLaunchContract }
-  | { ok: false; code: string; message: string };
-
 const PREFLIGHT_MODULE = 'pi-subagents/preflight';
+const AUTHORITY_MODULE = 'pi-subagents/launch-authority';
 
-async function resolveLaunchContract(input: Record<string, unknown>): Promise<PreflightResult> {
-  // Keep this runtime import opaque to the consumer's TypeScript compiler: the
-  // dependency publishes TypeScript sources whose internal .ts specifiers are
-  // valid in Pi but are not type-checkable under every package's tsconfig.
+async function defaultResolveContract(input: Record<string, unknown>): Promise<UltraLaunchContractResult> {
   const module = await import(PREFLIGHT_MODULE) as {
-    resolveSubagentLaunchContract(value: Record<string, unknown>): Promise<PreflightResult>;
+    resolveSubagentLaunchContract(value: Record<string, unknown>): Promise<UltraLaunchContractResult>;
   };
   return module.resolveSubagentLaunchContract(input);
 }
 
-const PLAN_SCHEMA: Record<string, unknown> = {
-  type: 'object',
-  properties: {
-    objective: { type: 'string', minLength: 1, maxLength: MAX_OBJECTIVE_LENGTH },
-    evidence: {
-      type: 'array',
-      maxItems: MAX_LIST_ITEMS,
-      items: { type: 'string', minLength: 1, maxLength: MAX_LIST_STRING_LENGTH },
-    },
-    mode: { enum: ['wave', 'no-wave', 'over-cap'] },
-    lanes: {
-      type: 'array',
-      maxItems: MAX_PLANNED_LANES,
-      items: {
-        type: 'object',
-        properties: {
-          id: { type: 'string', pattern: LANE_ID.source, maxLength: 48 },
-          role: { enum: [...ULTRA_ROLE_NAMES] },
-          task: { type: 'string', minLength: 1, maxLength: MAX_TASK_LENGTH },
-          write: { type: 'boolean' },
-        },
-        required: ['id', 'role', 'task', 'write'],
-        additionalProperties: false,
-      },
-    },
-    acceptance: {
-      type: 'array',
-      maxItems: MAX_LIST_ITEMS,
-      items: { type: 'string', minLength: 1, maxLength: MAX_LIST_STRING_LENGTH },
-    },
-  },
-  required: ['objective', 'evidence', 'mode', 'lanes', 'acceptance'],
-  additionalProperties: false,
-};
+async function requestDigest(params: Record<string, unknown>): Promise<string> {
+  const module = await import(AUTHORITY_MODULE) as {
+    digestSubagentLaunchRequest(value: Record<string, unknown>, domain?: string): string;
+  };
+  return module.digestSubagentLaunchRequest(params, 'rpc.spawn');
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function unsubscribe(dispose: (() => void) | void): void {
-  if (typeof dispose === 'function') dispose();
+function exactKeys(value: Record<string, unknown>, allowed: readonly string[], label: string): void {
+  const set = new Set(allowed);
+  const unexpected = Object.keys(value).find((key) => !set.has(key));
+  if (unexpected) throw new Error(`${label} contains unsupported field '${unexpected}'.`);
 }
 
-function positiveTimeout(value: number, label: string): number {
-  if (!Number.isSafeInteger(value) || value <= 0 || value > 2_147_483_647) {
-    throw new Error(`${label} must be a positive safe integer no greater than 2147483647.`);
+function boundedString(value: unknown, label: string, maxLength: number): string {
+  if (typeof value !== 'string') throw new Error(`${label} must be a string.`);
+  const normalized = value.trim();
+  if (!normalized || value.length > maxLength || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) {
+    throw new Error(`${label} must be non-empty, control-safe, and no longer than ${maxLength} characters.`);
   }
-  return value;
+  return normalized;
 }
 
-function protocolTimeout<T>(
-  events: UltraEventBus,
-  event: string,
-  timeoutMs: number,
-  label: string,
-  handle: (payload: unknown, resolve: (value: T) => void, reject: (error: Error) => void) => void,
-): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
+function semanticKey(value: string): string {
+  return value.normalize('NFKC').toLowerCase().replace(/[\p{P}\p{S}]+/gu, ' ').replace(/\s+/gu, ' ').trim();
+}
+
+function normalizeOwnedPath(value: unknown, label: string): string {
+  const raw = boundedString(value, label, MAX_PATH).replace(/\\/gu, '/');
+  if (/^[A-Za-z]:\//u.test(raw) || raw.startsWith('/') || /[*?[\]{}]/u.test(raw)) throw new Error(`${label} is an unsafe owned path.`);
+  const segments = raw.split('/');
+  if (segments.some((segment) => !segment || segment === '.' || segment === '..')) throw new Error(`${label} is an unsafe owned path.`);
+  const normalized = posix.normalize(raw);
+  if (normalized === '.' || normalized.startsWith('../')) throw new Error(`${label} is an unsafe owned path.`);
+  return normalized;
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
+export function validateUltraDelegateInput(value: unknown, bounds: { minLanes: number; maxLanes: number }): UltraDelegateInput {
+  if (!Number.isSafeInteger(bounds.minLanes) || !Number.isSafeInteger(bounds.maxLanes) || bounds.minLanes < 1 || bounds.maxLanes > ULTRA_MAX_LANES || bounds.minLanes > bounds.maxLanes) {
+    throw new Error(`Lane bounds must satisfy 1 <= minLanes <= maxLanes <= ${ULTRA_MAX_LANES}.`);
+  }
+  if (!isRecord(value)) throw new Error('ultra_delegate input must be an object.');
+  exactKeys(value, ['objective', 'lanes', 'acceptance', 'repairOf'], 'ultra_delegate input');
+  const objective = boundedString(value.objective, 'objective', MAX_OBJECTIVE);
+  if (!Array.isArray(value.lanes) || value.lanes.length < bounds.minLanes || value.lanes.length > bounds.maxLanes) {
+    throw new Error(`lanes must contain between ${bounds.minLanes} and ${bounds.maxLanes} entries.`);
+  }
+  if (!Array.isArray(value.acceptance) || value.acceptance.length < 1 || value.acceptance.length > MAX_ACCEPTANCE) {
+    throw new Error(`acceptance must contain 1..${MAX_ACCEPTANCE} entries.`);
+  }
+  const acceptance = value.acceptance.map((entry, index) => boundedString(entry, `acceptance[${index}]`, MAX_ACCEPTANCE_ITEM));
+  if (new Set(acceptance.map(semanticKey)).size !== acceptance.length) throw new Error('acceptance entries must be semantically unique.');
+  const repairOf = value.repairOf === undefined ? undefined : boundedString(value.repairOf, 'repairOf', 128);
+  if (repairOf !== undefined && !OPERATION_ID.test(repairOf)) throw new Error('repairOf is invalid.');
+
+  const ids = new Set<string>();
+  const tasks = new Set<string>();
+  const deliverables = new Set<string>();
+  const writerPaths: Array<{ laneId: string; path: string }> = [];
+  const lanes = value.lanes.map((raw, index): UltraDelegateLane => {
+    if (!isRecord(raw)) throw new Error(`lanes[${index}] must be an object.`);
+    exactKeys(raw, ['id', 'role', 'task', 'deliverable', 'ownedPaths'], `lanes[${index}]`);
+    const id = boundedString(raw.id, `lanes[${index}].id`, 48);
+    if (!LANE_ID.test(id)) throw new Error(`lanes[${index}].id is invalid.`);
+    if (ids.has(id)) throw new Error(`Duplicate lane id '${id}'.`);
+    ids.add(id);
+    if (typeof raw.role !== 'string' || !ROLE_SET.has(raw.role)) throw new Error(`lanes[${index}].role is invalid.`);
+    const role = raw.role as UltraRole;
+    const task = boundedString(raw.task, `lanes[${index}].task`, MAX_TASK);
+    const taskKey = semanticKey(task);
+    if (tasks.has(taskKey)) throw new Error(`Duplicate task at lanes[${index}].`);
+    tasks.add(taskKey);
+    const deliverable = boundedString(raw.deliverable, `lanes[${index}].deliverable`, MAX_DELIVERABLE);
+    const deliverableKey = semanticKey(deliverable);
+    if (deliverables.has(deliverableKey)) throw new Error(`Duplicate deliverable at lanes[${index}].`);
+    deliverables.add(deliverableKey);
+    if (role !== 'worker' && raw.ownedPaths !== undefined) throw new Error(`ownedPaths are allowed only for worker lanes.`);
+    if (role === 'worker' && (!Array.isArray(raw.ownedPaths) || raw.ownedPaths.length < 1 || raw.ownedPaths.length > MAX_PATHS)) {
+      throw new Error(`Worker lane '${id}' requires 1..${MAX_PATHS} ownedPaths.`);
+    }
+    const ownedPaths = role === 'worker'
+      ? (raw.ownedPaths as unknown[]).map((path, pathIndex) => normalizeOwnedPath(path, `lanes[${index}].ownedPaths[${pathIndex}]`))
+      : undefined;
+    if (ownedPaths && new Set(ownedPaths).size !== ownedPaths.length) throw new Error(`Worker lane '${id}' has duplicate ownedPaths.`);
+    for (const path of ownedPaths ?? []) {
+      const overlap = writerPaths.find((entry) => pathsOverlap(entry.path, path));
+      if (overlap) throw new Error(`Worker owned paths overlap between '${overlap.laneId}' and '${id}'.`);
+      writerPaths.push({ laneId: id, path });
+    }
+    return { id, role, task, deliverable, ...(ownedPaths ? { ownedPaths } : {}) };
+  });
+  return { objective, lanes, acceptance, ...(repairOf ? { repairOf } : {}) };
+}
+
+function roleMatches(contract: UltraLaunchContract, requested: string): boolean {
+  return contract.agent.name === requested || contract.agent.localName === requested || contract.agent.name.endsWith(`.${requested}`);
+}
+
+function validateRoleContract(role: UltraRole, requestedAgent: string, contract: UltraLaunchContract): void {
+  if (!roleMatches(contract, requestedAgent)) throw new Error(`Lane role '${role}' resolved unexpected agent '${contract.agent.name}'.`);
+  if (contract.context !== 'fresh') throw new Error(`Lane role '${role}' resolved non-fresh context '${contract.context}'.`);
+  if (!DIGEST.test(contract.launchContractDigest)) throw new Error(`Lane role '${role}' returned an invalid launch-contract digest.`);
+  if (!Array.isArray(contract.modelCandidates) || contract.modelCandidates.length < 1 || contract.modelCandidates.some((model) => typeof model !== 'string' || !model.includes('/'))) {
+    throw new Error(`Lane role '${role}' returned invalid model candidates.`);
+  }
+  const tools = new Set(contract.tools.effectiveAllowlist);
+  if (role === 'worker') {
+    for (const required of ['read', 'bash', 'edit', 'write']) if (!tools.has(required)) throw new Error(`Worker role is missing required mutation tool '${required}'.`);
+    if (tools.has('subagent')) throw new Error('Worker role must not expose nested subagent launches.');
+  } else {
+    const mutation = [...MUTATING_TOOLS].find((tool) => tools.has(tool));
+    if (mutation) throw new Error(`${role} role is not read-only; mutation tool '${mutation}' is present.`);
+  }
+  if (contract.tools.runtimeExtensions.length > 0 || contract.tools.configuredExtensions.length > 0 || contract.tools.disableAmbientExtensions !== true) {
+    throw new Error(`Lane role '${role}' must deny ambient/configured extensions.`);
+  }
+}
+
+async function preflight(
+  input: PrepareUltraWaveInput,
+  lane: UltraDelegateLane,
+  model?: string,
+): Promise<UltraLaunchContract> {
+  const agent = ROLE_AGENTS[lane.role];
+  const result = await (input.resolveContract ?? defaultResolveContract)({
+    agent,
+    cwd: input.cwd,
+    task: lane.task,
+    context: 'fresh',
+    ...(model ? { model } : {}),
+    availableModels: input.availableModels,
+    parentModel: input.parentModel,
+    capabilityCeiling: input.capabilityCeiling,
+  });
+  if (!result.ok) throw new Error(`Lane '${lane.id}' preflight failed (${result.code}): ${result.message}`);
+  validateRoleContract(lane.role, agent, result.contract);
+  return result.contract;
+}
+
+export interface PrepareUltraWaveInput {
+  input: UltraDelegateInput;
+  settings: UltraSettings;
+  cwd: string;
+  sessionId: string;
+  revision: string;
+  availableModels: ReadonlyArray<{ provider: string; id: string; fullId?: string; reasoning?: boolean }>;
+  parentModel?: { provider: string; id?: string };
+  capabilityCeiling?: UltraCapabilityCeiling;
+  resolveContract?: ResolveLaunchContract;
+}
+
+export async function prepareUltraWave(input: PrepareUltraWaveInput): Promise<UltraPreparedWave> {
+  const validated = validateUltraDelegateInput(input.input, { minLanes: input.settings.minLanes, maxLanes: input.settings.maxLanes });
+  let uniformModel: string | undefined;
+  if (input.settings.routingMode === 'uniform') {
+    if (input.settings.workerModel) uniformModel = input.settings.workerModel;
+    else {
+      const seedLane: UltraDelegateLane = {
+        id: 'automatic-seed', role: 'worker', task: 'Resolve the automatic Ultra worker model.',
+        deliverable: 'One canonical model binding.', ownedPaths: ['automatic-seed'],
+      };
+      const seed = await preflight(input, seedLane);
+      uniformModel = seed.model ?? seed.modelCandidates[0];
+      if (!uniformModel) throw new Error('Automatic routing could not resolve a canonical model.');
+    }
+  }
+  const lanes = await Promise.all(validated.lanes.map(async (lane): Promise<UltraPreparedLane> => {
+    const contract = await preflight(input, lane, uniformModel);
+    if (uniformModel && (contract.modelCandidates.length !== 1 || contract.modelCandidates[0] !== uniformModel || contract.model !== uniformModel)) {
+      throw new Error(`Uniform model '${uniformModel}' must be the sole candidate for lane '${lane.id}'.`);
+    }
+    return {
+      lane,
+      agent: contract.agent.name,
+      modelCandidates: [...contract.modelCandidates],
+      ...(uniformModel ? { requestedModel: uniformModel } : {}),
+      launchContractDigest: contract.launchContractDigest,
+    };
+  }));
+  const script = buildUltraWorkflow(lanes);
+  const params = { workflowScript: script, cwd: input.cwd, context: 'fresh' as const, async: true as const, mission: false as const };
+  return { objective: validated.objective, acceptance: validated.acceptance, revision: input.revision, settings: { ...input.settings }, lanes, script, params };
+}
+
+function taskForLane(prepared: UltraPreparedLane): string {
+  const { lane } = prepared;
+  const authority = lane.role === 'worker'
+    ? `WRITE only for the declared deliverable inside this managed worktree.\nOwned paths: ${lane.ownedPaths!.join(', ')}`
+    : 'READ-ONLY. Inspect and report; do not mutate files or run mutation-capable tools.';
+  return `Ultra role: ${lane.role}\nAuthority: ${authority}\nDeliverable: ${lane.deliverable}\nTask:\n${lane.task}`;
+}
+
+export function buildUltraWorkflow(lanes: readonly UltraPreparedLane[]): string {
+  if (!Array.isArray(lanes) || lanes.length < 1 || lanes.length > ULTRA_MAX_LANES) throw new Error(`Ultra workflow requires 1..${ULTRA_MAX_LANES} lanes.`);
+  const keys = new Set<string>();
+  const items = lanes.map((prepared) => {
+    if (keys.has(prepared.lane.id)) throw new Error(`Duplicate prepared lane '${prepared.lane.id}'.`);
+    keys.add(prepared.lane.id);
+    return {
+      key: prepared.lane.id,
+      agent: prepared.agent,
+      task: taskForLane(prepared),
+      context: 'fresh' as const,
+      ...(prepared.requestedModel ? { model: prepared.requestedModel } : {}),
+      ...(prepared.lane.role === 'worker' ? { worktree: true as const } : {}),
+      output: true as const,
+    };
+  });
+  return `return await runs.all(${JSON.stringify(items)});`;
+}
+
+function permitManifest(prepared: UltraPreparedWave): UltraLaunchAuthorityLane[] {
+  return prepared.lanes.map((lane) => ({
+    key: lane.lane.id,
+    agent: lane.agent,
+    modelCandidates: [...lane.modelCandidates],
+    launchContractDigest: lane.launchContractDigest,
+  }));
+}
+
+export async function launchUltraWave(input: {
+  events: UltraEventBus;
+  authority: UltraLaunchAuthorityHandle;
+  prepared: UltraPreparedWave;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}): Promise<unknown> {
+  const timeoutMs = input.timeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) throw new Error('RPC timeout must be a positive integer no greater than 60000ms.');
+  const digest = await requestDigest(input.prepared.params);
+  const permit = input.authority.issueOnce({
+    configRevision: input.prepared.revision,
+    expiresInMs: PERMIT_EXPIRY_MS,
+    requestDigest: digest,
+    minLanes: input.prepared.settings.minLanes,
+    maxLanes: input.prepared.settings.maxLanes,
+    lanes: permitManifest(input.prepared),
+  });
+  if (input.signal?.aborted) {
+    input.authority.revokeUnused();
+    throw input.signal.reason instanceof Error ? input.signal.reason : new Error('Ultra launch aborted.');
+  }
+  const requestId = randomUUID();
+  const replyEvent = subagentRpcReply(requestId);
+  return new Promise((resolve, reject) => {
     let settled = false;
     let dispose: (() => void) | void;
     const finish = (callback: () => void) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      unsubscribe(dispose);
+      input.signal?.removeEventListener('abort', abort);
+      if (typeof dispose === 'function') dispose();
       callback();
     };
+    const abort = () => {
+      input.authority.revokeUnused();
+      finish(() => reject(input.signal?.reason instanceof Error ? input.signal.reason : new Error('Ultra launch aborted.')));
+    };
     const timer = setTimeout(() => {
-      finish(() => reject(new Error(`${label} timed out after ${timeoutMs}ms.`)));
+      input.authority.revokeUnused();
+      finish(() => reject(new Error(`Subagent spawn RPC timed out after ${timeoutMs}ms.`)));
     }, timeoutMs);
-    dispose = events.on(event, (payload) => {
-      handle(
-        payload,
-        (value) => finish(() => resolve(value)),
-        (error) => finish(() => reject(error)),
-      );
-    });
-  });
-}
-
-export function waitForSubagentCapabilities(
-  events: UltraEventBus,
-  timeout = DEFAULT_PROTOCOL_TIMEOUT_MS,
-): Promise<unknown> {
-  const timeoutMs = positiveTimeout(timeout, 'Readiness timeout');
-  return protocolTimeout(events, SUBAGENT_RPC_READY, timeoutMs, 'Subagent capability readiness', (payload, resolve) => {
-    resolve(payload);
-  });
-}
-
-export function requestPlan(input: RequestPlanInput): Promise<unknown> {
-  if (typeof input.task !== 'string' || input.task.trim().length === 0 || input.task.length > MAX_TASK_LENGTH) {
-    return Promise.reject(new Error(`Planner task must be a non-empty string no longer than ${MAX_TASK_LENGTH} characters.`));
-  }
-  if (typeof input.cwd !== 'string' || input.cwd.trim().length === 0) {
-    return Promise.reject(new Error('Planner cwd must be a non-empty string.'));
-  }
-
-  const timeoutMs = positiveTimeout(input.timeoutMs ?? input.timeout ?? DEFAULT_PLAN_TIMEOUT_MS, 'Planner timeout');
-  const request: SubagentDelegationRequest = {
-    requestId: randomUUID(),
-    ownerRunId: randomUUID(),
-    nodeId: 'ultra-plan',
-    agent: 'ultra-planner',
-    task: input.task,
-    context: 'fresh',
-    cwd: input.cwd,
-    timeoutMs,
-    result: { kind: 'structured', schema: PLAN_SCHEMA },
-  };
-
-  const pending = protocolTimeout<unknown>(
-    input.events,
-    SUBAGENT_DELEGATION_RESPONSE_EVENT,
-    timeoutMs,
-    'Ultra planner response',
-    (payload, resolve, reject) => {
-      if (!isRecord(payload)) return;
-      const response = payload as unknown as SubagentDelegationResponse;
-      if (
-        response.requestId !== request.requestId
-        || response.ownerRunId !== request.ownerRunId
-        || response.nodeId !== request.nodeId
-      ) return;
-      if (response.status !== 'completed') {
-        reject(new Error(response.error || `Ultra planner failed with status ${response.status}.`));
-        return;
-      }
-      if (response.result?.kind !== 'structured' || !isRecord(response.result.value)) {
-        reject(new Error('Ultra planner returned no structured object result.'));
-        return;
-      }
-      resolve(response.result.value);
-    },
-  );
-  input.events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, request);
-  return pending;
-}
-
-function exactKeys(value: Record<string, unknown>, allowed: readonly string[], label: string): void {
-  const allowedSet = new Set(allowed);
-  const unexpected = Object.keys(value).find((key) => !allowedSet.has(key));
-  if (unexpected) throw new Error(`${label} contains unsupported field '${unexpected}'.`);
-}
-
-function boundedString(value: unknown, label: string, maxLength: number): asserts value is string {
-  if (typeof value !== 'string' || value.trim().length === 0 || value.length > maxLength) {
-    throw new Error(`${label} must be a non-empty string no longer than ${maxLength} characters.`);
-  }
-}
-
-function boundedStringList(value: unknown, label: string): asserts value is string[] {
-  if (!Array.isArray(value) || value.length > MAX_LIST_ITEMS) {
-    throw new Error(`${label} must be an array of at most ${MAX_LIST_ITEMS} strings.`);
-  }
-  value.forEach((entry, index) => boundedString(entry, `${label}[${index}]`, MAX_LIST_STRING_LENGTH));
-}
-
-function validateBounds(bounds: UltraPlanBounds): void {
-  if (
-    !Number.isSafeInteger(bounds.minLanes)
-    || !Number.isSafeInteger(bounds.maxLanes)
-    || bounds.minLanes < ULTRA_MIN_LANES
-    || bounds.maxLanes > ULTRA_MAX_LANES
-    || bounds.minLanes > bounds.maxLanes
-  ) {
-    throw new Error(`Plan bounds must be safe integers with ${ULTRA_MIN_LANES} <= minLanes <= maxLanes <= ${ULTRA_MAX_LANES}.`);
-  }
-}
-
-export function validatePlan(plan: unknown, bounds: UltraPlanBounds): UltraPlan {
-  validateBounds(bounds);
-  if (!isRecord(plan)) throw new Error('Ultra plan must be an object.');
-  exactKeys(plan, ['objective', 'evidence', 'mode', 'lanes', 'acceptance'], 'Ultra plan');
-  boundedString(plan.objective, 'Plan objective', MAX_OBJECTIVE_LENGTH);
-  boundedStringList(plan.evidence, 'Plan evidence');
-  boundedStringList(plan.acceptance, 'Plan acceptance');
-  if (plan.mode !== 'wave' && plan.mode !== 'no-wave' && plan.mode !== 'over-cap') {
-    throw new Error('Plan mode must be wave, no-wave, or over-cap.');
-  }
-  if (!Array.isArray(plan.lanes) || plan.lanes.length > MAX_PLANNED_LANES) {
-    throw new Error(`Plan lanes must be an array of at most ${MAX_PLANNED_LANES} lanes.`);
-  }
-
-  const ids = new Set<string>();
-  for (const [index, rawLane] of plan.lanes.entries()) {
-    if (!isRecord(rawLane)) throw new Error(`Lane ${index} must be an object.`);
-    exactKeys(rawLane, ['id', 'role', 'task', 'write'], `Lane ${index}`);
-    if (typeof rawLane.id !== 'string' || !LANE_ID.test(rawLane.id)) {
-      throw new Error(`Lane id at index ${index} must match ${LANE_ID.source}.`);
+    input.signal?.addEventListener('abort', abort, { once: true });
+    if (input.signal?.aborted) {
+      abort();
+      return;
     }
-    if (ids.has(rawLane.id)) throw new Error(`Lane ids must be unique; duplicate '${rawLane.id}'.`);
-    ids.add(rawLane.id);
-    if (typeof rawLane.role !== 'string' || !ROLE_NAMES.has(rawLane.role)) {
-      throw new Error(`Lane role at index ${index} must be one of: ${ULTRA_ROLE_NAMES.join(', ')}.`);
-    }
-    boundedString(rawLane.task, `Lane task at index ${index}`, MAX_TASK_LENGTH);
-    if (typeof rawLane.write !== 'boolean') throw new Error(`Lane write at index ${index} must be boolean.`);
-  }
-
-  const count = plan.lanes.length;
-  if (plan.mode === 'no-wave' && count !== 0) throw new Error('A no-wave plan must contain zero lanes.');
-  if (plan.mode === 'wave' && (count < bounds.minLanes || count > bounds.maxLanes)) {
-    throw new Error(`A wave plan must contain between ${bounds.minLanes} and ${bounds.maxLanes} lanes.`);
-  }
-  if (plan.mode === 'over-cap' && count <= bounds.maxLanes) {
-    throw new Error(`An over-cap plan must contain more than ${bounds.maxLanes} lanes and must not be launched.`);
-  }
-
-  return plan as unknown as UltraPlan;
-}
-
-function fixedModel(value: string | undefined): string | undefined {
-  return value === undefined || value === 'automatic' ? undefined : value;
-}
-
-function resolvePreflightModelBinding(input: PreflightLaneInput): {
-  requestedModel?: string;
-  expectedModel?: string;
-} {
-  if (input.model !== undefined) {
-    if (input.model === 'automatic') return {};
-    const expectedModel = input.uniformModel !== undefined
-      ? fixedModel(input.uniformModel)
-      : fixedModel(input.expectedModel);
-    return {
-      requestedModel: input.model,
-      ...(expectedModel !== undefined ? { expectedModel } : {}),
-    };
-  }
-
-  if (input.uniformModel !== undefined) {
-    const uniformModel = fixedModel(input.uniformModel);
-    return uniformModel === undefined
-      ? {}
-      : { requestedModel: uniformModel, expectedModel: uniformModel };
-  }
-
-  const expectedModel = fixedModel(input.expectedModel);
-  return expectedModel === undefined ? {} : { expectedModel };
-}
-
-export async function preflightLane(input: PreflightLaneInput): Promise<UltraLaunchContract> {
-  boundedString(input.agent, 'Preflight agent', 96);
-  boundedString(input.task, 'Preflight task', MAX_TASK_LENGTH);
-  boundedString(input.cwd, 'Preflight cwd', 4_096);
-
-  const { requestedModel, expectedModel } = resolvePreflightModelBinding(input);
-  const result = await resolveLaunchContract({
-    agent: input.agent,
-    task: input.task,
-    context: 'fresh',
-    cwd: input.cwd,
-    availableModels: input.availableModels,
-    ...(requestedModel !== undefined ? { model: requestedModel } : {}),
-  });
-  if (!result.ok) throw new Error(`Lane preflight failed (${result.code}): ${result.message}`);
-  if (result.contract.context !== 'fresh') {
-    throw new Error(`Lane preflight resolved unexpected context '${result.contract.context}'.`);
-  }
-  if (expectedModel !== undefined && result.contract.model !== expectedModel) {
-    throw new Error(`Uniform model mismatch: expected '${expectedModel}', resolved '${result.contract.model ?? 'none'}'.`);
-  }
-  return result.contract;
-}
-
-export function buildWaveWorkflow(lanes: readonly UltraLane[], agent: string): string {
-  boundedString(agent, 'Workflow agent', 96);
-  if (!Array.isArray(lanes) || lanes.length === 0 || lanes.length > ULTRA_MAX_LANES) {
-    throw new Error(`A launchable workflow requires 1..${ULTRA_MAX_LANES} lanes.`);
-  }
-
-  const keys = new Set<string>();
-  const launches = lanes.map((lane, index) => {
-    if (!isRecord(lane)) throw new Error(`Workflow lane ${index} must be an object.`);
-    if (typeof lane.id !== 'string' || !LANE_ID.test(lane.id)) throw new Error(`Workflow lane id at index ${index} is invalid.`);
-    if (keys.has(lane.id)) throw new Error(`Workflow lane ids must be unique; duplicate '${lane.id}'.`);
-    keys.add(lane.id);
-    if (typeof lane.role !== 'string' || !ROLE_NAMES.has(lane.role)) throw new Error(`Workflow lane role '${String(lane.role)}' is not an Ultra role.`);
-    boundedString(lane.task, `Workflow lane task at index ${index}`, MAX_TASK_LENGTH);
-    if (typeof lane.write !== 'boolean') throw new Error(`Workflow lane write at index ${index} must be boolean.`);
-
-    const authority = lane.write
-      ? 'Authority: WRITE only within this assigned lane. Do not change files outside the lane ownership stated in the task.'
-      : 'Authority: READ-ONLY. Inspect and report; do not edit any file.';
-    const task = `Role: ${lane.role}\n${authority}\nTask:\n${lane.task}`;
-    return {
-      key: lane.id,
-      agent,
-      task,
-      context: 'fresh' as const,
-      ...(lane.write ? { worktree: true as const } : {}),
-      output: true as const,
-    };
-  });
-
-  return `return await runs.all(${JSON.stringify(launches)});`;
-}
-
-export function spawnWave(events: UltraEventBus, script: string, cwd: string): Promise<unknown> {
-  boundedString(script, 'Workflow script', 1_048_576);
-  boundedString(cwd, 'Workflow cwd', 4_096);
-  const requestId = randomUUID();
-  const replyEvent = subagentRpcReply(requestId);
-  const pending = protocolTimeout<unknown>(
-    events,
-    replyEvent,
-    DEFAULT_PROTOCOL_TIMEOUT_MS,
-    'Subagent spawn RPC',
-    (payload, resolve, reject) => {
+    dispose = input.events.on(replyEvent, (payload) => {
       if (!isRecord(payload) || payload.requestId !== requestId) return;
-      if (payload.version !== 1) {
-        reject(new Error(`Subagent spawn RPC returned unsupported version '${String(payload.version)}'.`));
-        return;
-      }
-      if (payload.method !== undefined && payload.method !== 'spawn') {
-        reject(new Error(`Subagent spawn RPC returned mismatched method '${String(payload.method)}'.`));
+      if (payload.version !== 1 || (payload.method !== undefined && payload.method !== 'spawn')) {
+        input.authority.revokeUnused();
+        finish(() => reject(new Error('Subagent spawn RPC returned an incompatible reply.')));
         return;
       }
       if (payload.success === true) {
-        resolve(payload.data);
+        finish(() => resolve(payload.data));
         return;
       }
-      if (payload.success === false) {
-        const error = isRecord(payload.error) && typeof payload.error.message === 'string'
-          ? payload.error.message
-          : 'Subagent spawn RPC failed without an error message.';
-        reject(new Error(error));
-        return;
-      }
-      reject(new Error('Subagent spawn RPC returned a malformed reply.'));
-    },
-  );
-  events.emit(SUBAGENT_RPC_REQUEST, {
-    version: 1,
-    requestId,
-    method: 'spawn',
-    params: {
-      workflowScript: script,
-      cwd,
-      async: true,
-      context: 'fresh',
-    },
+      const message = isRecord(payload.error) && typeof payload.error.message === 'string' ? payload.error.message : 'Subagent spawn RPC failed.';
+      input.authority.revokeUnused();
+      finish(() => reject(new Error(message)));
+    });
+    input.events.emit(SUBAGENT_RPC_REQUEST, {
+      version: 1,
+      requestId,
+      method: 'spawn',
+      source: { extension: 'pi-ultra' },
+      params: input.prepared.params,
+      authorization: { launchPermits: [permit] },
+    });
   });
-  return pending;
 }
