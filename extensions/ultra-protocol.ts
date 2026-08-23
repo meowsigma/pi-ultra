@@ -313,8 +313,11 @@ async function preflight(
     capabilityCeiling: input.capabilityCeiling,
   });
   if (!result.ok) throw new Error(`Lane '${lane.id}' preflight failed (${result.code}): ${result.message}`);
-  validateRoleContract(lane.role, agent, result.contract);
-  return result.contract;
+  const contract = result.contract.modelCandidates.length === 0 && result.contract.model
+    ? { ...result.contract, modelCandidates: [result.contract.model] }
+    : result.contract;
+  validateRoleContract(lane.role, agent, contract);
+  return contract;
 }
 
 export interface PrepareUltraWaveInput {
