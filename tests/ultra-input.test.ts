@@ -234,6 +234,10 @@ test('owned prefix is deduplicated and stripped by input transform before agent 
   const before = await h.pi.inputToAgentStart(`${ULTRA_OWNED_PREFIX}${ULTRA_OWNED_PREFIX}Implement it.`);
   assert.deepEqual(before.inputResult, { action: 'transform', text: 'Implement it.' });
   assert.equal(before.prompt, 'Implement it.');
+
+  const spaced = await h.pi.inputToAgentStart(`${ULTRA_OWNED_PREFIX} ${ULTRA_OWNED_PREFIX}Implement it.`);
+  assert.deepEqual(spaced.inputResult, { action: 'transform', text: 'Implement it.' });
+  assert.equal(spaced.prompt, 'Implement it.');
   assert.equal(h.plannerTasks.length, 1, 'owned requeue must not plan again');
 });
 

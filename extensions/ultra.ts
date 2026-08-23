@@ -102,7 +102,7 @@ function bounded(value: unknown, maxLength = MAX_RESULT_STRING_LENGTH): string |
 function stripOwnedPrefix(text: string): string {
   let stripped = text.trimStart();
   while (stripped.startsWith(ULTRA_OWNED_PREFIX)) {
-    stripped = stripped.slice(ULTRA_OWNED_PREFIX.length);
+    stripped = stripped.slice(ULTRA_OWNED_PREFIX.length).trimStart();
   }
   return stripped;
 }
