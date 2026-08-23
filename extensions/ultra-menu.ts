@@ -1,468 +1,279 @@
-// ── Ultra control menu — pure data build functions and TUI adapter ──
-
-import {
-  defineMenu,
-  runMenu,
-} from '@narumitw/pi-tui-kit';
+import { defineMenu, runMenu } from '@narumitw/pi-tui-kit';
 import type {
   ActionsScreen,
   ChoiceScreen,
+  MenuActionContext,
   MenuActionHandler,
   MenuScreenFactory,
   RunMenuOptions,
   RunMenuResult,
   SettingsScreen,
-  MenuActionContext,
 } from '@narumitw/pi-tui-kit';
 import type { ExtensionCommandContext } from '@earendil-works/pi-coding-agent';
-import {
-  ULTRA_MAX_LANES,
-  ULTRA_MIN_LANES,
-  effectiveUniformModel,
-  normalizeUltraSettings,
+import type {
+  InvalidUltraSettingsResult,
+  LoadUltraSettingsResult,
+  UltraSettings,
+  UltraSettingsMutator,
+  UltraSettingsPatch,
+  ValidUltraSettingsResult,
 } from './ultra-config.js';
-import type { UltraSettings } from './ultra-config.js';
 
-// ── Constants ─────────────────────────────────────────────────────
-
-const LANE_OPTIONS: readonly string[] = (() => {
-  const opts: string[] = [];
-  for (let i = ULTRA_MIN_LANES; i <= ULTRA_MAX_LANES; i++) {
-    opts.push(String(i));
-  }
-  return opts;
-})();
-
-// ── Exported types ────────────────────────────────────────────────
-
-export type UltraScreenId = 'main' | 'settings' | 'help' | 'model-select';
+export type UltraScreenId = 'main' | 'settings' | 'help' | 'model-select' | 'lane-range';
 export type UltraActionId =
-  | 'enable-ultra'
-  | 'disable-ultra'
-  | 'set-ultra'
-  | 'set-routing'
-  | 'set-model'
-  | 'set-min-lanes'
-  | 'set-max-lanes';
+  | 'enable-ultra' | 'disable-ultra' | 'set-ultra' | 'set-routing' | 'set-model'
+  | 'set-lane-range' | 'recover-config';
 
-/**
- * Input context for showUltraMenu.
- * Covers the ExtensionCommandContext subset needed to render the menu
- * and resolve available models.
- */
-export type UltraMenuContext = Pick<
-  ExtensionCommandContext,
-  'mode' | 'hasUI' | 'scopedModels' | 'model'
-> & {
-  ui: Pick<ExtensionCommandContext['ui'], 'custom' | 'input' | 'select' | 'notify'>;
+export type UltraMenuContext = Pick<ExtensionCommandContext, 'mode' | 'hasUI' | 'model' | 'scopedModels'> & {
+  ui: Pick<ExtensionCommandContext['ui'], 'custom' | 'input' | 'select' | 'confirm' | 'notify'>;
   modelRegistry: Pick<ExtensionCommandContext['modelRegistry'], 'getAvailable'>;
 };
 
 export interface ShowUltraMenuOptions {
-  /** The Pi extension context (or compatible subset). */
   ctx: UltraMenuContext;
-  /** Current ultra settings. */
-  settings: UltraSettings;
-  /**
-   * Async save function called exactly once after every successful
-   * setting change that passes normalizeUltraSettings. Throwing from
-   * this function signals a save failure — in-memory state is not
-   * corrupted because the caller retains the previous settings.
-   */
-  save(settings: UltraSettings): Promise<void>;
-  /** Optional abort signal. */
+  state: LoadUltraSettingsResult;
+  update(patch: UltraSettingsPatch | UltraSettingsMutator): Promise<ValidUltraSettingsResult>;
+  recover(): Promise<{ backupPath: string; committed: ValidUltraSettingsResult }>;
   signal?: AbortSignal;
 }
 
-// ── Help text ─────────────────────────────────────────────────────
+const HELP_LINES = [
+  'Ultra keeps the active session model as manager and final reviewer.',
+  'It launches only exact, preflighted, independent worker waves.',
+  'Escalation: one initial attempt, one focused repair, then main-model takeover.',
+  'Uniform routing pins every role lane to one canonical model.',
+  'Role defaults preserve each strict role candidate chain.',
+  'Lane ranges are hard per-wave bounds; Ultra never manufactures padding.',
+  'Worker completion is evidence, never acceptance.',
+] as const;
 
-const HELP_LINES: readonly string[] = [
-  'Ultra Control — manage parallel subagent wave execution.',
-  '',
-  'Enable Ultra to delegate bounded work to parallel lanes of',
-  'worker agents. Each lane has a role (scout, worker, or',
-  'reviewer) with corresponding authority.',
-  '',
-  'Routing modes:',
-  '\u2022 One model for every lane — all lanes use the same model',
-  '\u2022 Role defaults — each role uses its configured default model',
-  '',
-  'Lanes: Minimum to maximum subagents deployed per wave.',
-  'Min 1, max 8.',
-  '',
-  'Settings persist in pi-ultra.json.',
-];
+const PRESETS = [
+  { id: 'small', label: 'Small — 1–2', minLanes: 1, maxLanes: 2 },
+  { id: 'balanced', label: 'Balanced — 2–4', minLanes: 2, maxLanes: 4 },
+  { id: 'large', label: 'Large — 4–8', minLanes: 4, maxLanes: 8 },
+] as const;
 
-// ── Routing label helpers ─────────────────────────────────────────
+function isValidState(state: LoadUltraSettingsResult): state is ValidUltraSettingsResult {
+  return state.kind !== 'invalid';
+}
 
-function routingLabel(mode: 'uniform' | 'role-defaults'): string {
+function routingLabel(mode: UltraSettings['routingMode']): string {
   return mode === 'uniform' ? 'One model for every lane' : 'Role defaults';
 }
 
-function routingValue(label: string): 'uniform' | 'role-defaults' | undefined {
-  if (label === 'One model for every lane') return 'uniform';
-  if (label === 'Role defaults') return 'role-defaults';
-  return undefined;
+function presetFor(settings: UltraSettings): (typeof PRESETS)[number] | undefined {
+  return PRESETS.find((preset) => preset.minLanes === settings.minLanes && preset.maxLanes === settings.maxLanes);
 }
 
-// ── Pure screen builders ──────────────────────────────────────────
+export function laneRangeLabel(settings: UltraSettings): string {
+  const preset = presetFor(settings);
+  return preset ? `${preset.label.split(' — ')[0]} · ${settings.minLanes}–${settings.maxLanes}` : `Custom · ${settings.minLanes}–${settings.maxLanes}`;
+}
 
-/**
- * Build the main actions screen.
- *
- * Lines show:
- *   Enabled: yes|no
- *   Routing: <label>
- *   Model: <model name> | Automatic | –
- *   Lanes: <min>–<max>
- */
 export function buildMainMenu(settings: UltraSettings): ActionsScreen<UltraScreenId, UltraActionId> {
-  const enabledText = settings.enabled ? 'yes' : 'no';
-  const routeLabel = routingLabel(settings.routingMode);
-  const effective = effectiveUniformModel(settings);
-  const modelLabel = settings.routingMode === 'role-defaults'
-    ? '\u2013'
-    : effective === 'automatic'
-      ? 'Automatic'
-      : (effective ?? 'Automatic');
-  const lanesLabel = `Lanes: ${settings.minLanes}\u2013${settings.maxLanes}`;
-
-  // Build with spread to avoid readonly-array mutation
-  const enableDisable: ActionsScreen<UltraScreenId, UltraActionId>['items'] = settings.enabled
-    ? [{ id: 'disable-ultra', label: 'Disable Ultra', action: 'disable-ultra' }]
-    : [{ id: 'enable-ultra', label: 'Enable Ultra', action: 'enable-ultra' }];
-
-  const items: ActionsScreen<UltraScreenId, UltraActionId>['items'] = [
-    ...enableDisable,
-    { id: 'settings', label: 'Settings\u2026', to: 'settings' },
-    { id: 'help', label: 'Help', to: 'help' },
-    { id: 'close', label: 'Close', close: true },
-  ];
-
+  const model = settings.routingMode === 'role-defaults' ? 'Role defaults' : settings.workerModel ?? 'Automatic';
   return {
     kind: 'actions',
     title: 'Ultra Control',
     lines: [
-      `Enabled: ${enabledText}`,
-      `Routing: ${routeLabel}`,
-      `Model: ${modelLabel}`,
-      lanesLabel,
+      `Ultra: ${settings.enabled ? 'Enabled' : 'Disabled'}`,
+      `Routing: ${routingLabel(settings.routingMode)}`,
+      `Model: ${model}`,
+      `Lane range: ${laneRangeLabel(settings)}`,
     ],
-    items,
+    items: [
+      settings.enabled
+        ? { id: 'disable-ultra', label: 'Disable Ultra', action: 'disable-ultra' }
+        : { id: 'enable-ultra', label: 'Enable Ultra', action: 'enable-ultra' },
+      { id: 'settings', label: 'Settings…', to: 'settings' },
+      { id: 'help', label: 'Help', to: 'help' },
+      { id: 'close', label: 'Close', close: true },
+    ],
     hint: 'close',
   };
 }
 
-/**
- * Build the settings screen.
- *
- * Items: Ultra (enabled toggle), Routing mode, Worker model,
- * Minimum subagents, Maximum subagents.
- *
- * The Worker model item does NOT carry values — model selection
- * uses a dedicated ChoiceScreen (buildModelChoiceScreen).
- *
- * @param params.settings – current UltraSettings
- * @param params.availableModels – optional list of model IDs from
- *   ctx.scopedModels or ctx.modelRegistry.getAvailable().
- *   When provided, an unavailable saved model is described on the
- *   enabled row so the user can open the picker and recover.
- */
-export function buildSettingsScreen(params: {
-  settings: UltraSettings;
-  availableModels?: readonly string[];
-}): SettingsScreen<UltraActionId> {
-  const { settings, availableModels } = params;
+export function buildBlockedMenu(state: InvalidUltraSettingsResult): ActionsScreen<UltraScreenId, UltraActionId> {
+  return {
+    kind: 'actions',
+    title: 'Ultra Control — Blocked',
+    lines: ['Ultra: Blocked', state.reason.slice(0, 512), 'New subagent launches remain denied until recovery or a valid off state is committed.'],
+    items: [
+      { id: 'recover', label: 'Back up invalid file and reset disabled…', action: 'recover-config' },
+      { id: 'help', label: 'Help', to: 'help' },
+      { id: 'close', label: 'Close', close: true },
+    ],
+    hint: 'close',
+  };
+}
 
-  const savedModel = settings.workerModel;
-  const modelUnavailable =
-    savedModel !== undefined &&
-    availableModels !== undefined &&
-    !availableModels.includes(savedModel);
-
-  const items: SettingsScreen<UltraActionId>['items'] = [
-    {
-      id: 'ultra',
-      label: 'Ultra',
-      currentValue: settings.enabled ? 'Enabled' : 'Disabled',
-      values: ['Enabled', 'Disabled'],
-      action: 'set-ultra',
-    },
-    {
-      id: 'routing-mode',
-      label: 'Routing mode',
-      currentValue: routingLabel(settings.routingMode),
-      values: ['One model for every lane', 'Role defaults'],
-      action: 'set-routing',
-    },
-    {
-      id: 'worker-model',
-      label: 'Worker model',
-      currentValue: savedModel ?? 'Automatic',
-      action: 'set-model',
-      ...(modelUnavailable ? { description: 'Saved model no longer available; choose a replacement' } : {}),
-    },
-    {
-      id: 'min-subagents',
-      label: 'Minimum subagents',
-      currentValue: String(settings.minLanes),
-      values: [...LANE_OPTIONS],
-      action: 'set-min-lanes',
-    },
-    {
-      id: 'max-subagents',
-      label: 'Maximum subagents',
-      currentValue: String(settings.maxLanes),
-      values: [...LANE_OPTIONS],
-      action: 'set-max-lanes',
-    },
-  ];
-
+export function buildSettingsScreen(settings: UltraSettings, availableIds: readonly string[]): SettingsScreen<UltraActionId> {
+  const unavailable = settings.workerModel !== undefined && !availableIds.includes(settings.workerModel);
   return {
     kind: 'settings',
     title: 'Ultra Settings',
-    items,
+    items: [
+      { id: 'ultra', label: 'Ultra', currentValue: settings.enabled ? 'Enabled' : 'Disabled', values: ['Enabled', 'Disabled'], action: 'set-ultra' },
+      { id: 'routing-mode', label: 'Routing mode', currentValue: routingLabel(settings.routingMode), values: ['One model for every lane', 'Role defaults'], action: 'set-routing' },
+      {
+        id: 'worker-model', label: 'Worker model', currentValue: settings.workerModel ?? 'Automatic', values: [settings.workerModel ?? 'Automatic', 'Choose…'], action: 'set-model',
+        description: unavailable ? 'Saved model is unavailable; used only by uniform routing' : 'Used only by uniform routing',
+      },
+      { id: 'lane-range', label: 'Lane range', currentValue: laneRangeLabel(settings), values: [laneRangeLabel(settings), 'Choose…'], action: 'set-lane-range', description: 'Hard per-wave eligibility bounds' },
+    ],
   };
 }
 
-/**
- * Build the model choice screen.
- *
- * Items: Automatic first, then available models.
- * If the saved workerModel is set and not in the available list,
- * it is appended as a disabled item with a "Not available" reason.
- */
+interface CatalogEntry {
+  id: string;
+  label: string;
+  searchText: string;
+}
+
+export function buildModelCatalog(models: ReadonlyArray<{ provider: string; id: string; name?: string }>): CatalogEntry[] {
+  const grouped = new Map<string, Set<string>>();
+  for (const model of models) {
+    if (!model || typeof model.provider !== 'string' || typeof model.id !== 'string') continue;
+    const provider = model.provider.trim();
+    const id = model.id.trim();
+    if (!provider || !id) continue;
+    const canonical = `${provider}/${id}`;
+    const names = grouped.get(canonical) ?? new Set<string>();
+    if (typeof model.name === 'string' && model.name.trim()) names.add(model.name.trim());
+    grouped.set(canonical, names);
+  }
+  return [...grouped.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([canonical, names]) => {
+    const sortedNames = [...names].sort((left, right) => left.localeCompare(right));
+    const displayName = sortedNames[0];
+    return {
+      id: canonical,
+      label: displayName && displayName !== canonical ? `${displayName} · ${canonical}` : canonical,
+      searchText: [canonical, canonical.split('/')[0], canonical.split('/').slice(1).join('/'), ...sortedNames].join(' '),
+    };
+  });
+}
+
 export function buildModelChoiceScreen(params: {
   settings: UltraSettings;
-  availableModels: readonly string[];
+  catalog: readonly CatalogEntry[];
 }): ChoiceScreen<UltraActionId> {
-  const { settings, availableModels } = params;
-  const savedModel = settings.workerModel;
-
-  // Build items via flat arrays to avoid readonly mutation
-  const modelItems: ChoiceScreen<UltraActionId>['items'] = availableModels.map((modelId) => ({
-    id: modelId,
-    label: modelId,
-  }));
-
-  const unavailableItem: ChoiceScreen<UltraActionId>['items'] =
-    savedModel !== undefined && !availableModels.includes(savedModel)
-      ? [{
-          id: savedModel,
-          label: savedModel,
-          disabled: true,
-          disabledReason: 'Not available',
-          details: ['This model was previously selected but is no longer available.'],
-        }]
-      : [];
-
-  const items: ChoiceScreen<UltraActionId>['items'] = [
-    {
-      id: 'automatic',
-      label: 'Automatic',
-      description: 'Let the system select the best model',
-    },
-    ...modelItems,
-    ...unavailableItem,
-  ];
-
-  const currentItemId = savedModel ?? 'automatic';
-
+  const available = new Set(params.catalog.map((entry) => entry.id));
+  const saved = params.settings.workerModel;
   return {
     kind: 'choice',
     title: 'Worker model',
-    items,
+    lines: ['Uniform routing pins every role lane to this one model.'],
+    items: [
+      { id: 'automatic', label: 'Automatic', description: 'Resolve one model, then pin it for the complete wave', searchText: 'automatic default' },
+      ...params.catalog.map((entry) => ({ id: entry.id, label: entry.label, searchText: entry.searchText })),
+      ...(saved && !available.has(saved) ? [{ id: saved, label: saved, disabled: true, disabledReason: 'Not available', details: ['Previously selected canonical model is unavailable.'] }] : []),
+    ],
     action: 'set-model',
-    currentItemId,
+    currentItemId: saved ?? 'automatic',
+    initialItemId: saved && available.has(saved) ? saved : 'automatic',
+    enableSearch: true,
+    viewportSize: 10,
+    hint: 'back',
   };
 }
 
-// ── applySetting ──────────────────────────────────────────────────
-
-/**
- * Apply a single field change to an UltraSettings object.
- *
- * Returns a complete next-settings copy (via normalizeUltraSettings)
- * or undefined if the change would produce an invalid state.
- *
- * Key behaviors:
- * - Returns a new object (does not mutate the input).
- * - Setting workerModel to 'Automatic' or undefined removes the field.
- * - String lane values are parsed as integers.
- * - Invalid values (out-of-range lanes, bad routing mode) cause
- *   undefined to be returned.
- * - The result is always a full normalized settings object.
- */
-export function applySetting(
-  settings: UltraSettings,
-  field: string,
-  value: unknown,
-): UltraSettings | undefined {
-  // Build the candidate object from a copy of the original settings
-  const next: Record<string, unknown> = {
-    version: settings.version,
-    enabled: settings.enabled,
-    routingMode: settings.routingMode,
-    minLanes: settings.minLanes,
-    maxLanes: settings.maxLanes,
+export function buildLaneRangeScreen(settings: UltraSettings): ChoiceScreen<UltraActionId> {
+  const preset = presetFor(settings);
+  return {
+    kind: 'choice',
+    title: 'Lane range',
+    lines: ['Hard inclusive bounds for each admitted wave.'],
+    items: [
+      ...PRESETS.map((item) => ({ id: item.id, label: item.label })),
+      { id: 'custom', label: 'Custom…', description: 'Enter MIN-MAX within 1–8' },
+    ],
+    action: 'set-lane-range',
+    currentItemId: preset?.id ?? 'custom',
+    initialItemId: preset?.id ?? 'custom',
+    viewportSize: 6,
+    hint: 'back',
   };
-
-  if ('workerModel' in settings && settings.workerModel !== undefined) {
-    next.workerModel = settings.workerModel;
-  }
-
-  // Apply the change
-  if (field === 'workerModel') {
-    if (value === 'Automatic' || value === undefined || value === '') {
-      delete next.workerModel;
-    } else if (typeof value === 'string') {
-      const trimmed = value.trim();
-      if (trimmed.length === 0) {
-        delete next.workerModel;
-      } else {
-        next.workerModel = trimmed;
-      }
-    } else {
-      // Non-string workerModel — let normalize reject it
-      next.workerModel = value;
-    }
-  } else if (field === 'minLanes' || field === 'maxLanes') {
-    // Parse lane strings to numbers
-    if (typeof value === 'string') {
-      const trimmed = value.trim();
-      if (!/^\d+$/u.test(trimmed)) return undefined;
-      const parsed = Number(trimmed);
-      if (!Number.isSafeInteger(parsed)) return undefined;
-      next[field] = parsed;
-    } else {
-      next[field] = value;
-    }
-  } else {
-    next[field] = value;
-  }
-
-  return normalizeUltraSettings(next);
 }
 
-// ── TUI adapter ───────────────────────────────────────────────────
-
-type MenuState = { settings: UltraSettings };
-
-/**
- * Resolve available model IDs from the context.
- */
-function resolveAvailableModels(ctx: UltraMenuContext): readonly string[] {
-  const scoped = ctx.scopedModels.map(({ model }) => model);
-  const registry = scoped.length === 0 ? ctx.modelRegistry.getAvailable() : [];
-  const models = scoped.length > 0
-    ? scoped
-    : registry.length > 0
-      ? registry
-      : ctx.model === undefined
-        ? []
-        : [ctx.model];
-
-  return [...new Set(models.map((model) => `${model.provider}/${model.id}`))];
+export function parseCustomLaneRange(value: string): { minLanes: number; maxLanes: number } | undefined {
+  const normalized = value.normalize('NFKC').trim().replace(/\s*[–—]\s*/gu, '-');
+  const match = normalized.match(/^(\d+)\s*-\s*(\d+)$/u);
+  if (!match) return undefined;
+  const minLanes = Number(match[1]);
+  const maxLanes = Number(match[2]);
+  if (!Number.isSafeInteger(minLanes) || !Number.isSafeInteger(maxLanes) || minLanes < 1 || maxLanes > 8 || minLanes > maxLanes) return undefined;
+  return { minLanes, maxLanes };
 }
 
-/**
- * Run the full Ultra control menu using the pi-tui-kit runtime.
- *
- * The menu renders in the Pi TUI or RPC adapter depending on the
- * context's mode. The supplied save function is called exactly once
- * after each successful setting change.
- *
- * On save failure, the error is surfaced but the in-memory state
- * is preserved (the caller retains its original settings).
- */
-export async function showUltraMenu(
-  options: ShowUltraMenuOptions,
-): Promise<RunMenuResult> {
-  const { ctx, settings, save, signal: externalSignal } = options;
-  let currentSettings = { ...settings };
+export async function showUltraMenu(options: ShowUltraMenuOptions): Promise<RunMenuResult> {
+  let current = options.state;
+  const catalog = buildModelCatalog(options.ctx.modelRegistry.getAvailable());
+  const availableIds = catalog.map((entry) => entry.id);
+  type State = { state: LoadUltraSettingsResult };
 
-  const availableModels = resolveAvailableModels(ctx);
-
-  // ── Screen factories ──────────────────────────────────────────
-
-  const screens: Record<
-    UltraScreenId,
-    MenuScreenFactory<MenuState, UltraScreenId, UltraActionId>
-  > = {
-    main: () => buildMainMenu(currentSettings),
-    settings: () => buildSettingsScreen({ settings: currentSettings, availableModels }),
-    help: () => ({
-      kind: 'detail' as const,
-      title: 'Help',
-      lines: [...HELP_LINES],
-      hint: 'back' as const,
-    }),
-    'model-select': () =>
-      buildModelChoiceScreen({
-        settings: currentSettings,
-        availableModels,
-      }),
+  const requireSettings = (): UltraSettings => {
+    if (!isValidState(current)) throw new Error('Ultra configuration is blocked.');
+    return current.settings;
   };
 
-  // ── Action handlers ───────────────────────────────────────────
-
-  async function settingAction(
-    field: string,
-    value: unknown,
-  ): Promise<{ kind: 'stay' } | { kind: 'rejected'; error: unknown }> {
-    const next = applySetting(currentSettings, field, value);
-    if (next === undefined) {
-      return { kind: 'rejected', error: `Invalid value for ${field}` };
-    }
+  const apply = async (patch: UltraSettingsPatch | UltraSettingsMutator) => {
     try {
-      await save(next);
+      current = await options.update(patch);
+      return { kind: 'stay' as const };
     } catch (error) {
-      return { kind: 'rejected', error };
+      return { kind: 'rejected' as const, error };
     }
-    currentSettings = next;
-    return { kind: 'stay' };
-  }
+  };
 
-  const actions: Record<
-    UltraActionId,
-    MenuActionHandler<MenuState, UltraScreenId, UltraMenuContext>
-  > = {
-    'enable-ultra': () => settingAction('enabled', true),
-    'disable-ultra': () => settingAction('enabled', false),
-    'set-ultra': (actCtx: MenuActionContext<MenuState, UltraMenuContext>) => {
-      const enabled = actCtx.value === 'Enabled';
-      return settingAction('enabled', enabled);
+  const screens: Record<UltraScreenId, MenuScreenFactory<State, UltraScreenId, UltraActionId>> = {
+    main: () => isValidState(current) ? buildMainMenu(current.settings) : buildBlockedMenu(current),
+    settings: () => buildSettingsScreen(requireSettings(), availableIds),
+    help: () => ({ kind: 'detail', title: 'Ultra Help', lines: HELP_LINES, hint: 'back' }),
+    'model-select': () => buildModelChoiceScreen({ settings: requireSettings(), catalog }),
+    'lane-range': () => buildLaneRangeScreen(requireSettings()),
+  };
+
+  const actions: Record<UltraActionId, MenuActionHandler<State, UltraScreenId, UltraMenuContext>> = {
+    'enable-ultra': () => apply({ enabled: true }),
+    'disable-ultra': () => apply({ enabled: false }),
+    'set-ultra': (ctx) => apply({ enabled: ctx.value === 'Enabled' }),
+    'set-routing': (ctx) => {
+      if (ctx.value === 'One model for every lane') return apply({ routingMode: 'uniform' });
+      if (ctx.value === 'Role defaults') return apply({ routingMode: 'role-defaults' });
+      return { kind: 'rejected', error: 'Invalid routing mode.' };
     },
-    'set-routing': (actCtx: MenuActionContext<MenuState, UltraMenuContext>) => {
-      const mode = routingValue(actCtx.value ?? '');
-      if (mode === undefined) return { kind: 'rejected' as const, error: 'Invalid routing mode' };
-      return settingAction('routingMode', mode);
+    'set-model': (ctx) => {
+      if (ctx.itemId === 'worker-model') return { kind: 'to', screen: 'model-select' };
+      return apply(ctx.itemId === 'automatic' ? { workerModel: undefined } : { workerModel: ctx.itemId });
     },
-    'set-model': (actCtx: MenuActionContext<MenuState, UltraMenuContext>) => {
-      if (actCtx.itemId === 'worker-model') {
-        return { kind: 'to' as const, screen: 'model-select' as const };
+    'set-lane-range': (ctx: MenuActionContext<State, UltraMenuContext>) => {
+      if (ctx.itemId === 'lane-range') return { kind: 'to', screen: 'lane-range' };
+      const preset = PRESETS.find((item) => item.id === ctx.itemId);
+      if (preset) return apply({ minLanes: preset.minLanes, maxLanes: preset.maxLanes });
+      if (ctx.itemId !== 'custom') return { kind: 'rejected', error: 'Invalid lane range selection.' };
+      return (async () => {
+        const draft = await options.ctx.ui.input('Custom lane range', 'MIN-MAX (1–8)');
+        if (draft === undefined) return { kind: 'stay' as const };
+        const parsed = parseCustomLaneRange(draft);
+        if (!parsed) return { kind: 'rejected' as const, error: 'Enter MIN-MAX with 1 <= MIN <= MAX <= 8.' };
+        return apply(parsed);
+      })();
+    },
+    'recover-config': async () => {
+      const confirmed = await options.ctx.ui.confirm('Recover Ultra configuration?', 'The exact invalid file will be backed up, then Ultra will reset to disabled defaults.');
+      if (!confirmed) return { kind: 'stay' };
+      try {
+        const recovered = await options.recover();
+        current = recovered.committed;
+        options.ctx.ui.notify(`Ultra configuration backed up to ${recovered.backupPath} and reset disabled.`, 'info');
+        return { kind: 'stay' };
+      } catch (error) {
+        return { kind: 'rejected', error };
       }
-      return settingAction(
-        'workerModel',
-        actCtx.itemId === 'automatic' ? undefined : actCtx.itemId,
-      );
     },
-    'set-min-lanes': (actCtx: MenuActionContext<MenuState, UltraMenuContext>) =>
-      settingAction('minLanes', actCtx.value ?? ''),
-    'set-max-lanes': (actCtx: MenuActionContext<MenuState, UltraMenuContext>) =>
-      settingAction('maxLanes', actCtx.value ?? ''),
   };
 
-  const definition = defineMenu<MenuState, UltraScreenId, UltraActionId, UltraMenuContext>({
-    start: 'main',
-    screens,
-    actions,
-  });
-
-  const menuOptions: RunMenuOptions<MenuState, UltraMenuContext> = {
-    getState: () => ({ settings: currentSettings }),
-    signal: externalSignal,
-  };
-
-  return runMenu(ctx, definition, menuOptions);
+  const definition = defineMenu<State, UltraScreenId, UltraActionId, UltraMenuContext>({ start: 'main', screens, actions });
+  const menuOptions: RunMenuOptions<State, UltraMenuContext> = { getState: () => ({ state: current }), signal: options.signal };
+  return runMenu(options.ctx, definition, menuOptions);
 }
