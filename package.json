@@ -39,17 +39,22 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.84.0",
-    "pi-subagents": ">=0.54.0"
+    "pi-subagents": "0.55.1-ultra.0",
+    "typebox": "*"
   },
   "dependencies": {
-    "@narumitw/pi-tui-kit": "^0.57.0"
+    "@narumitw/pi-tui-kit": "^0.57.0",
+    "pi-subagents": "github:meowsigma/pi-subagents#9abcc3adf54d9196cbaba2b4262a53e97ef1f2e8"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.84.2",
     "@earendil-works/pi-tui": "0.84.2",
     "@types/node": "^26.2.0",
-    "pi-subagents": "0.54.0",
     "tsx": "^4.20.0",
+    "typebox": "1.3.7",
     "typescript": "^5.9.0"
-  }
+  },
+  "bundledDependencies": [
+    "pi-subagents"
+  ]
 }
