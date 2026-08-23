@@ -1,7 +1,8 @@
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { watch, watchFile, unwatchFile } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 
 export const ULTRA_CONFIG_VERSION = 1 as const;
 export const ULTRA_MIN_LANES = 1 as const;
@@ -304,6 +305,41 @@ export async function saveUltraSettings(settings: Record<string, unknown>, pathI
   const normalized = normalizeUltraSettings(settings);
   if (!normalized) throw new Error('Invalid settings: normalization failed.');
   await updateUltraSettings(normalized, pathInput);
+}
+
+export function watchUltraSettings(
+  onChange: () => void | Promise<void>,
+  pathInput?: string,
+  onError?: (error: Error) => void,
+): () => void {
+  const path = settingsPath(pathInput);
+  let disposed = false;
+  let pending = false;
+  const trigger = () => {
+    if (disposed || pending) return;
+    pending = true;
+    queueMicrotask(() => {
+      pending = false;
+      if (disposed) return;
+      Promise.resolve(onChange()).catch((error) => onError?.(error instanceof Error ? error : new Error(String(error))));
+    });
+  };
+  watchFile(path, { interval: 500, persistent: false }, trigger);
+  let directoryWatcher: ReturnType<typeof watch> | undefined;
+  try {
+    directoryWatcher = watch(dirname(path), { persistent: false }, (_event, filename) => {
+      if (filename === null || filename.toString() === basename(path)) trigger();
+    });
+    directoryWatcher.on('error', (error) => onError?.(error));
+  } catch (error) {
+    onError?.(error instanceof Error ? error : new Error(String(error)));
+  }
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    unwatchFile(path, trigger);
+    directoryWatcher?.close();
+  };
 }
 
 export async function backupAndResetUltraSettings(

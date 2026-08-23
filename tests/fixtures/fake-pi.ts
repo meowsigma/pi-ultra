@@ -76,16 +76,24 @@ export interface FakePiContext {
     select(...args: unknown[]): Promise<undefined>;
   };
   scopedModels: unknown[];
-  model: undefined;
+  model: any;
   modelRegistry: { getAvailable(): unknown[] };
+  sessionManager: {
+    getSessionId(): string;
+    getSessionFile(): string;
+    getLeafId(): string;
+    getBranch(): unknown[];
+  };
 }
 
 export class FakePi {
   readonly events = new FakeEventBus();
   readonly commands = new Map<string, FakeCommand>();
+  readonly tools = new Map<string, any>();
   readonly handlers = new Map<string, Set<(event: any, ctx: FakePiContext) => unknown>>();
   readonly userMessages: Array<{ content: unknown; options?: unknown }> = [];
   readonly messages: Array<{ message: FakeMessage; options?: unknown }> = [];
+  readonly entries: Array<{ type: 'custom'; customType: string; data: unknown }> = [];
   readonly statuses: Array<{ key: string; value: string | undefined }> = [];
   readonly notifications: FakeNotification[] = [];
   readonly availableModels: unknown[] = [];
@@ -107,11 +115,21 @@ export class FakePi {
       scopedModels: [],
       model: undefined,
       modelRegistry: { getAvailable: () => this.availableModels },
+      sessionManager: {
+        getSessionId: () => 'fake-session',
+        getSessionFile: () => '/tmp/fake-session.jsonl',
+        getLeafId: () => 'fake-leaf',
+        getBranch: () => this.entries,
+      },
     };
   }
 
   registerCommand(name: string, command: FakeCommand): void {
     this.commands.set(name, command);
+  }
+
+  registerTool(tool: any): void {
+    this.tools.set(tool.name, tool);
   }
 
   on(event: string, handler: (event: any, ctx: FakePiContext) => unknown): void {
@@ -131,6 +149,10 @@ export class FakePi {
     this.messages.push({ message, options });
   }
 
+  appendEntry(customType: string, data: unknown): void {
+    this.entries.push({ type: 'custom', customType, data });
+  }
+
   async command(name: string, args = '', context = this.context): Promise<void> {
     const command = this.commands.get(name);
     if (!command) throw new Error(`Command not registered: ${name}`);
@@ -145,10 +167,17 @@ export class FakePi {
     return results;
   }
 
+  async tool(name: string, params: unknown, context = this.context): Promise<unknown> {
+    const tool = this.tools.get(name);
+    if (!tool) throw new Error(`Tool not registered: ${name}`);
+    return tool.execute(`tool-${name}`, params, new AbortController().signal, undefined, context);
+  }
+
   /** Simulate Pi's input transform pipeline and expose the prompt reaching agent start. */
   async inputToAgentStart(text: string, source = 'interactive'): Promise<{
     inputResult: unknown;
     prompt?: string;
+    systemPrompt?: string;
   }> {
     let current = text;
     let lastResult: unknown = { action: 'continue' };
@@ -158,8 +187,12 @@ export class FakePi {
       if (result?.action === 'handled') return { inputResult: result };
       if (result?.action === 'transform') current = result.text;
     }
-    await this.emit('before_agent_start', { type: 'before_agent_start', prompt: current, systemPrompt: '' });
-    return { inputResult: lastResult, prompt: current };
+    let systemPrompt = '';
+    for (const handler of [...(this.handlers.get('before_agent_start') ?? [])]) {
+      const result = await handler({ type: 'before_agent_start', prompt: current, systemPrompt }, this.context) as any;
+      if (typeof result?.systemPrompt === 'string') systemPrompt = result.systemPrompt;
+    }
+    return { inputResult: lastResult, prompt: current, systemPrompt };
   }
 
   handlerCount(event: string): number {

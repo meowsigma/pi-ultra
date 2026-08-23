@@ -1,328 +1,248 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { UltraSettings } from '../extensions/ultra-config.js';
-import type { UltraLane, UltraPlan } from '../extensions/ultra-protocol.js';
+import type { UltraSettings, LoadUltraSettingsResult } from '../extensions/ultra-config.js';
 import {
-  ULTRA_OWNED_PREFIX,
-  classifyUltraInput,
   createUltraExtension,
   type UltraExtensionDependencies,
+  type UltraPolicyRegistration,
 } from '../extensions/ultra.js';
+import type { UltraDelegateInput, UltraPreparedWave } from '../extensions/ultra-protocol.js';
 import { FakePi } from './fixtures/fake-pi.js';
 
 const ENABLED: UltraSettings = {
-  version: 1,
-  enabled: true,
-  routingMode: 'role-defaults',
-  minLanes: 1,
-  maxLanes: 4,
+  version: 1, enabled: true, routingMode: 'uniform', workerModel: 'openai/test-model', minLanes: 2, maxLanes: 4,
 };
 const DISABLED: UltraSettings = { ...ENABLED, enabled: false };
 
-function wave(lanes: UltraLane[] = [
-  { id: 'worker-a', role: 'worker', task: 'Implement A.', write: true },
-]): UltraPlan {
+function delegateInput(): UltraDelegateInput {
   return {
-    objective: 'Implement the requested change.',
-    evidence: ['The task has bounded implementation work.'],
-    mode: 'wave',
-    lanes,
-    acceptance: ['Review diffs and run focused tests.'],
+    objective: 'Implement parser.',
+    lanes: [
+      { id: 'inspect', role: 'scout', task: 'Inspect parser.', deliverable: 'Evidence.' },
+      { id: 'worker', role: 'worker', task: 'Implement parser.', deliverable: 'Patch.', ownedPaths: ['src/parser'] },
+    ],
+    acceptance: ['Run tests.'],
   };
 }
 
-function noWave(mode: 'no-wave' | 'over-cap' = 'no-wave'): UltraPlan {
+function prepared(settings: UltraSettings, revision = 'revision-1'): UltraPreparedWave {
+  const lanes = [
+    { lane: delegateInput().lanes[0]!, agent: 'ultra-scout', modelCandidates: ['openai/test-model'], requestedModel: 'openai/test-model', launchContractDigest: 'a'.repeat(64) },
+    { lane: delegateInput().lanes[1]!, agent: 'ultra-worker', modelCandidates: ['openai/test-model'], requestedModel: 'openai/test-model', launchContractDigest: 'b'.repeat(64) },
+  ];
+  const script = 'return await runs.all([]);';
   return {
-    objective: 'Keep the manager in control.',
-    evidence: ['No qualified bounded wave exists.'],
-    mode,
-    lanes: mode === 'over-cap'
-      ? Array.from({ length: 5 }, (_, index) => ({
-          id: `worker-${index}`,
-          role: 'worker' as const,
-          task: `Implement ${index}.`,
-          write: true,
-        }))
-      : [],
-    acceptance: ['Manager decides next steps.'],
+    objective: 'Implement parser.', acceptance: ['Run tests.'], revision, settings, lanes, script,
+    params: { workflowScript: script, cwd: '/repo', context: 'fresh', async: true, mission: false },
   };
 }
 
-interface HarnessOptions {
-  settings?: UltraSettings;
-  plan?: UltraPlan;
-  mode?: ConstructorParameters<typeof FakePi>[0];
-  preflight?: UltraExtensionDependencies['preflightLane'];
-  spawnReceipts?: unknown[];
+function resultText(result: any): string {
+  return result.content?.map((item: any) => item.text ?? '').join('\n') ?? '';
 }
 
-function harness(options: HarnessOptions = {}) {
-  let stored = { ...(options.settings ?? ENABLED) };
-  const saved: UltraSettings[] = [];
-  const plannerTasks: string[] = [];
-  const preflights: Array<Record<string, unknown>> = [];
-  const spawns: Array<Record<string, unknown>> = [];
+function harness(options: {
+  loaded?: LoadUltraSettingsResult;
+  capabilities?: boolean;
+  launchReceipt?: unknown;
+} = {}) {
+  let loaded: LoadUltraSettingsResult = options.loaded ?? { kind: 'loaded', settings: { ...ENABLED }, revision: 'revision-1', path: '/tmp/pi-ultra.json' };
+  const policyInstalls: Array<'blocked' | 'enabled'> = [];
+  const registrations: UltraPolicyRegistration[] = [];
+  const preparedInputs: any[] = [];
+  const launches: any[] = [];
+  let watcher: (() => void) | undefined;
+  let watcherError: ((error: Error) => void) | undefined;
   let menuCalls = 0;
-  const receipts = [...(options.spawnReceipts ?? [{ details: { runId: 'run-1', asyncDir: '/tmp/run-1' } }])];
+  let uuid = 0;
 
+  const authority = { issueOnce: () => 'permit', revokeUnused() {}, dispose() {} };
   const deps: UltraExtensionDependencies = {
-    loadSettings: async () => ({ kind: 'loaded', settings: { ...stored }, revision: 'test-revision', path: '/tmp/pi-ultra.json' }),
-    saveSettings: async (settings) => {
-      stored = { ...settings };
-      saved.push({ ...settings });
+    loadSettings: async () => loaded,
+    updateSettings: async (patch) => {
+      if (loaded.kind === 'invalid') throw new Error('blocked config');
+      const nextPatch = typeof patch === 'function' ? patch(loaded.settings) : patch;
+      const settings = { ...loaded.settings, ...nextPatch } as UltraSettings;
+      loaded = { kind: 'loaded', settings, revision: `revision-${++uuid + 1}`, path: '/tmp/pi-ultra.json' };
+      return loaded;
     },
-    showMenu: async ({ save }) => {
-      menuCalls += 1;
-      await save({ ...stored, enabled: !stored.enabled });
-      return { kind: 'closed', reason: 'close' };
+    backupAndReset: async () => { throw new Error('not used'); },
+    showMenu: async () => { menuCalls += 1; return { kind: 'closed', reason: 'close' } as any; },
+    checkCapabilities: async () => options.capabilities ?? true,
+    installPolicy: async ({ mode }) => {
+      policyInstalls.push(mode);
+      const registration: UltraPolicyRegistration = {
+        mode,
+        operational: mode === 'enabled',
+        ...(mode === 'enabled' ? { authority: authority as any, capabilityCeiling: { version: 1, allowedAgents: ['ultra-scout', 'ultra-worker', 'ultra-reviewer'], allowedTools: ['read', 'grep', 'find', 'ls', 'bash', 'edit', 'write', 'contact_supervisor'], denyExtensions: true, sources: ['ultra'] } } : {}),
+        dispose() { (registration as any).disposed = true; },
+      } as UltraPolicyRegistration & { disposed?: boolean };
+      registrations.push(registration);
+      return registration;
     },
-    requestPlan: async ({ task }) => {
-      plannerTasks.push(task);
-      return options.plan ?? wave();
-    },
-    validatePlan: (plan) => plan as UltraPlan,
-    preflightLane: options.preflight ?? (async (input) => {
-      preflights.push(input as unknown as Record<string, unknown>);
-      return {
-        context: 'fresh',
-        model: input.uniformModel === 'automatic' ? 'provider/automatic-worker' : input.uniformModel ?? `provider/${input.agent}`,
-        agent: { name: input.agent },
-        roots: { outputPath: `/artifacts/${input.agent}.md` },
-      };
-    }),
-    buildWaveWorkflow: (lanes, agent) => JSON.stringify({ agent, laneIds: lanes.map((lane) => lane.id) }),
-    spawnGroup: async (input) => {
-      spawns.push(input as unknown as Record<string, unknown>);
-      const receipt = receipts.shift();
-      if (receipt === undefined) throw new Error('No fake receipt configured.');
-      return receipt;
-    },
+    watchSettings: (onChange, onError) => { watcher = onChange; watcherError = onError; return () => { watcher = undefined; watcherError = undefined; }; },
+    prepareWave: async (value) => { preparedInputs.push(value); return prepared(value.settings, value.revision); },
+    launchWave: async (value) => { launches.push(value); return options.launchReceipt ?? { text: 'Async workflow', details: { runId: 'run-1', asyncDir: '/tmp/run-1' } }; },
+    queryStatus: async () => undefined,
+    randomId: () => `op-${++uuid}`,
   };
-
-  const pi = new FakePi(options.mode ?? 'tui');
+  const pi = new FakePi('tui', '/repo');
+  pi.availableModels.push({ provider: 'openai', id: 'test-model' });
+  pi.context.model = { provider: 'openai', id: 'manager' };
   createUltraExtension(deps)(pi as any);
-  pi.events.emit('subagents:rpc:v1:ready', {
-    version: 1,
-    events: { asyncComplete: 'advertised:async-complete' },
-  });
 
   return {
-    pi,
-    deps,
-    saved,
-    plannerTasks,
-    preflights,
-    spawns,
-    get stored() { return stored; },
+    pi, deps, policyInstalls, registrations, preparedInputs, launches,
+    setLoaded(value: LoadUltraSettingsResult) { loaded = value; },
+    async start() { await pi.emit('session_start', { type: 'session_start' }); },
+    async change() { await watcher?.(); await new Promise((resolve) => setImmediate(resolve)); },
+    async failWatcher(message = 'watch failed') { await watcherError?.(new Error(message)); await new Promise((resolve) => setImmediate(resolve)); },
     get menuCalls() { return menuCalls; },
   };
 }
 
-function countPrefix(text: string): number {
-  return text.split(ULTRA_OWNED_PREFIX).length - 1;
-}
-
-test('classifyUltraInput bypasses social/commands, considers coding work, and owns prefixed text', () => {
-  assert.equal(ULTRA_OWNED_PREFIX, '<pi-ultra-owned>');
-  for (const text of ['hi', 'Hello!', 'thanks', 'thank you', '/model gpt']) {
-    assert.equal(classifyUltraInput(text), 'bypass', text);
-  }
-  for (const text of ['Implement the parser and add tests.', 'Fix the failing TypeScript build.', 'Refactor src/index.ts.']) {
-    assert.equal(classifyUltraInput(text), 'consider', text);
-  }
-  assert.equal(classifyUltraInput(`${ULTRA_OWNED_PREFIX}Implement it.`), 'owned');
-  assert.equal(classifyUltraInput(`  ${ULTRA_OWNED_PREFIX}Implement it.`), 'owned');
-  assert.equal(classifyUltraInput(`${ULTRA_OWNED_PREFIX}${ULTRA_OWNED_PREFIX}Implement it.`), 'owned');
-});
-
-test('registers exactly one command and on/off/toggle reload, lock-save, and update status', async () => {
-  const h = harness({ settings: DISABLED });
-  assert.deepEqual([...h.pi.commands.keys()], ['ultra']);
-  assert.equal(h.pi.commands.get('ultra')?.description, "Configure or run Ultra's validated subagent controller");
-
-  await h.pi.command('ultra', 'on');
-  await h.pi.command('ultra', 'off');
-  await h.pi.command('ultra', 'toggle');
-
-  assert.deepEqual(h.saved.map((settings) => settings.enabled), [true, false, true]);
-  assert.deepEqual(h.pi.statuses.slice(-3).map(({ value }) => value), ['Ultra: on', 'Ultra: off', 'Ultra: on']);
-  assert.equal(h.plannerTasks.length, 0);
-});
-
-test('bare command opens the menu only in TUI and reports the exact non-TUI error', async () => {
-  const tui = harness({ settings: DISABLED });
-  await tui.pi.command('ultra');
-  assert.equal(tui.menuCalls, 1);
-  assert.equal(tui.saved.at(-1)?.enabled, true);
-  assert.equal(tui.pi.statuses.at(-1)?.value, 'Ultra: on');
-
-  const rpc = harness({ settings: ENABLED, mode: 'rpc' });
-  await rpc.pi.command('ultra');
-  assert.equal(rpc.menuCalls, 0);
-  assert.equal(
-    rpc.pi.notifications.at(-1)?.message,
-    '/ultra menu requires TUI mode; use /ultra on, /ultra off, or /ultra toggle.',
-  );
-});
-
-test('disabled explicit task notifies and never invokes planner or spawn', async () => {
-  const h = harness({ settings: DISABLED });
-  await h.pi.command('ultra', 'Implement the controller.');
-  assert.equal(h.pi.notifications.at(-1)?.message, 'Run /ultra on first.');
-  assert.equal(h.plannerTasks.length, 0);
-  assert.equal(h.spawns.length, 0);
-});
-
-test('direct task validates, preflights, spawns, and emits only a received receipt', async () => {
-  const receipt = { text: 'Async workflow [run-direct]', details: { runId: 'run-direct', asyncDir: '/tmp/run-direct' } };
-  const h = harness({ spawnReceipts: [receipt] });
-  await h.pi.command('ultra', 'Implement the controller.');
-
-  assert.deepEqual(h.plannerTasks, ['Implement the controller.']);
-  assert.equal(h.preflights.length, 1);
-  assert.equal(h.spawns.length, 1);
-  assert.equal(h.pi.messages.length, 1);
-  assert.equal(h.pi.messages[0]?.message.customType, 'ultra-wave');
-  assert.deepEqual((h.pi.messages[0]?.message.details as any).receipt, receipt);
-  assert.match(h.pi.messages[0]?.message.content ?? '', /receipt received/i);
-  assert.doesNotMatch(h.pi.messages[0]?.message.content ?? '', /accepted|successful/i);
-});
-
-test('passive coding input runs the controller once and is handled after a wave receipt', async () => {
+test('registers one command/tool, removes passive input interception, and appends manager policy to the active model', async () => {
   const h = harness();
-  const [result] = await h.pi.emit('input', {
-    type: 'input',
-    text: 'Implement a bounded TypeScript parser and tests.',
-    source: 'interactive',
-  });
-  assert.deepEqual(result, { action: 'handled' });
-  assert.deepEqual(h.plannerTasks, ['Implement a bounded TypeScript parser and tests.']);
-  assert.equal(h.spawns.length, 1);
+  await h.start();
+  assert.deepEqual([...h.pi.commands.keys()], ['ultra']);
+  assert.deepEqual([...h.pi.tools.keys()], ['ultra_delegate']);
+  assert.equal(h.pi.handlerCount('input'), 0);
+  const turn = await h.pi.inputToAgentStart('Implement the parser.');
+  assert.equal(turn.prompt, 'Implement the parser.');
+  assert.match(turn.systemPrompt ?? '', /active session model is the Ultra manager/i);
+  assert.match(turn.systemPrompt ?? '', /one focused repair/i);
+  assert.doesNotMatch(turn.systemPrompt ?? '', /ultra-planner/i);
+  assert.deepEqual(h.policyInstalls, ['blocked', 'enabled']);
 });
 
-test('passive no-wave consumes once and requeues the original with one owned prefix', async () => {
-  const original = 'Implement a tiny parser but keep it local.';
-  const h = harness({ plan: noWave() });
-  const [result] = await h.pi.emit('input', { type: 'input', text: original, source: 'interactive' });
-
-  assert.deepEqual(result, { action: 'handled' });
-  assert.equal(h.plannerTasks.length, 1);
-  assert.equal(h.spawns.length, 0);
+test('keeps the exact command contract and sends explicit tasks to the active main model', async () => {
+  const h = harness();
+  await h.start();
+  await h.pi.command('ultra', 'Implement the controller.');
   assert.equal(h.pi.userMessages.length, 1);
-  assert.equal(h.pi.userMessages[0]?.content, `${ULTRA_OWNED_PREFIX}${original}`);
+  assert.match(String(h.pi.userMessages[0]?.content), /Ultra-managed task:\nImplement the controller\./);
+  assert.deepEqual(h.pi.userMessages[0]?.options, { deliverAs: 'followUp' });
+
+  const rpc = harness();
+  rpc.pi.context.mode = 'rpc';
+  await rpc.start();
+  await rpc.pi.command('ultra');
+  assert.equal(rpc.pi.notifications.at(-1)?.message, '/ultra menu requires TUI mode; use /ultra on, /ultra off, or /ultra toggle.');
+  assert.equal(rpc.menuCalls, 0);
 });
 
-test('explicit no-wave or over-cap requeues a manager packet naming no qualified wave and original task', async () => {
-  for (const mode of ['no-wave', 'over-cap'] as const) {
-    const original = 'Implement the broad migration.';
-    const h = harness({ plan: noWave(mode) });
-    await h.pi.command('ultra', original);
-    const packet = String(h.pi.userMessages[0]?.content);
-    assert.ok(packet.startsWith(ULTRA_OWNED_PREFIX));
-    assert.match(packet, /no qualified wave/i);
-    assert.match(packet, /Implement the broad migration\./);
-    assert.equal(h.spawns.length, 0);
+test('disabled explicit tasks reject exactly and off disposes policy', async () => {
+  const h = harness({ loaded: { kind: 'loaded', settings: { ...DISABLED }, revision: 'off', path: '/tmp/pi-ultra.json' } });
+  await h.start();
+  await h.pi.command('ultra', 'Implement it.');
+  assert.equal(h.pi.notifications.at(-1)?.message, 'Run /ultra on first.');
+  assert.equal(h.pi.userMessages.length, 0);
+  assert.deepEqual(h.policyInstalls, ['blocked']);
+  assert.equal((h.registrations[0] as any).disposed, true);
+});
+
+test('ultra_delegate prepares one wave, records receipt evidence, and never claims acceptance', async () => {
+  const h = harness();
+  await h.start();
+  const result = await h.pi.tool('ultra_delegate', delegateInput()) as any;
+  assert.equal(result.isError, undefined);
+  assert.equal(h.preparedInputs.length, 1);
+  assert.equal(h.launches.length, 1);
+  assert.match(resultText(result), /operation op-1.*run run-1/i);
+  assert.doesNotMatch(resultText(result), /accepted|successful/i);
+  assert.equal(h.pi.entries.some((entry) => entry.customType === 'ultra.operation.v1'), true);
+});
+
+test('direct subagent spawn is blocked while enabled but proven non-spawning management remains available', async () => {
+  const h = harness();
+  await h.start();
+  const [direct] = await h.pi.emit('tool_call', { toolName: 'subagent', input: { agent: 'worker', task: 'bypass' } });
+  assert.equal((direct as any).block, true);
+  assert.match((direct as any).reason, /ultra_delegate/i);
+  const [status] = await h.pi.emit('tool_call', { toolName: 'subagent', input: { action: 'status', id: 'run' } });
+  assert.equal((status as any)?.block, undefined);
+  const [safeSteer] = await h.pi.emit('tool_call', { toolName: 'subagent', input: { action: 'steer', id: 'run', message: 'x', steeringRecovery: false } });
+  assert.equal((safeSteer as any)?.block, undefined);
+  const [recoveringSteer] = await h.pi.emit('tool_call', { toolName: 'subagent', input: { action: 'steer', id: 'run', message: 'x' } });
+  assert.equal((recoveringSteer as any).block, true);
+});
+
+test('invalid or incompatible configuration stays blocked with an empty ceiling and fast tool failure', async () => {
+  for (const h of [
+    harness({ loaded: { kind: 'invalid', reason: 'bad json', path: '/tmp/pi-ultra.json' } }),
+    harness({ capabilities: false }),
+  ]) {
+    await h.start();
+    assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: blocked');
+    const result = await h.pi.tool('ultra_delegate', delegateInput()) as any;
+    assert.equal(result.isError, true);
+    assert.match(resultText(result), /blocked|incompatible|configuration/i);
+    assert.equal(h.launches.length, 0);
+    assert.equal(h.policyInstalls.filter((mode) => mode === 'enabled').length, 0);
   }
 });
 
-test('owned prefix is deduplicated and stripped by input transform before agent start without replanning', async () => {
-  const h = harness({ plan: noWave() });
-  await h.pi.command('ultra', `${ULTRA_OWNED_PREFIX}${ULTRA_OWNED_PREFIX}Implement it.`);
-  const requeued = String(h.pi.userMessages[0]?.content);
-  assert.equal(countPrefix(requeued), 1);
-
-  const before = await h.pi.inputToAgentStart(`${ULTRA_OWNED_PREFIX}${ULTRA_OWNED_PREFIX}Implement it.`);
-  assert.deepEqual(before.inputResult, { action: 'transform', text: 'Implement it.' });
-  assert.equal(before.prompt, 'Implement it.');
-
-  const spaced = await h.pi.inputToAgentStart(`${ULTRA_OWNED_PREFIX} ${ULTRA_OWNED_PREFIX}Implement it.`);
-  assert.deepEqual(spaced.inputResult, { action: 'transform', text: 'Implement it.' });
-  assert.equal(spaced.prompt, 'Implement it.');
-  assert.equal(h.plannerTasks.length, 1, 'owned requeue must not plan again');
+test('completion before or after receipt produces one normal-path duplicate-safe follow-up', async () => {
+  const h = harness();
+  await h.start();
+  h.pi.events.emit('subagent:async-complete', { runId: 'run-1', state: 'complete', results: [
+    { workflowKey: 'inspect', agent: 'ultra-scout', model: 'openai/test-model', launchContractDigest: 'a'.repeat(64) },
+    { workflowKey: 'worker', agent: 'ultra-worker', model: 'openai/test-model', launchContractDigest: 'b'.repeat(64), changedFiles: ['src/parser/index.ts'] },
+  ] });
+  await h.pi.tool('ultra_delegate', delegateInput());
+  assert.equal(h.pi.messages.length, 1);
+  assert.match(h.pi.messages[0]?.message.content ?? '', /operation op-1/i);
+  assert.match(h.pi.messages[0]?.message.content ?? '', /evidence only/i);
+  assert.deepEqual(h.pi.messages[0]?.options, { triggerTurn: true, deliverAs: 'followUp' });
+  h.pi.events.emit('subagent:async-complete', { runId: 'run-1', state: 'complete', results: [] });
+  assert.equal(h.pi.messages.length, 1);
 });
 
-test('role defaults preserve trusted role routes and group only equal resolved agent/model bindings', async () => {
-  const lanes: UltraLane[] = [
-    { id: 'scout-a', role: 'scout', task: 'Inspect A.', write: false },
-    { id: 'worker-a', role: 'worker', task: 'Implement A.', write: true },
-    { id: 'worker-b', role: 'worker', task: 'Implement B.', write: true },
-    { id: 'review-a', role: 'reviewer', task: 'Review A.', write: false },
-  ];
-  const h = harness({
-    plan: wave(lanes),
-    spawnReceipts: [
-      { details: { runId: 'run-scout' } },
-      { details: { runId: 'run-worker' } },
-      { details: { runId: 'run-reviewer' } },
-    ],
-  });
-  await h.pi.command('ultra', 'Implement and review A and B.');
+test('restores a ready outbox after reload and retries with the same operation id', async () => {
+  const first = harness();
+  await first.start();
+  await first.pi.tool('ultra_delegate', delegateInput());
+  first.pi.events.emit('subagent:async-complete', { runId: 'run-1', state: 'failed', results: [] });
+  const ready = first.pi.entries.filter((entry) => entry.customType === 'ultra.operation.v1').at(-2);
+  assert.ok(ready, 'terminal ready snapshot precedes sent snapshot');
 
-  assert.deepEqual(h.preflights.map((entry) => entry.agent), ['scout', 'worker', 'worker', 'reviewer']);
-  assert.equal(h.spawns.length, 3);
-  const parsed = h.spawns.map((spawn) => JSON.parse(String(spawn.script)));
-  assert.deepEqual(parsed, [
-    { agent: 'scout', laneIds: ['scout-a'] },
-    { agent: 'worker', laneIds: ['worker-a', 'worker-b'] },
-    { agent: 'reviewer', laneIds: ['review-a'] },
-  ]);
-  assert.deepEqual(h.spawns.map((spawn) => spawn.model), [
-    'provider/scout', 'provider/worker', 'provider/reviewer',
-  ]);
+  const second = harness();
+  second.pi.entries.push(...first.pi.entries.slice(0, -1));
+  await second.start();
+  assert.equal(second.pi.messages.length, 1);
+  assert.match(second.pi.messages[0]?.message.content ?? '', /operation op-1/i);
 });
 
-test('uniform routing uses worker plus the effective selected model and preflights every lane', async () => {
-  const lanes: UltraLane[] = [
-    { id: 'scout-a', role: 'scout', task: 'Inspect A.', write: false },
-    { id: 'review-a', role: 'reviewer', task: 'Review A.', write: false },
-  ];
-  const h = harness({
-    settings: { ...ENABLED, routingMode: 'uniform', workerModel: 'provider/selected-worker' },
-    plan: wave(lanes),
-  });
-  await h.pi.command('ultra', 'Inspect and review A.');
-
-  assert.equal(h.preflights.length, 2);
-  assert.deepEqual(h.preflights.map((entry) => entry.agent), ['worker', 'worker']);
-  assert.deepEqual(h.preflights.map((entry) => entry.uniformModel), [
-    'provider/selected-worker', 'provider/selected-worker',
-  ]);
-  assert.equal(h.spawns.length, 1);
-  assert.equal(h.spawns[0]?.model, 'provider/selected-worker');
+test('settings watcher applies global off-to-on and invalid transitions in fail-closed order', async () => {
+  const h = harness({ loaded: { kind: 'loaded', settings: { ...DISABLED }, revision: 'off', path: '/tmp/pi-ultra.json' } });
+  await h.start();
+  h.setLoaded({ kind: 'loaded', settings: { ...ENABLED }, revision: 'on', path: '/tmp/pi-ultra.json' });
+  await h.change();
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on');
+  h.setLoaded({ kind: 'invalid', reason: 'replaced badly', path: '/tmp/pi-ultra.json' });
+  await h.change();
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: blocked');
+  assert.equal(h.policyInstalls.at(-1), 'blocked');
 });
 
-test('matching advertised completion emits bounded evidence packet and shutdown disposes listener', async () => {
-  const h = harness({ spawnReceipts: [{ details: { runId: 'run-complete' } }] });
-  assert.equal(h.pi.events.listenerCount('advertised:async-complete'), 1);
-  await h.pi.command('ultra', 'Implement A.');
-  h.pi.events.emit('advertised:async-complete', {
-    runId: 'other-run',
-    results: [{ artifactPath: '/ignore.md' }],
-  });
-  assert.equal(h.pi.messages.length, 1, 'unmatched completion is ignored');
+test('watcher failure remains blocked until a successful watcher change resynchronizes', async () => {
+  const h = harness();
+  await h.start();
+  await h.failWatcher();
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: blocked');
+  const blocked = await h.pi.tool('ultra_delegate', delegateInput()) as any;
+  assert.equal(blocked.isError, true);
+  await h.change();
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on');
+});
 
-  h.pi.events.emit('advertised:async-complete', {
-    runId: 'run-complete',
-    state: 'complete',
-    results: [
-      { index: 0, agent: 'worker', model: 'provider/worker', artifactPath: '/artifacts/a.md' },
-      { index: 1, artifactPath: '/artifacts/b.md' },
-    ],
-  });
-  assert.equal(h.pi.messages.length, 2);
-  const result = h.pi.messages[1]?.message;
-  assert.equal(result?.customType, 'ultra-wave');
-  assert.doesNotMatch(result?.content ?? '', /accepted|successful/i);
-  const details = result?.details as any;
-  assert.deepEqual(details.laneIds, ['worker-a']);
-  assert.deepEqual(details.resolvedAgents, ['worker']);
-  assert.deepEqual(details.resolvedModels, ['provider/worker']);
-  assert.deepEqual(details.artifactPaths, ['/artifacts/a.md', '/artifacts/b.md']);
-  assert.deepEqual(details.validationRequirements, ['Review diffs and run focused tests.']);
-  assert.match(details.managerInstructions, /verify|inspect/i);
-  assert.equal(details.acceptance, undefined);
-
-  await h.pi.emit('session_shutdown', { reason: 'quit' });
-  assert.equal(h.pi.events.listenerCount('advertised:async-complete'), 0);
-  assert.equal(h.pi.events.listenerCount('subagents:rpc:v1:ready'), 0);
+test('shutdown disposes policy, watcher, completion listeners, and prevents stale delivery', async () => {
+  const h = harness();
+  await h.start();
+  assert.ok(h.pi.events.listenerCount('subagent:async-complete') > 0);
+  await h.pi.emit('session_shutdown', { type: 'session_shutdown' });
+  assert.equal(h.pi.events.listenerCount('subagent:async-complete'), 0);
+  assert.equal((h.registrations.at(-1) as any).disposed, true);
+  h.pi.events.emit('subagent:async-complete', { runId: 'run-1', state: 'complete' });
+  assert.equal(h.pi.messages.length, 0);
 });
