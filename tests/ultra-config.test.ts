@@ -6,12 +6,9 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 
 // ── module under test ──────────────────────────────────────────────
-// We import lazily so the test file parses/imports even before the
-// module exists – only the import-site test function will fail.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let ultra: any;
 async function loadUltraModule() {
-  // Dynamic import – fails at runtime if module is missing (RED phase)
   ultra = await import('../extensions/ultra-config.js');
 }
 
@@ -32,14 +29,12 @@ async function writeSettings(dir: string, data: unknown): Promise<string> {
 test('module exports all required symbols', async () => {
   await loadUltraModule();
 
-  // Constants
   assert.equal(ultra.ULTRA_CONFIG_VERSION, 1);
   assert.equal(ultra.ULTRA_MIN_LANES, 1);
   assert.equal(ultra.ULTRA_MAX_LANES, 8);
   assert.deepEqual(ultra.ULTRA_ROLE_NAMES, ['scout', 'worker', 'reviewer']);
   assert.equal(ultra.ULTRA_SETTINGS_FILE, 'pi-ultra.json');
 
-  // Defaults
   assert.deepEqual(ultra.DEFAULT_ULTRA_SETTINGS, {
     version: 1,
     enabled: true,
@@ -48,23 +43,21 @@ test('module exports all required symbols', async () => {
     maxLanes: 4,
   });
 
-  // Functions exist
   assert.equal(typeof ultra.normalizeUltraSettings, 'function');
   assert.equal(typeof ultra.loadUltraSettings, 'function');
   assert.equal(typeof ultra.saveUltraSettings, 'function');
   assert.equal(typeof ultra.effectiveUniformModel, 'function');
-
-  // Types – can only test runtime shape, not TS types
   assert.equal(typeof ultra.UltraSettings, 'undefined'); // interface only
 });
 
-// ── NORMALIZE DEFAULTS / PARTIAL ──────────────────────────────────
-test('normalizeUltraSettings fills defaults for partial input', async () => {
+// ── NORMALIZE — VALID ─────────────────────────────────────────────
+test('normalizeUltraSettings fills defaults for partial object', async () => {
   await loadUltraModule();
-  const { normalizeUltraSettings, DEFAULT_ULTRA_SETTINGS } = ultra;
+  const { normalizeUltraSettings } = ultra;
 
   // Empty object → full defaults
   const r1 = normalizeUltraSettings({});
+  assert.notEqual(r1, undefined);
   assert.equal(r1.version, 1);
   assert.equal(r1.enabled, true);
   assert.equal(r1.routingMode, 'role-defaults');
@@ -74,48 +67,83 @@ test('normalizeUltraSettings fills defaults for partial input', async () => {
 
   // Partial overrides
   const r2 = normalizeUltraSettings({ enabled: false, maxLanes: 6 });
+  assert.notEqual(r2, undefined);
   assert.equal(r2.enabled, false);
   assert.equal(r2.maxLanes, 6);
-  assert.equal(r2.minLanes, 2); // from default
-  assert.equal(r2.routingMode, 'role-defaults'); // from default
+  assert.equal(r2.minLanes, 2);
+  assert.equal(r2.routingMode, 'role-defaults');
 
-  // workerModel absent when not supplied
+  // workerModel absent when whitespace-only or not supplied
   const r3 = normalizeUltraSettings({ workerModel: '  ' });
+  assert.notEqual(r3, undefined);
   assert.equal('workerModel' in r3, false);
+
   const r4 = normalizeUltraSettings({ workerModel: 'gpt-4o' });
+  assert.notEqual(r4, undefined);
   assert.equal(r4.workerModel, 'gpt-4o');
 
   // Trimmed non-empty
   const r5 = normalizeUltraSettings({ workerModel: '  claude-3  ' });
+  assert.notEqual(r5, undefined);
   assert.equal(r5.workerModel, 'claude-3');
 
-  // version must be 1
-  assert.throws(() => normalizeUltraSettings({ version: 2 }), /version/);
-  assert.throws(() => normalizeUltraSettings({ version: 0 }), /version/);
+  // valid routing modes
+  const u = normalizeUltraSettings({ routingMode: 'uniform' });
+  assert.notEqual(u, undefined);
+  assert.equal(u.routingMode, 'uniform');
 
-  // enabled must be boolean
-  assert.throws(() => normalizeUltraSettings({ enabled: 1 }), /enabled/);
-  assert.throws(() => normalizeUltraSettings({ enabled: 'yes' }), /enabled/);
+  const rd = normalizeUltraSettings({ routingMode: 'role-defaults' });
+  assert.notEqual(rd, undefined);
+  assert.equal(rd.routingMode, 'role-defaults');
 
-  // routingMode validation
-  assert.doesNotThrow(() => normalizeUltraSettings({ routingMode: 'uniform' }));
-  assert.doesNotThrow(() => normalizeUltraSettings({ routingMode: 'role-defaults' }));
-  assert.throws(() => normalizeUltraSettings({ routingMode: 'invalid' }), /routingMode/);
+  // Equal min/max allowed
+  const eq = normalizeUltraSettings({ minLanes: 8, maxLanes: 8 });
+  assert.notEqual(eq, undefined);
+  assert.equal(eq.minLanes, 8);
+  assert.equal(eq.maxLanes, 8);
+});
 
-  // min/max safe integers
-  assert.throws(() => normalizeUltraSettings({ minLanes: 0 }), /minLanes/);
-  assert.throws(() => normalizeUltraSettings({ minLanes: 9 }), /minLanes/);
-  assert.throws(() => normalizeUltraSettings({ maxLanes: 0 }), /maxLanes/);
-  assert.throws(() => normalizeUltraSettings({ maxLanes: 9 }), /maxLanes/);
-  assert.throws(() => normalizeUltraSettings({ minLanes: 1.5 }), /minLanes/);
-  assert.throws(() => normalizeUltraSettings({ maxLanes: 1.5 }), /maxLanes/);
+// ── NORMALIZE — INVALID (returns undefined, never throws) ─────────
+test('normalizeUltraSettings returns undefined for invalid inputs', async () => {
+  await loadUltraModule();
+  const { normalizeUltraSettings } = ultra;
 
-  // min <= max
-  assert.throws(() => normalizeUltraSettings({ minLanes: 5, maxLanes: 3 }), /min.*max/i);
+  // Non-object types
+  assert.equal(normalizeUltraSettings(null), undefined);
+  assert.equal(normalizeUltraSettings([1, 2, 3]), undefined);
+  assert.equal(normalizeUltraSettings('hello'), undefined);
+  assert.equal(normalizeUltraSettings(42), undefined);
+  assert.equal(normalizeUltraSettings(true), undefined);
+  assert.equal(normalizeUltraSettings(undefined), undefined);
 
-  // Reversed range rejected
-  assert.throws(() => normalizeUltraSettings({ minLanes: 7, maxLanes: 4 }), /min.*max/i);
-  assert.doesNotThrow(() => normalizeUltraSettings({ minLanes: 8, maxLanes: 8 })); // equal OK
+  // Bad version
+  assert.equal(normalizeUltraSettings({ version: 2 }), undefined);
+  assert.equal(normalizeUltraSettings({ version: 0 }), undefined);
+
+  // Bad enabled
+  assert.equal(normalizeUltraSettings({ enabled: 1 }), undefined);
+  assert.equal(normalizeUltraSettings({ enabled: 'yes' }), undefined);
+
+  // Bad routingMode
+  assert.equal(normalizeUltraSettings({ routingMode: 'invalid' }), undefined);
+
+  // Bad workerModel
+  assert.equal(normalizeUltraSettings({ workerModel: 123 }), undefined);
+
+  // min/max out of range
+  assert.equal(normalizeUltraSettings({ minLanes: 0 }), undefined);
+  assert.equal(normalizeUltraSettings({ minLanes: 9 }), undefined);
+  assert.equal(normalizeUltraSettings({ maxLanes: 0 }), undefined);
+  assert.equal(normalizeUltraSettings({ maxLanes: 9 }), undefined);
+
+  // non-integer lanes
+  assert.equal(normalizeUltraSettings({ minLanes: 1.5 }), undefined);
+  assert.equal(normalizeUltraSettings({ maxLanes: 1.5 }), undefined);
+
+  // Reversed ranges
+  assert.equal(normalizeUltraSettings({ minLanes: 5, maxLanes: 3 }), undefined);
+  assert.equal(normalizeUltraSettings({ minLanes: 7, maxLanes: 4 }), undefined);
+  assert.equal(normalizeUltraSettings({ minLanes: 4, maxLanes: 2 }), undefined);
 });
 
 // ── EFFECTIVE UNIFORM MODEL ───────────────────────────────────────
@@ -145,7 +173,6 @@ test('loadUltraSettings returns kind:missing when file does not exist', async ()
   const result = await loadUltraSettings(join(dir, 'nonexistent.json'));
   assert.equal(result.kind, 'missing');
   assert.deepEqual(result.settings, DEFAULT_ULTRA_SETTINGS);
-  // Must be a clone, not same reference
   assert.notEqual(result.settings, DEFAULT_ULTRA_SETTINGS);
   assert.equal(result.settings.version, 1);
   await rm(dir, { recursive: true, force: true });
@@ -182,7 +209,7 @@ test('loadUltraSettings returns kind:invalid for malformed JSON', async () => {
   assert.ok(result.reason);
   assert.deepEqual(result.settings, DEFAULT_ULTRA_SETTINGS);
 
-  // Original bytes must be preserved (not overwritten)
+  // Original bytes must be preserved
   const bytes = await readFile(p, 'utf8');
   assert.equal(bytes, 'this is not json');
   await rm(dir, { recursive: true, force: true });
@@ -279,7 +306,6 @@ test('save preserves unknown top-level fields while replacing Ultra fields', asy
   const dir = await tmpDir();
   const p = join(dir, 'pi-ultra.json');
 
-  // Start with extra fields
   await writeFile(p, JSON.stringify({
     version: 1,
     enabled: true,
@@ -313,14 +339,12 @@ test('Promise.all two saves leaves parseable normalized JSON', async () => {
     saveUltraSettings({ enabled: false, routingMode: 'role-defaults', minLanes: 3, maxLanes: 5, workerModel: 'model-b' }, p),
   ]);
 
-  // File exists and is valid JSON
   const content = await readFile(p, 'utf8');
   const parsed = JSON.parse(content);
   assert.equal(typeof parsed, 'object');
   assert.ok(parsed.version === 1);
   assert.equal(typeof parsed.enabled, 'boolean');
 
-  // load should succeed
   const result = await loadUltraSettings(p);
   assert.equal(result.kind, 'loaded');
   await rm(dir, { recursive: true, force: true });
@@ -329,25 +353,29 @@ test('Promise.all two saves leaves parseable normalized JSON', async () => {
 // ── AUTOMATIC DISTINCTIONS ────────────────────────────────────────
 test('Automatic behavior distinctions shown exactly', async () => {
   await loadUltraModule();
-  const { normalizeUltraSettings, effectiveUniformModel, DEFAULT_ULTRA_SETTINGS } = ultra;
+  const { normalizeUltraSettings, effectiveUniformModel } = ultra;
 
   // default (role-defaults) → workerModel absent, effectiveUniformModel undefined
   const def = normalizeUltraSettings({});
+  assert.notEqual(def, undefined);
   assert.equal('workerModel' in def, false);
   assert.equal(effectiveUniformModel(def), undefined);
 
   // uniform without explicit workerModel → workerModel absent, effective 'automatic'
   const uniNoModel = normalizeUltraSettings({ routingMode: 'uniform' });
+  assert.notEqual(uniNoModel, undefined);
   assert.equal('workerModel' in uniNoModel, false);
   assert.equal(effectiveUniformModel(uniNoModel), 'automatic');
 
   // uniform WITH workerModel → workerModel present, effective equals it
   const uniWithModel = normalizeUltraSettings({ routingMode: 'uniform', workerModel: 'claude-3-opus' });
+  assert.notEqual(uniWithModel, undefined);
   assert.equal(uniWithModel.workerModel, 'claude-3-opus');
   assert.equal(effectiveUniformModel(uniWithModel), 'claude-3-opus');
 
   // role-defaults with workerModel → workerModel present but effective undefined
   const roleWithModel = normalizeUltraSettings({ routingMode: 'role-defaults', workerModel: 'gpt-4o' });
+  assert.notEqual(roleWithModel, undefined);
   assert.equal(roleWithModel.workerModel, 'gpt-4o');
   assert.equal(effectiveUniformModel(roleWithModel), undefined);
 });

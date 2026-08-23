@@ -1,6 +1,5 @@
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -65,84 +64,73 @@ function cloneDefaults(): UltraSettings {
 
 const VALID_ROUTING_MODES = new Set<RoutingMode>(['uniform', 'role-defaults']);
 
-interface NormalizedFields {
-  version: 1;
-  enabled: boolean;
-  routingMode: RoutingMode;
-  workerModel?: string;
-  minLanes: number;
-  maxLanes: number;
-}
-
-type UltraFields = keyof NormalizedFields;
+const ULTRA_FIELDS: ReadonlySet<string> = new Set([
+  'version',
+  'enabled',
+  'routingMode',
+  'workerModel',
+  'minLanes',
+  'maxLanes',
+]);
 
 /**
- * Validate and normalize raw input into a valid UltraSettings, or throw.
+ * Normalize raw input into a valid UltraSettings, or return undefined
+ * if the input is null, a non-object, or fails any validation rule.
+ *
+ * Never throws.
  */
-export function normalizeUltraSettings(value: Record<string, unknown>): UltraSettings {
+export function normalizeUltraSettings(value: unknown): UltraSettings | undefined {
+  // Reject null, arrays, and non-object primitives
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const input = value as Record<string, unknown>;
   const out: UltraSettings = cloneDefaults();
 
   // version – only 1 accepted
-  if (value.version !== undefined) {
-    if (value.version !== 1) {
-      throw new Error(`Invalid version: expected 1, got ${JSON.stringify(value.version)}`);
-    }
-    out.version = 1;
+  if (input.version !== undefined) {
+    if (input.version !== 1) return undefined;
   }
 
   // enabled – strict boolean
-  if (value.enabled !== undefined) {
-    if (typeof value.enabled !== 'boolean') {
-      throw new Error(`Invalid enabled: expected boolean, got ${JSON.stringify(value.enabled)}`);
-    }
-    out.enabled = value.enabled;
+  if (input.enabled !== undefined) {
+    if (typeof input.enabled !== 'boolean') return undefined;
+    out.enabled = input.enabled;
   }
 
   // routingMode
-  if (value.routingMode !== undefined) {
-    if (!VALID_ROUTING_MODES.has(value.routingMode as RoutingMode)) {
-      throw new Error(`Invalid routingMode: expected 'uniform' or 'role-defaults', got ${JSON.stringify(value.routingMode)}`);
-    }
-    out.routingMode = value.routingMode as RoutingMode;
+  if (input.routingMode !== undefined) {
+    if (!VALID_ROUTING_MODES.has(input.routingMode as RoutingMode)) return undefined;
+    out.routingMode = input.routingMode as RoutingMode;
   }
 
   // workerModel – optional, must be trimmed non-empty string when present
-  if (value.workerModel !== undefined) {
-    const vm = value.workerModel;
-    if (typeof vm !== 'string') {
-      throw new Error(`Invalid workerModel: expected string, got ${JSON.stringify(vm)}`);
-    }
-    const trimmed = vm.trim();
-    if (trimmed.length === 0) {
-      // whitespace-only → treat as absent
-      delete out.workerModel;
-    } else {
+  if (input.workerModel !== undefined) {
+    if (typeof input.workerModel !== 'string') return undefined;
+    const trimmed = input.workerModel.trim();
+    if (trimmed.length > 0) {
       out.workerModel = trimmed;
     }
+    // whitespace-only → leave absent (already cloned without it)
   }
 
   // minLanes – safe integer 1..8
-  if (value.minLanes !== undefined) {
-    const ml = value.minLanes;
-    if (typeof ml !== 'number' || !Number.isSafeInteger(ml) || ml < ULTRA_MIN_LANES || ml > ULTRA_MAX_LANES) {
-      throw new Error(`Invalid minLanes: expected safe integer between ${ULTRA_MIN_LANES} and ${ULTRA_MAX_LANES}, got ${JSON.stringify(ml)}`);
-    }
+  if (input.minLanes !== undefined) {
+    const ml = input.minLanes;
+    if (typeof ml !== 'number' || !Number.isSafeInteger(ml) || ml < ULTRA_MIN_LANES || ml > ULTRA_MAX_LANES) return undefined;
     out.minLanes = ml;
   }
 
   // maxLanes – safe integer 1..8
-  if (value.maxLanes !== undefined) {
-    const ml = value.maxLanes;
-    if (typeof ml !== 'number' || !Number.isSafeInteger(ml) || ml < ULTRA_MIN_LANES || ml > ULTRA_MAX_LANES) {
-      throw new Error(`Invalid maxLanes: expected safe integer between ${ULTRA_MIN_LANES} and ${ULTRA_MAX_LANES}, got ${JSON.stringify(ml)}`);
-    }
+  if (input.maxLanes !== undefined) {
+    const ml = input.maxLanes;
+    if (typeof ml !== 'number' || !Number.isSafeInteger(ml) || ml < ULTRA_MIN_LANES || ml > ULTRA_MAX_LANES) return undefined;
     out.maxLanes = ml;
   }
 
   // minLanes <= maxLanes
-  if (out.minLanes > out.maxLanes) {
-    throw new Error(`Invalid range: minLanes (${out.minLanes}) cannot exceed maxLanes (${out.maxLanes})`);
-  }
+  if (out.minLanes > out.maxLanes) return undefined;
 
   return out;
 }
@@ -158,7 +146,7 @@ export function effectiveUniformModel(settings: UltraSettings): string | undefin
     return undefined;
   }
   // uniform mode
-  if (settings.workerModel === undefined || settings.workerModel === undefined) {
+  if (settings.workerModel === undefined) {
     return 'automatic';
   }
   return settings.workerModel;
@@ -166,6 +154,10 @@ export function effectiveUniformModel(settings: UltraSettings): string | undefin
 
 // ── Load ──────────────────────────────────────────────────────────
 
+/**
+ * Read a JSON file, returning the parsed value.
+ * Re-throws on any error (caller handles ENOENT vs parse failure).
+ */
 async function readJsonFile(path: string): Promise<unknown> {
   const raw = await readFile(path, 'utf8');
   return JSON.parse(raw);
@@ -174,20 +166,24 @@ async function readJsonFile(path: string): Promise<unknown> {
 /**
  * Load UltraSettings from a JSON file.
  *
+ * Uses readFile directly (no TOCTOU existsSync) — an ENOENT error is
+ * classified as `kind:'missing'`; any other read or parse error is
+ * `kind:'invalid'`.
+ *
  * @param settingsPath – absolute path to the JSON file; defaults to
  *   `join(getAgentDir(), ULTRA_SETTINGS_FILE)`.
  */
 export async function loadUltraSettings(settingsPath?: string): Promise<LoadUltraSettingsResult> {
   const path = settingsPath ?? join(getAgentDir(), ULTRA_SETTINGS_FILE);
 
-  if (!existsSync(path)) {
-    return { kind: 'missing', settings: cloneDefaults() };
-  }
-
   let raw: unknown;
   try {
     raw = await readJsonFile(path);
   } catch (err) {
+    const nodeErr = err as NodeJS.ErrnoException;
+    if (nodeErr?.code === 'ENOENT') {
+      return { kind: 'missing', settings: cloneDefaults() };
+    }
     return {
       kind: 'invalid',
       reason: String(err),
@@ -203,16 +199,16 @@ export async function loadUltraSettings(settingsPath?: string): Promise<LoadUltr
     };
   }
 
-  try {
-    const settings = normalizeUltraSettings(raw as Record<string, unknown>);
-    return { kind: 'loaded', settings };
-  } catch (err) {
+  const settings = normalizeUltraSettings(raw);
+  if (settings === undefined) {
     return {
       kind: 'invalid',
-      reason: String(err),
+      reason: 'Invalid settings shape',
       settings: cloneDefaults(),
     };
   }
+
+  return { kind: 'loaded', settings };
 }
 
 // ── Save ──────────────────────────────────────────────────────────
@@ -233,7 +229,6 @@ async function acquireLock(lockDir: string): Promise<void> {
         if (Date.now() - start >= LOCK_RETRY_MS) {
           throw new Error(`Could not acquire lock at ${lockDir}: timeout`);
         }
-        // Wait before retry
         await new Promise(resolve => setTimeout(resolve, LOCK_RETRY_INTERVAL));
         continue;
       }
@@ -250,14 +245,38 @@ async function releaseLock(lockDir: string): Promise<void> {
   }
 }
 
-const ULTRA_FIELDS: Set<string> = new Set([
-  'version',
-  'enabled',
-  'routingMode',
-  'workerModel',
-  'minLanes',
-  'maxLanes',
-]);
+/**
+ * Build the output object by merging normalized Ultra fields into any
+ * existing unknown (non-Ultra) top-level fields.
+ */
+function mergeOutput(
+  existing: Record<string, unknown>,
+  normalized: UltraSettings,
+): Record<string, unknown> {
+  const output: Record<string, unknown> = {};
+
+  // Copy unknown (non-Ultra) fields from existing
+  for (const [key, val] of Object.entries(existing)) {
+    if (!ULTRA_FIELDS.has(key)) {
+      output[key] = val;
+    }
+  }
+
+  // Set Ultra fields from normalized settings
+  for (const key of ULTRA_FIELDS) {
+    if (key === 'workerModel') {
+      if (normalized.workerModel !== undefined) {
+        output.workerModel = normalized.workerModel;
+      } else {
+        delete output.workerModel;
+      }
+    } else {
+      output[key] = (normalized as unknown as Record<string, unknown>)[key];
+    }
+  }
+
+  return output;
+}
 
 /**
  * Save UltraSettings to a JSON file with lock-based atomic write.
@@ -274,67 +293,54 @@ export async function saveUltraSettings(
   const lockDir = `${path}.lock`;
   const dir = dirname(path);
 
-  // 1. Validate input
+  // 1. Validate input — reject invalid
   const normalized = normalizeUltraSettings(settings);
+  if (normalized === undefined) {
+    throw new Error('Invalid settings: normalization failed');
+  }
 
   // 2. Acquire lock
   await acquireLock(lockDir);
 
   try {
-    // 3. Re-read existing file under lock – reject if invalid
-    if (existsSync(path)) {
-      let raw: unknown;
+    // 3. Read existing file under lock — single read, no TOCTOU
+    let existingRaw: unknown = undefined;
+    let existingContent: string | undefined;
+    try {
+      existingContent = await readFile(path, 'utf8');
+    } catch (err) {
+      const nodeErr = err as NodeJS.ErrnoException;
+      if (nodeErr?.code !== 'ENOENT') {
+        // Some real read error — surface it
+        throw new Error(`Failed to read ${path}: ${err}`);
+      }
+      // ENOENT → file doesn't exist yet, that's fine
+    }
+
+    // If the file exists, parse and validate it in one pass
+    if (existingContent !== undefined) {
       try {
-        raw = await readJsonFile(path);
+        existingRaw = JSON.parse(existingContent);
       } catch {
         throw new Error(`Refusing to overwrite invalid file: ${path} (parse error)`);
       }
 
-      if (typeof raw !== 'object' || raw === null) {
+      if (typeof existingRaw !== 'object' || existingRaw === null) {
         throw new Error(`Refusing to overwrite invalid file: ${path} (not an object)`);
       }
 
-      try {
-        normalizeUltraSettings(raw as Record<string, unknown>);
-      } catch {
+      if (normalizeUltraSettings(existingRaw) === undefined) {
         throw new Error(`Refusing to overwrite invalid file: ${path} (invalid shape)`);
       }
     }
 
-    // 4. Build output – preserve unknown top-level fields
-    let existing: Record<string, unknown> = {};
-    if (existsSync(path)) {
-      try {
-        existing = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-      } catch {
-        // if re-read fails, proceed with empty existing
-      }
-      if (typeof existing !== 'object' || existing === null) {
-        existing = {};
-      }
-    }
+    // 4. Build output — preserve unknown top-level fields
+    const existing: Record<string, unknown> =
+      (existingRaw !== undefined && typeof existingRaw === 'object' && !Array.isArray(existingRaw))
+        ? (existingRaw as Record<string, unknown>)
+        : {};
 
-    const output: Record<string, unknown> = {};
-    // Copy unknown (non-Ultra) fields from existing
-    for (const [key, val] of Object.entries(existing)) {
-      if (!ULTRA_FIELDS.has(key)) {
-        output[key] = val;
-      }
-    }
-    // Set Ultra fields from normalized settings
-    for (const key of ULTRA_FIELDS) {
-      const k = key as keyof UltraSettings;
-      if (k === 'workerModel') {
-        if (normalized.workerModel !== undefined) {
-          output.workerModel = normalized.workerModel;
-        } else {
-          delete output.workerModel;
-        }
-      } else if (k in normalized) {
-        output[k] = normalized[k];
-      }
-    }
-
+    const output = mergeOutput(existing, normalized);
     const jsonContent = JSON.stringify(output, null, 2) + '\n';
 
     // 5. Write to UUID temp path with flag wx, then atomic rename
@@ -343,7 +349,6 @@ export async function saveUltraSettings(
       await writeFile(tempPath, jsonContent, { flag: 'wx' });
       await rename(tempPath, path);
     } catch (err) {
-      // Clean up temp file on failure
       try { await rm(tempPath, { force: true }); } catch { /* ignore */ }
       throw err;
     }
