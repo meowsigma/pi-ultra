@@ -9,6 +9,8 @@ const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8
 
 test('package exposes Pi extension and subagent layout', () => {
   assert.deepEqual(packageJson.pi.extensions, ['./extensions']);
+  assert.ok(existsSync(resolve(root, 'extensions/index.ts')));
+  assert.equal(packageJson.keywords.includes('prompt-template'), false);
   assert.deepEqual(packageJson.pi.subagents.agents, ['./agents']);
   assert.equal(packageJson.pi.prompts, undefined);
   assert.deepEqual(packageJson.files, [

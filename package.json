@@ -5,8 +5,7 @@
   "keywords": [
     "pi-package",
     "pi",
-    "subagents",
-    "prompt-template"
+    "subagents"
   ],
   "license": "MIT",
   "type": "module",
