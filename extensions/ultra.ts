@@ -269,6 +269,7 @@ export function createUltraExtension(
 
     const reloadSettings = async (): Promise<UltraSettings> => {
       const loaded = await dependencies.loadSettings();
+      if (loaded.kind === 'invalid') throw new Error(`Ultra configuration is blocked: ${loaded.reason}`);
       settings = { ...loaded.settings };
       return settings;
     };

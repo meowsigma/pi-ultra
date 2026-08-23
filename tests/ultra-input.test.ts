@@ -66,7 +66,7 @@ function harness(options: HarnessOptions = {}) {
   const receipts = [...(options.spawnReceipts ?? [{ details: { runId: 'run-1', asyncDir: '/tmp/run-1' } }])];
 
   const deps: UltraExtensionDependencies = {
-    loadSettings: async () => ({ kind: 'loaded', settings: { ...stored } }),
+    loadSettings: async () => ({ kind: 'loaded', settings: { ...stored }, revision: 'test-revision', path: '/tmp/pi-ultra.json' }),
     saveSettings: async (settings) => {
       stored = { ...settings };
       saved.push({ ...settings });
