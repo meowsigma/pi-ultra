@@ -6,11 +6,17 @@ import { statSync } from 'node:fs';
 const REQUIRED_PACKAGE_FILES = [
   'package/extensions/index.ts',
   'package/extensions/ultra.ts',
+  'package/extensions/ultra-protocol.ts',
+  'package/agents/ultra-scout.md',
+  'package/agents/ultra-worker.md',
+  'package/agents/ultra-reviewer.md',
+];
+const STALE_FILES = [
   'package/agents/ultra-planner.md',
   'package/prompts/ultra-planner.md',
   'package/prompts/ultra-manager.md',
+  'package/prompts/ultra.md',
 ];
-const STALE_PROMPT = 'package/prompts/ultra.md';
 const ULTRA_COMMAND = /\bregisterCommand\s*\(\s*(['"`])ultra\1/g;
 
 function normalizeEntry(entry) {
@@ -31,8 +37,8 @@ export function inspectUltraPackage(entries, contents = new Map()) {
       throw new Error(`missing required package file: ${required}`);
     }
   }
-  if (files.has(STALE_PROMPT)) {
-    throw new Error(`stale prompt template must not be packaged: ${STALE_PROMPT}`);
+  for (const stale of STALE_FILES) {
+    if (files.has(stale)) throw new Error(`stale planner asset must not be packaged: ${stale}`);
   }
 
   let commandCount = 0;

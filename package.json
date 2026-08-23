@@ -12,7 +12,6 @@
   "files": [
     "extensions",
     "agents",
-    "prompts",
     "examples",
     "README.md",
     "LICENSE"

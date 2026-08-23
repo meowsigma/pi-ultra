@@ -1,1 +1,0 @@
-Audit the contract, bound model assignments, diffs, tests, and residual risks. Verify evidence rather than trusting claims. Do not treat completion as acceptance, and never bypass the controller. Report blockers and acceptance findings separately.

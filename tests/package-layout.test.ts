@@ -13,9 +13,10 @@ const { inspectUltraPackage } = await import('./ultra-smoke.mjs');
 const requiredPackedFiles = [
   'package/extensions/index.ts',
   'package/extensions/ultra.ts',
-  'package/agents/ultra-planner.md',
-  'package/prompts/ultra-planner.md',
-  'package/prompts/ultra-manager.md',
+  'package/extensions/ultra-protocol.ts',
+  'package/agents/ultra-scout.md',
+  'package/agents/ultra-worker.md',
+  'package/agents/ultra-reviewer.md',
 ];
 
 test('package exposes exactly one Pi extension and the Ultra subagent layout', () => {
@@ -26,13 +27,18 @@ test('package exposes exactly one Pi extension and the Ultra subagent layout', (
   assert.deepEqual(packageJson.pi.subagents.agents, ['./agents']);
   assert.equal(packageJson.pi.prompts, undefined);
   assert.equal(packageJson.keywords.includes('prompt-template'), false);
-  for (const required of ['extensions', 'agents', 'prompts', 'README.md', 'LICENSE']) {
+  for (const required of ['extensions', 'agents', 'README.md', 'LICENSE']) {
     assert.ok(packageJson.files.includes(required), `${required} is included in package files`);
   }
-  assert.ok(existsSync(resolve(root, 'agents/ultra-planner.md')));
-  assert.ok(existsSync(resolve(root, 'prompts/ultra-planner.md')));
-  assert.ok(existsSync(resolve(root, 'prompts/ultra-manager.md')));
-  assert.equal(existsSync(resolve(root, 'prompts/ultra.md')), false);
+  assert.equal(packageJson.files.includes('prompts'), false);
+  assert.equal(existsSync(resolve(root, 'agents/ultra-planner.md')), false);
+  assert.equal(existsSync(resolve(root, 'prompts')), false);
+  for (const role of ['scout', 'worker', 'reviewer']) {
+    const source = readFileSync(resolve(root, `agents/ultra-${role}.md`), 'utf8');
+    const tools = source.match(/^tools:.*$/m)?.[0] ?? '';
+    assert.doesNotMatch(tools, /\bsubagent\b/, `${role} must not expose subagent`);
+    if (role !== 'worker') assert.doesNotMatch(tools, /\b(?:bash|edit|write)\b/);
+  }
 
   const ultraSource = readFileSync(resolve(root, 'extensions/ultra.ts'), 'utf8');
   assert.equal([...ultraSource.matchAll(/\bregisterCommand\s*\(\s*(['"`])ultra\1/g)].length, 1);

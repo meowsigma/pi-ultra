@@ -1,262 +1,206 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import test from 'node:test';
 import {
-  buildWaveWorkflow,
-  preflightLane,
-  requestPlan,
-  spawnWave,
-  validatePlan,
-  waitForSubagentCapabilities,
+  ROLE_AGENTS,
+  buildUltraWorkflow,
+  launchUltraWave,
+  prepareUltraWave,
+  validateUltraDelegateInput,
+  type UltraDelegateInput,
+  type UltraLaunchAuthorityHandle,
+  type UltraPreparedLane,
 } from '../extensions/ultra-protocol.js';
+import type { UltraSettings } from '../extensions/ultra-config.js';
 import { FakeEventBus } from './fixtures/fake-pi.js';
 
-const READY = 'subagents:rpc:v1:ready';
-const DELEGATION_REQUEST = 'prompt-template:subagent:request';
-const DELEGATION_RESPONSE = 'prompt-template:subagent:response';
-const RPC_REQUEST = 'subagents:rpc:v1:request';
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const FIXED: UltraSettings = {
+  version: 1,
+  enabled: true,
+  routingMode: 'uniform',
+  workerModel: 'openai/test-model',
+  minLanes: 2,
+  maxLanes: 4,
+};
 
-function validPlan() {
+const ROLE_DEFAULTS: UltraSettings = { ...FIXED, routingMode: 'role-defaults' };
+const AUTOMATIC: UltraSettings = { ...FIXED, workerModel: undefined };
+
+function input(lanes: UltraDelegateInput['lanes'] = [
+  { id: 'inspect', role: 'scout', task: 'Inspect parser behavior.', deliverable: 'Parser evidence.' },
+  { id: 'implement', role: 'worker', task: 'Implement parser change.', deliverable: 'Parser patch.', ownedPaths: ['src/parser'] },
+]): UltraDelegateInput {
   return {
-    objective: 'Implement the bounded change',
-    evidence: ['The requested files are independent.'],
-    mode: 'wave',
-    lanes: [
-      { id: 'worker-a', role: 'worker', task: 'Implement module A.', write: true },
-      { id: 'review-a', role: 'reviewer', task: 'Review module A.', write: false },
-    ],
-    acceptance: ['Focused tests pass.'],
+    objective: 'Improve the parser safely.',
+    lanes,
+    acceptance: ['Run parser tests.', 'Review the final diff.'],
   };
 }
 
-test('waitForSubagentCapabilities returns readiness and times out cleanly', async () => {
-  const readyEvents = new FakeEventBus();
-  const waiting = waitForSubagentCapabilities(readyEvents, 50);
-  readyEvents.emit(READY, { version: 1, capabilities: { asyncSpawn: true } });
-  assert.deepEqual(await waiting, { version: 1, capabilities: { asyncSpawn: true } });
-  assert.equal(readyEvents.listenerCount(READY), 0);
-
-  const timeoutEvents = new FakeEventBus();
-  await assert.rejects(waitForSubagentCapabilities(timeoutEvents, 5), /timed out/i);
-  assert.equal(timeoutEvents.listenerCount(READY), 0);
-});
-
-test('requestPlan emits owned structured delegation and returns its exact successful result', async () => {
-  const events = new FakeEventBus();
-  const pending = requestPlan({ events, task: 'Plan this change.', cwd: '/repo', timeout: 100 });
-  const emission = events.lastEmission(DELEGATION_REQUEST);
-  assert.ok(emission);
-  const request = emission.data as Record<string, any>;
-  assert.match(request.requestId, UUID);
-  assert.match(request.ownerRunId, UUID);
-  assert.notEqual(request.requestId, request.ownerRunId);
-  assert.equal(request.nodeId, 'ultra-plan');
-  assert.equal(request.agent, 'ultra-planner');
-  assert.equal(request.context, 'fresh');
-  assert.equal(request.cwd, '/repo');
-  assert.equal(request.result.kind, 'structured');
-  assert.equal(request.result.schema.additionalProperties, false);
-
-  events.emit(DELEGATION_RESPONSE, {
-    requestId: crypto.randomUUID(),
-    ownerRunId: request.ownerRunId,
-    nodeId: request.nodeId,
-    status: 'completed',
-    result: { kind: 'structured', value: { ignored: true } },
-  });
-  events.emit(DELEGATION_RESPONSE, {
-    requestId: request.requestId,
-    ownerRunId: request.ownerRunId,
-    nodeId: request.nodeId,
-    status: 'completed',
-    result: { kind: 'structured', value: validPlan() },
-  });
-
-  assert.deepEqual(await pending, validPlan());
-  assert.equal(events.listenerCount(DELEGATION_RESPONSE), 0);
-});
-
-test('requestPlan rejects malformed and failed terminal responses and removes listeners', async () => {
-  for (const response of [
-    { status: 'completed', result: { kind: 'text', text: '{}' } },
-    { status: 'completed', result: { kind: 'structured', value: undefined } },
-    { status: 'failed', error: 'planner exploded' },
-  ]) {
-    const events = new FakeEventBus();
-    const pending = requestPlan({ events, task: 'Plan.', cwd: '/repo', timeout: 100 });
-    const request = events.lastEmission(DELEGATION_REQUEST)!.data as Record<string, unknown>;
-    events.emit(DELEGATION_RESPONSE, {
-      requestId: request.requestId,
-      ownerRunId: request.ownerRunId,
-      nodeId: request.nodeId,
-      ...response,
-    });
-    await assert.rejects(pending, response.status === 'failed' ? /planner exploded/ : /structured/i);
-    assert.equal(events.listenerCount(DELEGATION_RESPONSE), 0);
-  }
-});
-
-test('validatePlan enforces Ultra roles, lane IDs, uniqueness, string bounds, and mode counts', () => {
-  assert.deepEqual(validatePlan(validPlan(), { minLanes: 1, maxLanes: 4 }), validPlan());
-
-  const debuggerPlan = validPlan();
-  debuggerPlan.lanes[0]!.role = 'debugger' as any;
-  assert.throws(() => validatePlan(debuggerPlan, { minLanes: 1, maxLanes: 4 }), /role/i);
-
-  for (const id of ['Bad', 'two_words', '-bad', `a${'b'.repeat(48)}`]) {
-    const plan = validPlan();
-    plan.lanes[0]!.id = id;
-    assert.throws(() => validatePlan(plan, { minLanes: 1, maxLanes: 4 }), /lane id/i);
-  }
-
-  const duplicate = validPlan();
-  duplicate.lanes[1]!.id = duplicate.lanes[0]!.id;
-  assert.throws(() => validatePlan(duplicate, { minLanes: 1, maxLanes: 4 }), /unique/i);
-
-  const tooLong = validPlan();
-  tooLong.lanes[0]!.task = 'x'.repeat(16_385);
-  assert.throws(() => validatePlan(tooLong, { minLanes: 1, maxLanes: 4 }), /task/i);
-});
-
-test('validatePlan accepts only zero-lane no-wave and genuinely over-cap over-cap plans', () => {
-  const noWave = { ...validPlan(), mode: 'no-wave', lanes: [] };
-  assert.deepEqual(validatePlan(noWave, { minLanes: 1, maxLanes: 2 }), noWave);
-  assert.throws(
-    () => validatePlan({ ...validPlan(), mode: 'no-wave' }, { minLanes: 1, maxLanes: 2 }),
-    /no-wave/i,
-  );
-
-  const overCap = {
-    ...validPlan(),
-    mode: 'over-cap',
-    lanes: [
-      ...validPlan().lanes,
-      { id: 'worker-b', role: 'worker', task: 'Implement B.', write: true },
-    ],
+function prepared(role: keyof typeof ROLE_AGENTS, id = role): UltraPreparedLane {
+  return {
+    lane: {
+      id,
+      role,
+      task: `${role} task`,
+      deliverable: `${role} deliverable`,
+      ...(role === 'worker' ? { ownedPaths: [`src/${id}`] } : {}),
+    },
+    agent: ROLE_AGENTS[role],
+    modelCandidates: ['openai/test-model'],
+    requestedModel: 'openai/test-model',
+    launchContractDigest: id.padEnd(64, 'a').slice(0, 64).replace(/[^a-f0-9]/gu, 'a'),
   };
-  assert.deepEqual(validatePlan(overCap, { minLanes: 1, maxLanes: 2 }), overCap);
-  assert.throws(
-    () => validatePlan({ ...validPlan(), mode: 'over-cap' }, { minLanes: 1, maxLanes: 2 }),
-    /over-cap/i,
-  );
-  assert.throws(
-    () => validatePlan({ ...validPlan(), lanes: [validPlan().lanes[0]!] }, { minLanes: 2, maxLanes: 3 }),
-    /between/i,
-  );
+}
+
+test('validates exact tool schema, hard bounds, role-derived ownership, and repair id', () => {
+  const validated = validateUltraDelegateInput(input(), { minLanes: 2, maxLanes: 4 });
+  assert.equal(validated.lanes[1]?.ownedPaths?.[0], 'src/parser');
+  assert.equal('write' in validated.lanes[1]!, false);
+
+  assert.throws(() => validateUltraDelegateInput({ ...input(), extra: true } as any, { minLanes: 2, maxLanes: 4 }), /unsupported field/i);
+  assert.throws(() => validateUltraDelegateInput({ ...input(), lanes: input().lanes.slice(0, 1) }, { minLanes: 2, maxLanes: 4 }), /between 2 and 4/i);
+  assert.throws(() => validateUltraDelegateInput({ ...input(), lanes: [...input().lanes, ...input().lanes, ...input().lanes] }, { minLanes: 2, maxLanes: 4 }), /at most|between/i);
+  assert.throws(() => validateUltraDelegateInput({ ...input(), repairOf: '../bad' }, { minLanes: 2, maxLanes: 4 }), /repairOf/i);
+  assert.throws(() => validateUltraDelegateInput({ ...input(), lanes: [{ ...input().lanes[0]!, write: true }, input().lanes[1]!] } as any, { minLanes: 2, maxLanes: 4 }), /unsupported field/i);
+  assert.throws(() => validateUltraDelegateInput({ ...input(), lanes: [{ ...input().lanes[0]!, ownedPaths: ['src'] }, input().lanes[1]!] }, { minLanes: 2, maxLanes: 4 }), /ownedPaths.*worker/i);
+  assert.throws(() => validateUltraDelegateInput({ ...input(), lanes: [input().lanes[0]!, { ...input().lanes[1]!, ownedPaths: undefined }] }, { minLanes: 2, maxLanes: 4 }), /ownedPaths/i);
 });
 
-test('buildWaveWorkflow safely quotes input, uses fresh context/output, and isolates writing lanes', () => {
-  const hostile = `Do work.\n"}); throw new Error('injected');//`;
-  const script = buildWaveWorkflow([
-    { id: 'write-lane', role: 'worker', task: hostile, write: true },
-    { id: 'read-lane', role: 'reviewer', task: 'Inspect only.', write: false },
-  ], 'ultra-worker"}); process.exit();//');
-
-  assert.ok(script.includes(JSON.stringify(hostile).slice(1, -1)));
-  assert.ok(script.includes(JSON.stringify('ultra-worker"}); process.exit();//')));
-  assert.match(script, /"context":"fresh"/);
-  assert.match(script, /"output":true/);
-  assert.match(script, /"worktree":true/);
-  assert.match(script, /Authority: WRITE/);
-  assert.match(script, /Authority: READ-ONLY/);
-  assert.equal((script.match(/"worktree":true/g) ?? []).length, 1);
-  assert.doesNotThrow(() => new Function('runs', `return (async () => { ${script} })();`));
-});
-
-test('preflightLane never forwards automatic as a requested or expected fixed model', async () => {
-  const cwd = await mkdtemp(join(tmpdir(), 'pi-ultra-preflight-'));
-  await mkdir(join(cwd, '.pi', 'agents'), { recursive: true });
-  await writeFile(join(cwd, '.pi', 'agents', 'test-lane.md'), `---\nname: test-lane\ndescription: test lane\nmodel: provider/agent-default\ntools: read\n---\nStay bounded.\n`);
-  const availableModels = [
-    { provider: 'provider', id: 'agent-default', fullId: 'provider/agent-default' },
-    { provider: 'provider', id: 'uniform-fixed', fullId: 'provider/uniform-fixed' },
-  ];
-  try {
-    const explicitAutomatic = await preflightLane({
-      agent: 'test-lane',
-      task: 'Inspect only.',
-      cwd,
-      availableModels,
-      model: 'automatic',
-      uniformModel: 'provider/uniform-fixed',
-    });
-    assert.equal(explicitAutomatic.model, 'provider/agent-default');
-
-    const uniformAutomatic = await preflightLane({
-      agent: 'test-lane',
-      task: 'Inspect only.',
-      cwd,
-      availableModels,
-      uniformModel: 'automatic',
-    });
-    assert.equal(uniformAutomatic.model, 'provider/agent-default');
-  } finally {
-    await rm(cwd, { recursive: true, force: true });
+test('rejects duplicate semantic padding, unsafe paths, and overlapping worker ownership', () => {
+  assert.throws(() => validateUltraDelegateInput(input([
+    { id: 'a', role: 'scout', task: 'Inspect   parser.', deliverable: 'Evidence.' },
+    { id: 'b', role: 'reviewer', task: 'inspect parser', deliverable: 'Different.' },
+  ]), { minLanes: 2, maxLanes: 4 }), /duplicate task/i);
+  assert.throws(() => validateUltraDelegateInput(input([
+    { id: 'a', role: 'scout', task: 'Inspect A.', deliverable: 'Same evidence.' },
+    { id: 'b', role: 'reviewer', task: 'Inspect B.', deliverable: 'same   evidence' },
+  ]), { minLanes: 2, maxLanes: 4 }), /duplicate deliverable/i);
+  for (const path of ['/etc/passwd', '../escape', 'src/*', 'C:\\escape']) {
+    assert.throws(() => validateUltraDelegateInput(input([
+      input().lanes[0]!,
+      { ...input().lanes[1]!, ownedPaths: [path] },
+    ]), { minLanes: 2, maxLanes: 4 }), /owned path/i, path);
   }
+  assert.throws(() => validateUltraDelegateInput(input([
+    { id: 'a', role: 'worker', task: 'Implement A.', deliverable: 'Patch A.', ownedPaths: ['src/parser'] },
+    { id: 'b', role: 'worker', task: 'Implement B.', deliverable: 'Patch B.', ownedPaths: ['src/parser/tests'] },
+  ]), { minLanes: 2, maxLanes: 4 }), /overlap/i);
 });
 
-test('preflightLane gives an explicit fixed model request precedence but enforces a uniform binding', async () => {
-  const cwd = await mkdtemp(join(tmpdir(), 'pi-ultra-preflight-'));
-  await mkdir(join(cwd, '.pi', 'agents'), { recursive: true });
-  await writeFile(join(cwd, '.pi', 'agents', 'test-lane.md'), `---\nname: test-lane\ndescription: test lane\nmodel: inherit\ntools: read\n---\nStay bounded.\n`);
-  const availableModels = [
-    { provider: 'provider', id: 'explicit', fullId: 'provider/explicit' },
-    { provider: 'provider', id: 'uniform', fullId: 'provider/uniform' },
-  ];
-  try {
-    await assert.rejects(
-      preflightLane({
-        agent: 'test-lane',
-        task: 'Inspect only.',
-        cwd,
-        availableModels,
-        model: 'provider/explicit',
-        uniformModel: 'provider/uniform',
-      }),
-      /model mismatch.*provider\/uniform.*provider\/explicit/i,
-    );
-  } finally {
-    await rm(cwd, { recursive: true, force: true });
-  }
+test('builds one strict static runs.all workflow preserving roles and worker-only isolation', () => {
+  const lanes = [prepared('scout'), prepared('worker'), prepared('reviewer')];
+  const script = buildUltraWorkflow(lanes);
+  assert.ok(script.startsWith('return await runs.all('));
+  const items = JSON.parse(script.slice('return await runs.all('.length, -2));
+  assert.deepEqual(items.map((item: any) => item.agent), ['ultra-scout', 'ultra-worker', 'ultra-reviewer']);
+  assert.deepEqual(items.map((item: any) => item.model), ['openai/test-model', 'openai/test-model', 'openai/test-model']);
+  assert.deepEqual(items.map((item: any) => item.worktree), [undefined, true, undefined]);
+  assert.ok(items[0].task.includes('READ-ONLY'));
+  assert.ok(items[1].task.includes('Owned paths: src/worker'));
+  assert.equal(items.every((item: any) => item.context === 'fresh' && item.output === true), true);
 });
 
-test('spawnWave sends an async fresh workflow RPC and returns only its correlated success', async () => {
+test('preflights fixed uniform, automatic, and role-default model contracts exactly', async () => {
+  const calls: any[] = [];
+  const preflight = async (value: any) => {
+    calls.push(value);
+    const requested = value.model as string | undefined;
+    const automatic = requested ?? 'openai/auto-model';
+    return {
+      ok: true as const,
+      contract: {
+        version: 2,
+        agent: { name: value.agent },
+        context: 'fresh' as const,
+        model: automatic,
+        modelCandidates: [automatic],
+        tools: {
+          effectiveAllowlist: value.agent === 'ultra-worker'
+            ? ['read', 'grep', 'find', 'ls', 'bash', 'edit', 'write', 'contact_supervisor']
+            : ['read', 'grep', 'find', 'ls'],
+          runtimeExtensions: [], configuredExtensions: [], disableAmbientExtensions: true,
+        },
+        launchContractDigest: `${calls.length}`.repeat(64).slice(0, 64),
+      },
+    } as any;
+  };
+  const common = {
+    input: input(), cwd: '/repo', sessionId: 'session', revision: 'revision',
+    availableModels: [{ provider: 'openai', id: 'test-model' }],
+    parentModel: { provider: 'openai', id: 'manager' },
+    resolveContract: preflight,
+    capabilityCeiling: { version: 1 as const, allowedAgents: Object.values(ROLE_AGENTS), allowedTools: ['read', 'grep', 'find', 'ls', 'bash', 'edit', 'write', 'contact_supervisor'], denyExtensions: true, sources: ['ultra'] },
+  };
+
+  const fixed = await prepareUltraWave({ ...common, settings: FIXED });
+  assert.deepEqual(fixed.lanes.map((lane) => lane.agent), ['ultra-scout', 'ultra-worker']);
+  assert.deepEqual(fixed.lanes.map((lane) => lane.modelCandidates), [['openai/test-model'], ['openai/test-model']]);
+  assert.equal(calls.every((call) => call.model === 'openai/test-model'), true);
+
+  calls.length = 0;
+  const automatic = await prepareUltraWave({ ...common, settings: AUTOMATIC });
+  assert.deepEqual(automatic.lanes.map((lane) => lane.requestedModel), ['openai/auto-model', 'openai/auto-model']);
+  assert.equal(calls[0]?.agent, 'ultra-worker', 'automatic seed uses strict worker');
+  assert.equal(calls.slice(1).every((call) => call.model === 'openai/auto-model'), true);
+
+  calls.length = 0;
+  const defaults = await prepareUltraWave({ ...common, settings: ROLE_DEFAULTS });
+  assert.equal(defaults.lanes.every((lane) => lane.requestedModel === undefined), true);
+  assert.equal(calls.every((call) => call.model === undefined), true);
+});
+
+test('fails complete preflight for fallback uniform models or role authority drift', async () => {
+  const common = {
+    input: input(), settings: FIXED, cwd: '/repo', sessionId: 'session', revision: 'revision',
+    availableModels: [{ provider: 'openai', id: 'test-model' }], parentModel: { provider: 'openai', id: 'manager' },
+    capabilityCeiling: undefined,
+  };
+  await assert.rejects(() => prepareUltraWave({
+    ...common,
+    resolveContract: async (value: any) => ({ ok: true, contract: {
+      agent: { name: value.agent }, context: 'fresh', model: value.model,
+      modelCandidates: [value.model, 'openai/fallback'],
+      tools: { effectiveAllowlist: value.agent === 'ultra-worker' ? ['read', 'bash', 'edit', 'write'] : ['read'], runtimeExtensions: [], configuredExtensions: [], disableAmbientExtensions: true },
+      launchContractDigest: 'a'.repeat(64),
+    } } as any),
+  }), /sole candidate|uniform/i);
+  await assert.rejects(() => prepareUltraWave({
+    ...common,
+    resolveContract: async (value: any) => ({ ok: true, contract: {
+      agent: { name: value.agent }, context: 'fresh', model: value.model,
+      modelCandidates: [value.model],
+      tools: { effectiveAllowlist: ['read', 'write'], runtimeExtensions: [], configuredExtensions: [], disableAmbientExtensions: true },
+      launchContractDigest: 'a'.repeat(64),
+    } } as any),
+  }), /read-only|mutation/i);
+});
+
+test('issues one permit after preflight and sends it only as RPC authorization metadata', async () => {
   const events = new FakeEventBus();
-  const pending = spawnWave(events, 'return await runs.all([]);', '/repo');
-  const emission = events.lastEmission(RPC_REQUEST);
-  assert.ok(emission);
-  const request = emission.data as Record<string, any>;
-  assert.match(request.requestId, UUID);
-  assert.equal(request.version, 1);
+  const issued: any[] = [];
+  const authority = {
+    issueOnce(value: any) { issued.push(value); return 'opaque-permit'; },
+    revokeUnused() {}, dispose() {},
+  } satisfies UltraLaunchAuthorityHandle;
+  const lanes = [prepared('scout'), prepared('worker')];
+  const script = buildUltraWorkflow(lanes);
+  const preparedWave = {
+    objective: 'Objective', acceptance: ['Test'], revision: 'revision', settings: FIXED,
+    lanes, script,
+    params: { workflowScript: script, cwd: '/repo', context: 'fresh' as const, async: true as const, mission: false as const },
+  };
+  const pending = launchUltraWave({ events, authority, prepared: preparedWave, timeoutMs: 100 });
+  await new Promise((resolve) => setImmediate(resolve));
+  const request = events.lastEmission('subagents:rpc:v1:request')?.data as any;
   assert.equal(request.method, 'spawn');
-  assert.deepEqual(request.params, {
-    workflowScript: 'return await runs.all([]);',
-    cwd: '/repo',
-    async: true,
-    context: 'fresh',
+  assert.deepEqual(request.authorization, { launchPermits: ['opaque-permit'] });
+  assert.equal(JSON.stringify(request.params).includes('opaque-permit'), false);
+  assert.equal(issued.length, 1);
+  assert.equal(issued[0].requestDigest.length, 64);
+  assert.deepEqual(issued[0].lanes.map((lane: any) => lane.key), ['scout', 'worker']);
+  events.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
+    version: 1, requestId: request.requestId, method: 'spawn', success: true,
+    data: { text: 'Async workflow', details: { runId: 'run-1', asyncDir: '/tmp/run-1' } },
   });
-
-  const replyEvent = `subagents:rpc:v1:reply:${request.requestId}`;
-  events.emit(replyEvent, { version: 1, requestId: crypto.randomUUID(), success: true, data: 'wrong' });
-  events.emit(replyEvent, { version: 1, requestId: request.requestId, success: true, data: { runId: 'run-1' } });
-  assert.deepEqual(await pending, { runId: 'run-1' });
-  assert.equal(events.listenerCount(replyEvent), 0);
-});
-
-test('spawnWave surfaces RPC failure and unsubscribes', async () => {
-  const events = new FakeEventBus();
-  const pending = spawnWave(events, 'return 1;', '/repo');
-  const request = events.lastEmission(RPC_REQUEST)!.data as Record<string, unknown>;
-  const replyEvent = `subagents:rpc:v1:reply:${request.requestId}`;
-  events.emit(replyEvent, {
-    version: 1,
-    requestId: request.requestId,
-    success: false,
-    error: { code: 'execution_failed', message: 'spawn refused' },
-  });
-  await assert.rejects(pending, /spawn refused/);
-  assert.equal(events.listenerCount(replyEvent), 0);
+  assert.deepEqual(await pending, { text: 'Async workflow', details: { runId: 'run-1', asyncDir: '/tmp/run-1' } });
 });
