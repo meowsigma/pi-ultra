@@ -8,7 +8,6 @@ import type {
   ActionsScreen,
   ChoiceScreen,
   MenuActionHandler,
-  MenuDefinition,
   MenuScreenFactory,
   RunMenuOptions,
   RunMenuResult,
@@ -51,16 +50,13 @@ export type UltraActionId =
  * Covers the ExtensionCommandContext subset needed to render the menu
  * and resolve available models.
  */
-export interface UltraMenuContext {
-  mode: ExtensionCommandContext['mode'];
-  hasUI: boolean;
-  ui: Record<string, unknown>;
-  scopedModels?: readonly { id: string; name?: string }[];
-  modelRegistry?: { getAvailable(): readonly { id: string; name?: string }[] };
-  signal?: AbortSignal;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  [key: string]: any;
-}
+export type UltraMenuContext = Pick<
+  ExtensionCommandContext,
+  'mode' | 'hasUI' | 'scopedModels' | 'model'
+> & {
+  ui: Pick<ExtensionCommandContext['ui'], 'custom' | 'input' | 'select' | 'notify'>;
+  modelRegistry: Pick<ExtensionCommandContext['modelRegistry'], 'getAvailable'>;
+};
 
 export interface ShowUltraMenuOptions {
   /** The Pi extension context (or compatible subset). */
@@ -124,7 +120,11 @@ export function buildMainMenu(settings: UltraSettings): ActionsScreen<UltraScree
   const enabledText = settings.enabled ? 'yes' : 'no';
   const routeLabel = routingLabel(settings.routingMode);
   const effective = effectiveUniformModel(settings);
-  const modelLabel = settings.routingMode === 'role-defaults' ? '\u2013' : (effective ?? 'Automatic');
+  const modelLabel = settings.routingMode === 'role-defaults'
+    ? '\u2013'
+    : effective === 'automatic'
+      ? 'Automatic'
+      : (effective ?? 'Automatic');
   const lanesLabel = `Lanes: ${settings.minLanes}\u2013${settings.maxLanes}`;
 
   // Build with spread to avoid readonly-array mutation
@@ -165,8 +165,8 @@ export function buildMainMenu(settings: UltraSettings): ActionsScreen<UltraScree
  * @param params.settings – current UltraSettings
  * @param params.availableModels – optional list of model IDs from
  *   ctx.scopedModels or ctx.modelRegistry.getAvailable().
- *   When provided, the Worker model item is disabled if the saved
- *   model is not in this list.
+ *   When provided, an unavailable saved model is described on the
+ *   enabled row so the user can open the picker and recover.
  */
 export function buildSettingsScreen(params: {
   settings: UltraSettings;
@@ -200,7 +200,7 @@ export function buildSettingsScreen(params: {
       label: 'Worker model',
       currentValue: savedModel ?? 'Automatic',
       action: 'set-model',
-      ...(modelUnavailable ? { disabled: true as const, description: 'Saved model no longer available' } : {}),
+      ...(modelUnavailable ? { description: 'Saved model no longer available; choose a replacement' } : {}),
     },
     {
       id: 'min-subagents',
@@ -329,8 +329,10 @@ export function applySetting(
   } else if (field === 'minLanes' || field === 'maxLanes') {
     // Parse lane strings to numbers
     if (typeof value === 'string') {
-      const parsed = parseInt(value, 10);
-      if (Number.isNaN(parsed) || !Number.isSafeInteger(parsed)) return undefined;
+      const trimmed = value.trim();
+      if (!/^\d+$/u.test(trimmed)) return undefined;
+      const parsed = Number(trimmed);
+      if (!Number.isSafeInteger(parsed)) return undefined;
       next[field] = parsed;
     } else {
       next[field] = value;
@@ -350,13 +352,17 @@ type MenuState = { settings: UltraSettings };
  * Resolve available model IDs from the context.
  */
 function resolveAvailableModels(ctx: UltraMenuContext): readonly string[] {
-  if (ctx.scopedModels && ctx.scopedModels.length > 0) {
-    return ctx.scopedModels.map((m) => m.id);
-  }
-  if (ctx.modelRegistry && typeof ctx.modelRegistry.getAvailable === 'function') {
-    return ctx.modelRegistry.getAvailable().map((m: { id: string }) => m.id);
-  }
-  return [];
+  const scoped = ctx.scopedModels.map(({ model }) => model);
+  const registry = scoped.length === 0 ? ctx.modelRegistry.getAvailable() : [];
+  const models = scoped.length > 0
+    ? scoped
+    : registry.length > 0
+      ? registry
+      : ctx.model === undefined
+        ? []
+        : [ctx.model];
+
+  return [...new Set(models.map((model) => `${model.provider}/${model.id}`))];
 }
 
 /**
@@ -400,21 +406,19 @@ export async function showUltraMenu(
 
   // ── Action handlers ───────────────────────────────────────────
 
-  function settingAction(
+  async function settingAction(
     field: string,
     value: unknown,
-  ): { kind: 'stay' } | { kind: 'rejected'; error: unknown } {
+  ): Promise<{ kind: 'stay' } | { kind: 'rejected'; error: unknown }> {
     const next = applySetting(currentSettings, field, value);
     if (next === undefined) {
       return { kind: 'rejected', error: `Invalid value for ${field}` };
     }
-    // Call save once — fire and forget
-    save(next).catch((err: unknown) => {
-      // Save failed — in-memory state is preserved; error surfaces
-      // via the runMenu onError option or as a rejected result.
-      return { kind: 'rejected', error: err };
-    });
-    // Update in-memory state optimistically
+    try {
+      await save(next);
+    } catch (error) {
+      return { kind: 'rejected', error };
+    }
     currentSettings = next;
     return { kind: 'stay' };
   }
@@ -435,17 +439,13 @@ export async function showUltraMenu(
       return settingAction('routingMode', mode);
     },
     'set-model': (actCtx: MenuActionContext<MenuState, UltraMenuContext>) => {
-      // When called from the SettingsScreen Worker model item with no value,
-      // navigate to the model choice screen.
-      if (actCtx.value === undefined || actCtx.value === '') {
+      if (actCtx.itemId === 'worker-model') {
         return { kind: 'to' as const, screen: 'model-select' as const };
       }
-      // When called from the model choice screen with a selected model ID:
-      const modelId = actCtx.value;
-      if (modelId === 'automatic') {
-        return settingAction('workerModel', 'Automatic');
-      }
-      return settingAction('workerModel', modelId);
+      return settingAction(
+        'workerModel',
+        actCtx.itemId === 'automatic' ? undefined : actCtx.itemId,
+      );
     },
     'set-min-lanes': (actCtx: MenuActionContext<MenuState, UltraMenuContext>) =>
       settingAction('minLanes', actCtx.value ?? ''),
