@@ -1,12 +1,12 @@
 # Ultra Main-Manager Redesign
 
 **Date:** 2026-08-23  
-**Status:** Approved design; implementation not started  
+**Status:** Approved requirements; implementation gated on the launch-authority seam in §5.1
 **Branch:** `feature/ultra-main-manager`
 
 ## 1. Purpose
 
-Ultra must make the active Pi session model the manager. The main model receives the user's task, decides how to decompose it, delegates bounded work, continues working in the session, and makes the final quality decision. Ultra must not replace the main model with a foreground planner subagent.
+Ultra must make the active Pi session model the manager. The main model receives the user's task, decides how to decompose it, delegates bounded work, continues working in the session, and makes the final quality decision. Ultra must not replace the main model with a foreground planner subagent. While Ultra is enabled, it is the session-wide authority for every new pi-subagents spawn originating from that main session; no direct tool, workflow, RPC, structured-delegation, nested, scheduled, or extension-triggered path may bypass its current lane and model policy.
 
 The redesign also provides:
 
@@ -26,6 +26,9 @@ The redesign also provides:
 4. **Model catalog:** the Ultra picker searches all models returned by `ctx.modelRegistry.getAvailable()`, regardless of current session scope.
 5. **Lane controls:** Small `1–2`, Balanced `2–4`, Large `4–8`, plus Custom.
 6. **`/ultra` is a TUI menu.** RPC adapters remain testable, but RPC-side menu search is not a product requirement.
+7. **Ultra-on is session-wide launch policy.** Every new main-session pi-subagents spawn path is governed; status, inspection, stop, interrupt, and steer remain available.
+8. **Lane bounds are hard per-wave admission bounds.** The main session is not a lane. An unowned one-agent launch is rejected when `minLanes` is greater than one; over-cap and under-minimum waves never partially launch.
+9. **Uniform model binding is authoritative.** Every lane must have exactly the currently selected canonical model as its only candidate. The current user's `openai-codex/gpt-5.6-sol` selection is evidence, not a hard-coded product value; changing settings changes subsequent permits immediately.
 
 ## 3. Audit baseline
 
@@ -41,7 +44,10 @@ The existing release passes typecheck and 51 tests, but the deep audit found mat
 - invalid configuration fails open to enabled defaults;
 - settings locks protect bytes but not atomic read-modify-write semantics;
 - stale lock directories are not recoverable;
-- packed-file inspection does not prove the packed extension loads.
+- packed-file inspection does not prove the packed extension loads;
+- direct subagent launches outside the old optional Ultra path bypass model and cardinality settings.
+
+Audit workers launched manually outside Ultra are useful code-review evidence but are not proof that Ultra policy works. With the current configuration (`uniform`, `minLanes: 4`, `maxLanes: 8`, selected model `openai-codex/gpt-5.6-sol`), a compliant Ultra audit wave would require 4–8 authorized lanes resolving only to that selected model.
 
 This design treats those findings as release blockers for the redesign rather than preserving the old controller.
 
@@ -63,7 +69,50 @@ Parallel planning creates duplicate decomposition, concurrent ownership, conflic
 
 ## 5. Main-session execution model
 
-### 5.1 No passive input interception
+### 5.1 Proven session-wide enforcement boundary
+
+The installed public APIs do **not** currently provide the complete enforcement seam this requirement needs:
+
+- Pi 0.84.2 `tool_call` handlers can block a main-model `subagent` tool call. This covers direct tool calls but not process-local RPC or structured-delegation events.
+- pi-subagents 0.54.0 `registerSubagentCapabilityCeiling` can restrict agent and tool names across launch paths. It cannot restrict models or require a minimum/maximum batch cardinality.
+- pi-subagents model scope can enforce model patterns from settings, but there is no public session-scoped registration API that Ultra can update atomically with its own selected model.
+- Pi's process-local event bus is a notification `EventEmitter`. RPC and structured-delegation requests have no cancellable result, and pi-subagents may already begin handling them before another listener observes them.
+
+Therefore pi-ultra alone cannot truthfully enforce hard model and lane policy across direct tools, workflows, RPC, structured delegation, nested launches, schedules, and other extension launches. Event-listener mutation, package load ordering, source-string checks, or temporary ceiling removal are explicitly forbidden as fake security boundaries.
+
+The implementation is gated on a small public pi-subagents launch-authority API (delivered upstream or through an explicitly pinned compatible package version):
+
+```ts
+const authority = registerSubagentLaunchAuthority({
+  sessionId,
+  source: "pi-ultra",
+  defaultNewSpawnDecision: "deny"
+});
+
+const permit = authority.issueOnce({
+  configRevision,
+  expiresInMs,
+  minLanes,
+  maxLanes,
+  lanes: [{ key, agent, modelCandidates, launchContractDigest }]
+});
+```
+
+Required authority semantics:
+
+1. Every pi-subagents path that can admit a new child or workflow consults all active session authorities before any child starts. This includes direct tool calls, static/dynamic workflows, RPC spawn/resume, structured delegation, nested launches, schedules, and extension-triggered launches.
+2. Read-only/control actions (`list`, `status`, `stop`, `interrupt`, `steer`) remain available. Any action that starts or revives execution requires authorization.
+3. Permits are opaque, unforgeable, one-use, session-bound, short-lived, and tied to a config revision plus the exact preflighted child manifest and launch-contract digests.
+4. All active authority registrations intersect. Another extension cannot satisfy or bypass Ultra's registration with its own permit.
+5. The complete static wave is admitted atomically. Cardinality, keys, agents, model candidates, and digests must match before the first child starts. Arbitrary/dynamic scripts without an exact authorized manifest fail closed.
+6. Admission calls the owning authority's validator, which re-reads the current Ultra config revision before consuming the permit. A mismatch rejects the complete wave. In-session settings updates also revoke every unused permit from the old revision. Already admitted runs retain the policy under which they started; every subsequent launch uses the new setting.
+7. The authority and its inherited proof propagate to nested/async execution and recovery without exposing the permit to the model.
+
+With compatible launch authority, Ultra also registers a capability ceiling allowing only `ultra-scout`, `ultra-worker`, and `ultra-reviewer`, and a Pi `tool_call` handler blocks direct spawn-shaped `subagent` calls with a clear instruction to use `ultra_delegate`. The tool hook is defense-in-depth and diagnostics; the pi-subagents authority is the source-independent enforcement boundary.
+
+While Ultra is enabled—or its config is invalid/ambiguous—against a pi-subagents version without this API, Ultra registers an empty `allowedAgents` capability ceiling and blocks direct `subagent` spawn calls for a clearer diagnostic. This permits management actions but denies **all** new subagent execution, including `ultra_delegate`. The main model may take over directly. Ultra never degrades to partially governed launches. With a valid explicit `/ultra off`, Ultra disposes its launch authority, capability ceiling, and direct-call guard so normal pi-subagents behavior resumes.
+
+### 5.2 No passive input interception
 
 Ultra removes the ordinary `input` handler and the ownership-prefix/requeue mechanism. User prompts, steers, follow-ups, images, and extension-originated messages flow to Pi normally.
 
@@ -75,7 +124,7 @@ This eliminates:
 - hidden duplicate work after partial launch;
 - the misleading `main → ultra-planner` run in the subagent inspector.
 
-### 5.2 Dynamic manager policy
+### 5.3 Dynamic manager policy
 
 When Ultra is enabled and configuration is valid, `before_agent_start` appends a bounded Ultra policy to the current system prompt. It must preserve the existing system prompt and state:
 
@@ -92,13 +141,13 @@ Delegation-first is a model/tool contract, not a blockade on Pi's mutation tools
 
 When Ultra is disabled or configuration is invalid, no delegation policy is injected.
 
-### 5.3 Explicit `/ultra <task>`
+### 5.4 Explicit `/ultra <task>`
 
 `/ultra <task>` no longer runs a planner. When enabled, it injects a model-visible `ultra-explicit-task` message containing the original task and triggers the active main model. If the model is already running, delivery is queued as a follow-up. The dynamic policy marks the request as explicitly Ultra-managed.
 
 When disabled, it reports exactly `Run /ultra on first.` and does not trigger a turn.
 
-### 5.4 Tool contract
+### 5.5 Tool contract
 
 Ultra registers one main-session tool:
 
@@ -108,7 +157,9 @@ ultra_delegate({
   lanes: Array<{
     id: string,
     role: "scout" | "worker" | "reviewer",
-    task: string
+    task: string,
+    deliverable: string,
+    ownedPaths?: string[]
   }>,
   acceptance: string[],
   repairOf?: string
@@ -118,13 +169,14 @@ ultra_delegate({
 The tool:
 
 - is available in every session but fails fast when Ultra is disabled, configuration is invalid, or capabilities are unavailable;
-- validates exact keys, bounded text, lane IDs, uniqueness, role allowlist, and configured lane range;
+- reloads the latest committed settings and validates exact keys, bounded text, lane IDs, uniqueness, role allowlist, and hard configured lane range;
+- rejects normalized duplicate tasks/deliverables and pairwise-overlapping writer path ownership;
 - derives mutation authority from role rather than accepting a contradictory `write` boolean;
-- preflights every lane before launch;
-- launches exactly one asynchronous workflow and returns an operation ID plus run receipt;
+- preflights the complete wave before requesting a one-use launch permit;
+- launches exactly one authorized asynchronous workflow and returns an operation ID plus run receipt;
 - never claims success or acceptance.
 
-A main model that decides no qualified wave exists simply does not call the tool and continues normally.
+A main model that decides no qualified wave exists simply does not call the tool and continues normally. Ultra can structurally reject duplicate padding and overlapping writer ownership, but no API can prove that two deceptive prose descriptions are semantically independent. The manager policy requires genuine independence, and the final main-model audit remains responsible for detecting semantic padding; the implementation must not claim stronger automatic proof.
 
 ## 6. Role and model routing
 
@@ -142,12 +194,11 @@ Package-owned names avoid overriding pi-subagents built-ins globally. Their agen
 
 ### 6.2 Routing modes
 
-- **Role defaults:** each package-owned role agent resolves its configured/default model, including a matching user agent override when present.
-- **Uniform:** the selected canonical `provider/id` is passed as a requested and expected model for every lane.
+- **Role defaults:** each package-owned role agent resolves its configured/default candidate chain, including a matching user agent override when present. Preflighted candidates and actual runtime models are recorded and verified.
+- **Uniform with a fixed selection:** the latest selected canonical `provider/id` is passed as the requested and expected model for every lane. Preflight must report exactly one model candidate equal to that selection; agent defaults and fallback candidates are rejected before permit issuance.
+- **Uniform with `Automatic`:** Ultra first preflights `ultra-worker` without a model override to resolve one canonical available model, then re-preflights every lane with that model as the explicit requested/expected sole candidate. The one-use permit pins it for the complete wave. `Automatic` is never forwarded as a literal model ID.
 
-Uniform routing changes only model binding. It never changes the lane's role or agent.
-
-`Automatic` means no fixed model request or expectation; it is never forwarded as a literal model ID.
+Uniform routing changes only model binding. It never changes the lane's role or agent. A settings update revokes unused old-revision permits, so the next admitted wave immediately follows the new selection.
 
 ## 7. Atomic workflow launch
 
@@ -162,9 +213,9 @@ return await runs.all([
 
 Each child carries its own resolved agent and optional model. Worker lanes set `worktree: true`; scout/reviewer lanes cannot request it and retain strict read-only tools.
 
-The workflow is sent in one RPC `spawn`, creating one admission result, one run ID, and one terminal completion boundary. Ultra does not split role/model groups into independent RPC launches.
+The workflow is sent in one RPC `spawn` carrying the opaque one-use launch permit outside model-visible parameters. pi-subagents matches the complete parsed child manifest and every launch-contract digest to the permit before admitting the workflow, creating one admission result, one run ID, and one terminal completion boundary. Ultra does not split role/model groups into independent RPC launches.
 
-If preflight or admission fails, no lane is treated as launched. The tool returns bounded diagnostics to the main model immediately.
+If any lane fails validation/preflight, the permit cannot be issued. If permit validation or workflow admission fails, no child starts and the permit is consumed or revoked. The tool returns bounded diagnostics to the main model immediately.
 
 ## 8. Delegation repair and takeover
 
@@ -182,20 +233,23 @@ A repair call must set `repairOf` to a completed operation.
 - The first repair is accepted with `repairCount: 1`.
 - A second repair for the same operation is rejected with a model-visible instruction that the main model must take over.
 - A repair may contain only focused lanes tied to failed or inadequate prior work.
+- A repair is still a new wave and must satisfy the current hard `minLanes`/`maxLanes` bounds. If there are not enough genuine independent repair lanes, Ultra rejects the repair wave and instructs the main model to take over rather than pad it.
 
 Preflight/admission failure does not consume the single quality-repair allowance because no worker attempt ran. Repeated capability failure still tells the main model to proceed directly rather than loop.
 
 ## 9. Capability readiness and shutdown
 
-On session start, Ultra requests the pi-subagents capability advertisement and stores the validated protocol version, events, and methods.
+On session start, Ultra requests the pi-subagents capability advertisement and stores the validated protocol version, events, methods, and launch-authority capability/version. It registers both its session capability ceiling and deny-by-default launch authority before reporting Ultra as operational.
 
-`ultra_delegate` waits at most the short protocol timeout (default 1.5 seconds) for readiness. It never enters the old 120-second planner wait. Failure identifies the missing/incompatible dependency and suggests install/update plus `/reload`.
+`ultra_delegate` waits at most the short protocol timeout (default 1.5 seconds) for readiness. It never enters the old 120-second planner wait. Missing or incompatible launch-authority support leaves the empty-agent fail-closed ceiling active, identifies the required pi-subagents version, and suggests install/update plus `/reload`. `/ultra on` may persist the preference, but status must show `Ultra: blocked` rather than implying governed launches are available.
 
 Every RPC waiter accepts an abort signal. Session shutdown/reload:
 
 - aborts active waiters;
 - clears timers;
-- removes listeners;
+- removes listeners and direct-call guards;
+- disposes launch-authority and capability-ceiling registrations;
+- revokes unused permits;
 - prevents stale extension instances from storing receipts or sending messages.
 
 ## 10. Durable completion and manager delivery
@@ -256,13 +310,13 @@ Commands and menu actions update fresh locked state. Toggle is computed inside t
 
 ### 11.2 Invalid configuration
 
-Malformed or invalid settings fail closed: Ultra is disabled for execution, the original bytes remain untouched, and a bounded reason is shown.
+Malformed or invalid settings fail closed into `Ultra: blocked`: the original bytes remain untouched, the empty-agent capability ceiling denies new subagent execution, `ultra_delegate` is unavailable, and a bounded reason is shown. The main model may work directly, but no unmanaged subagent launch is allowed until recovery or a valid explicit off-state is committed.
 
 The TUI offers an explicit recovery action that:
 
 1. asks for confirmation;
 2. copies the exact invalid bytes to a timestamped backup under the lock;
-3. prepares validated defaults in a same-directory exclusive temp file;
+3. prepares validated defaults with `enabled: false` in a same-directory exclusive temp file;
 4. atomically replaces the invalid file only after the backup and temp write succeed;
 5. reports both paths and committed state.
 
@@ -349,6 +403,8 @@ Add package-owned strict role agents:
 
 Manager policy/instructions have one runtime source of truth in extension code, with tests asserting the model-visible contract. README and package smoke expectations follow that source rather than treating dead prompts as runtime behavior.
 
+The peer dependency is raised to the first pi-subagents version that exports and advertises the launch-authority API defined in §5.1. A local node_modules patch, event-listener ordering trick, or undeclared private import is not an acceptable integration.
+
 ## 15. Verification strategy
 
 ### 15.1 Main-manager behavior
@@ -362,16 +418,26 @@ Tests prove:
 - initial wave, one repair, second-repair rejection, and direct-main override guidance;
 - disabled/invalid config fails fast.
 
-### 15.2 Authority and routing
+### 15.2 Session-wide launch authority and routing
 
-Use real preflight contracts to prove:
+Use real Pi/pi-subagents ingress paths and preflight contracts to prove:
 
+- with `minLanes: 4`, a direct one-agent `subagent` call is rejected before spawn;
+- unpermitted single, parallel, static/dynamic workflow, RPC, structured-delegation, nested, scheduled, resume, and extension-triggered launches are rejected while Ultra is on;
+- `list`, `status`, `stop`, `interrupt`, and `steer` remain available;
+- missing launch-authority support activates the empty-agent ceiling and starts no child;
+- permits are one-use, expire, reject replay/forgery, and are invalidated by a config-revision change;
+- under-minimum, over-cap, malformed, duplicate-task/deliverable, and overlapping-writer waves issue no permit;
+- any failed lane preflight prevents permit issuance and starts no child;
 - scout/reviewer effective tools exclude `bash`, `edit`, and `write`;
 - worker has required implementation tools and worktree isolation;
 - reviewer/scout cannot become writing lanes;
 - uniform routing preserves role agents and binds only the model;
-- `Automatic` is never sent as a model ID;
-- one workflow contains every per-lane agent/model binding.
+- fixed uniform mode exposes exactly the selected model as the sole candidate and rejects defaults/fallbacks;
+- changing the selected model changes the next admitted manifest;
+- Automatic resolves once and pins one model across the complete wave;
+- role-default mappings and actual runtime models are verified;
+- one authorized workflow contains every per-lane agent/model/digest binding.
 
 ### 15.3 Protocol and lifecycle
 
@@ -428,13 +494,15 @@ The redesign is complete only when:
 1. `/ultra` opens the approved menu and model search works over all available models.
 2. The active session model receives and manages user tasks; no planner subagent owns the prompt.
 3. Qualifying work is delegation-first with one repair then main takeover.
-4. Role authority is enforced by strict tool contracts and worker isolation.
-5. A wave has one atomic workflow receipt/completion boundary.
-6. Completion survives event races and reload, verifies actual bindings, and triggers one model-visible audit follow-up.
-7. Invalid config cannot enable execution or be silently overwritten.
-8. Concurrent settings changes do not lose updates.
-9. Focused, full, and packed-runtime smoke tests pass.
-10. README accurately documents main-manager ownership, escalation, routing, lane presets, recovery, and evidence-not-acceptance semantics.
+4. While Ultra is on, every supported main-session new-spawn path is denied unless it presents an exact one-use Ultra wave permit; management actions remain available.
+5. Hard per-wave lane bounds and the latest model policy are verified before any child starts; the main session never counts as a lane.
+6. Role authority is enforced by strict tool contracts and worker isolation.
+7. A wave has one atomic workflow receipt/completion boundary.
+8. Completion survives event races and reload, verifies actual bindings, and triggers one model-visible audit follow-up.
+9. Invalid config cannot enable execution or be silently overwritten.
+10. Concurrent settings changes do not lose updates.
+11. Focused, full, launch-ingress integration, and packed-runtime smoke tests pass.
+12. README accurately documents main-manager ownership, session-wide enforcement, escalation, routing, lane presets, recovery, and evidence-not-acceptance semantics.
 
 ## 17. Explicit non-goals
 
@@ -445,3 +513,5 @@ The redesign is complete only when:
 - RPC-side fuzzy model search.
 - Treating worker completion as acceptance.
 - Supporting a second worker repair for one operation.
+- Claiming an operating-system sandbox against malicious code already running in the trusted parent process.
+- Claiming semantic independence can be proven from arbitrary prose; Ultra enforces structural uniqueness/ownership and keeps semantic judgment with the main manager.
