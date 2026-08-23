@@ -13,10 +13,10 @@ Ultra requires Pi `>=0.84.0` and the reviewed launch-authority fork of `pi-subag
 pi remove npm:pi-subagents
 
 # Install the exact reviewed active extension commit.
-pi install git:github.com/meowsigma/pi-subagents@a3d45034927cb7e1fbca799472d656d9a8dd885c
+pi install git:github.com/meowsigma/pi-subagents@dde516d1f6a9f0a50b6306f0a0bffd026e58594e
 
 # Install Ultra (pin the release in production).
-pi install git:github.com/meowsigma/pi-ultra@v0.2.5
+pi install git:github.com/meowsigma/pi-ultra@v0.2.6
 ```
 
 Ultra bundles the same fork commit from its immutable HTTPS archive as a runtime API dependency because Pi packages have separate module roots. The separately installed fork is the active `subagent` extension; both copies share a versioned process registry. If the active extension does not advertise launch-authority v1, Ultra shows **blocked** and denies new subagent execution instead of partially enforcing policy.
