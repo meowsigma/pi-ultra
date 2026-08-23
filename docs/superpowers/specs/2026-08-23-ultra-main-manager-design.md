@@ -101,12 +101,12 @@ const permit = authority.issueOnce({
 Required authority semantics:
 
 1. Every pi-subagents path that can admit a new child or workflow consults all active session authorities before any child starts. This includes direct tool calls, static/dynamic workflows, RPC spawn/resume, structured delegation, nested launches, schedules, and extension-triggered launches.
-2. Read-only/control actions (`list`, `status`, `stop`, `interrupt`, `steer`) remain available. Any action that starts or revives execution requires authorization.
-3. Permits are opaque, unforgeable, one-use, session-bound, short-lived, and tied to a config revision plus the exact preflighted child manifest and launch-contract digests.
-4. All active authority registrations intersect. Another extension cannot satisfy or bypass Ultra's registration with its own permit.
-5. The complete static wave is admitted atomically. Cardinality, keys, agents, model candidates, and digests must match before the first child starts. Arbitrary/dynamic scripts without an exact authorized manifest fail closed.
-6. Admission calls the owning authority's validator, which re-reads the current Ultra config revision before consuming the permit. A mismatch rejects the complete wave. In-session settings updates also revoke every unused permit from the old revision. Already admitted runs retain the policy under which they started; every subsequent launch uses the new setting.
-7. The authority and its inherited proof propagate to nested/async execution and recovery without exposing the permit to the model.
+2. Proven read-only/control actions remain available. `steer` is safe only with recovery disabled; anything that starts, revives, enables, or schedules execution requires authorization or is denied.
+3. Permits are opaque, one-use, session-bound, short-lived, and tied to a config revision plus the exact preflighted child manifest and launch-contract digests.
+4. All active authority registrations intersect. Ordinary callers cannot satisfy Ultra's registration with a permit from another authority. The trusted-parent-process threat model in §17 excludes hostile same-realm extensions that deliberately mutate process internals.
+5. Before any run ID, storage, capacity reservation, mission, worktree, or process is created, pi-subagents parses the exact static `runs.all` workflow, repeats launch preflight against current agent/model/tool configuration, and compares cardinality, ordered keys, agents, candidate lists, and launch-contract digests with every authority manifest. Arbitrary/dynamic scripts and conflicting manifests fail closed.
+6. Admission is a bounded linearizable transaction: it reserves exact tokens, validates the current config revision with a deadline, then rechecks registry generation, registration ownership, revocation, disposal, expiry, and exact runtime manifest before commit. Any mismatch consumes the permit and rejects the complete wave.
+7. Ultra denies scheduled creation/firing, resume/revival, recovery-capable steer, and nested subagent spawning while enabled. Authorized strict children receive no `subagent` tool and no ambient extensions. Raw permits are never persisted or inherited.
 
 With compatible launch authority, Ultra also registers a capability ceiling allowing only `ultra-scout`, `ultra-worker`, and `ultra-reviewer`, and a Pi `tool_call` handler blocks direct spawn-shaped `subagent` calls with a clear instruction to use `ultra_delegate`. The tool hook is defense-in-depth and diagnostics; the pi-subagents authority is the source-independent enforcement boundary.
 
@@ -178,6 +178,8 @@ The tool:
 
 A main model that decides no qualified wave exists simply does not call the tool and continues normally. Ultra can structurally reject duplicate padding and overlapping writer ownership, but no API can prove that two deceptive prose descriptions are semantically independent. The manager policy requires genuine independence, and the final main-model audit remains responsible for detecting semantic padding; the implementation must not claim stronger automatic proof.
 
+`ownedPaths` are normalized relative repository roots, not a filesystem sandbox. Ultra compares each worker handoff's changed-path evidence with its declared ownership and marks out-of-scope changes as an authority mismatch requiring main-model rejection. Managed worktrees prevent direct shared-checkout mutation; they do not make path instructions cryptographically enforceable inside the worker process.
+
 ## 6. Role and model routing
 
 ### 6.1 Package-owned strict agents
@@ -232,7 +234,9 @@ A repair call must set `repairOf` to a completed operation.
 
 - The first repair is accepted with `repairCount: 1`.
 - A second repair for the same operation is rejected with a model-visible instruction that the main model must take over.
-- A repair may contain only focused lanes tied to failed or inadequate prior work.
+- Every operation stores a `rootOperationId`. `repairOf` may identify the initial operation or its one repair, but all ancestry resolves to one root repair slot.
+- `ultra_delegate` executes sequentially and reserves that root slot durably when the repair wave is admitted; reload and sibling references cannot create a second repair.
+- A repair may contain only focused lanes tied to failed or inadequate prior work; semantic focus remains manager-audited.
 - A repair is still a new wave and must satisfy the current hard `minLanes`/`maxLanes` bounds. If there are not enough genuine independent repair lanes, Ultra rejects the repair wave and instructs the main model to take over rather than pad it.
 
 Preflight/admission failure does not consume the single quality-repair allowance because no worker attempt ran. Repeated capability failure still tells the main model to proceed directly rather than loop.
@@ -254,6 +258,8 @@ Every RPC waiter accepts an abort signal. Session shutdown/reload:
 
 ## 10. Durable completion and manager delivery
 
+Pi 0.84 has no transactional or idempotent custom-message delivery API. Ultra therefore provides a durable **at-least-once** audit outbox keyed by `operationId`, with in-session deduplication and explicit duplicate-safe message content. It does not claim crash-proof exactly-once delivery.
+
 ### 10.1 Persistence and race closure
 
 Operation records are appended as bounded Pi custom session entries and restored from the active branch at `session_start`.
@@ -273,9 +279,9 @@ Paused and other nonterminal events update state but never delete correlation or
 
 Terminal data is parsed into bounded per-lane evidence. Actual runtime agent/model/status values are compared with preflight expectations. Mismatches are highlighted; expected values are never mislabeled as actual resolved values.
 
-### 10.4 One model-visible follow-up
+### 10.4 Durable model-visible follow-up
 
-When the single workflow reaches terminal state, Ultra sends one `ultra-wave` custom message whose **content**, not only `details`, includes:
+When the single workflow reaches terminal state, Ultra persists an outbox-ready snapshot, sends an `ultra-wave` custom message, then persists delivery evidence. Normal execution emits once; reload retries an undelivered/uncertain outbox item at least once. The message's **content**, not only `details`, includes a stable operation ID and:
 
 - operation and run IDs;
 - lane IDs and terminal statuses;
@@ -307,6 +313,8 @@ Under one lock it:
 6. returns the committed settings.
 
 Commands and menu actions update fresh locked state. Toggle is computed inside the lock. Concurrent independent changes compose instead of overwriting one another.
+
+Every live session installs a pessimistic guard at `session_start` before asynchronous loading, then watches the global settings file and parent directory. A bounded polling fallback re-reads the revision when native watch is unavailable or replaced by atomic rename. Off→on, on→off, malformed replacement, and recovery transitions update or dispose that session's authority/ceiling in fail-closed order. Watcher failure leaves the empty-agent ceiling active and reports `Ultra: blocked`.
 
 ### 11.2 Invalid configuration
 
@@ -450,7 +458,7 @@ Cover:
 - duplicate terminal event dedupe;
 - actual-versus-expected binding mismatch;
 - shutdown abort/listener cleanup;
-- one model-visible aggregated follow-up.
+- one normal-path model-visible aggregated follow-up, with duplicate-safe at-least-once retry after uncertain delivery.
 
 ### 15.4 Configuration
 
@@ -498,7 +506,7 @@ The redesign is complete only when:
 5. Hard per-wave lane bounds and the latest model policy are verified before any child starts; the main session never counts as a lane.
 6. Role authority is enforced by strict tool contracts and worker isolation.
 7. A wave has one atomic workflow receipt/completion boundary.
-8. Completion survives event races and reload, verifies actual bindings, and triggers one model-visible audit follow-up.
+8. Completion survives event races and reload, verifies actual bindings, and drives a durable duplicate-safe at-least-once audit follow-up.
 9. Invalid config cannot enable execution or be silently overwritten.
 10. Concurrent settings changes do not lose updates.
 11. Focused, full, launch-ingress integration, and packed-runtime smoke tests pass.
@@ -513,5 +521,5 @@ The redesign is complete only when:
 - RPC-side fuzzy model search.
 - Treating worker completion as acceptance.
 - Supporting a second worker repair for one operation.
-- Claiming an operating-system sandbox against malicious code already running in the trusted parent process.
+- Claiming an operating-system or same-realm sandbox against malicious code already running in the trusted parent process.
 - Claiming semantic independence can be proven from arbitrary prose; Ultra enforces structural uniqueness/ownership and keeps semantic judgment with the main manager.
