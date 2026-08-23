@@ -147,6 +147,14 @@ test('disabled explicit tasks reject exactly and off disposes policy', async () 
   assert.equal((h.registrations[0] as any).disposed, true);
 });
 
+test('ultra_delegate closes an RPC startup race by synchronizing before session_start completes', async () => {
+  const h = harness();
+  const result = await h.pi.tool('ultra_delegate', delegateInput()) as any;
+  assert.equal(result.isError, undefined);
+  assert.deepEqual(h.policyInstalls, ['blocked', 'enabled']);
+  assert.equal(h.launches.length, 1);
+});
+
 test('ultra_delegate prepares one wave, records receipt evidence, and never claims acceptance', async () => {
   const h = harness();
   await h.start();

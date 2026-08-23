@@ -416,6 +416,10 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
         const signal = toolSignal ? AbortSignal.any([toolSignal, reconciliationAbort.signal]) : reconciliationAbort.signal;
         let repairReservationId: string | undefined;
         try {
+          // RPC/model work can race session_start. Re-run the fail-closed policy
+          // synchronization here so no delegation observes uninitialized state.
+          await synchronize(ctx);
+          if (stale()) throw new Error('Ultra extension reloaded before delegation initialized.');
           const loaded = await dependencies.loadSettings();
           if (stale()) throw new Error('Ultra extension reloaded before delegation completed.');
           current = loaded;
