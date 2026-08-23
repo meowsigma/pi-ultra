@@ -228,6 +228,10 @@ function operationLanes(prepared: UltraPreparedWave): UltraOperationLane[] {
   }));
 }
 
+function sessionIdentity(ctx: ExtensionContext): string {
+  return ctx.sessionManager.getSessionFile() ?? ctx.sessionManager.getSessionId();
+}
+
 function managerPolicy(settings: UltraSettings): string {
   const model = settings.routingMode === 'uniform' ? settings.workerModel ?? 'one automatically resolved model' : 'strict role-default candidate chains';
   return [
@@ -286,7 +290,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
       const run = async () => {
         if (disposed) return;
         lastContext = ctx;
-        const guard = await dependencies.installPolicy({ sessionId: ctx.sessionManager.getSessionId(), mode: 'blocked', validateRevision });
+        const guard = await dependencies.installPolicy({ sessionId: sessionIdentity(ctx), mode: 'blocked', validateRevision });
         let next: UltraPolicyRegistration | undefined;
         try {
           if (watcherFailed) {
@@ -320,7 +324,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             notify(ctx, 'Ultra is blocked: installed pi-subagents lacks launch-authority v1. Install the pinned compatible fork and /reload.', 'error');
             return;
           }
-          next = await dependencies.installPolicy({ sessionId: ctx.sessionManager.getSessionId(), mode: 'enabled', validateRevision });
+          next = await dependencies.installPolicy({ sessionId: sessionIdentity(ctx), mode: 'enabled', validateRevision });
           policy?.dispose();
           policy = next;
           guard.dispose();
@@ -403,7 +407,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             input,
             settings: loaded.settings,
             cwd: ctx.cwd,
-            sessionId: ctx.sessionManager.getSessionId(),
+            sessionId: sessionIdentity(ctx),
             revision: loaded.revision,
             availableModels: ctx.modelRegistry.getAvailable().map((model) => ({ provider: model.provider, id: model.id, fullId: `${model.provider}/${model.id}`, reasoning: model.reasoning })),
             parentModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,

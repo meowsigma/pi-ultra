@@ -1,7 +1,7 @@
 {
   "name": "pi-ultra",
-  "version": "0.1.0",
-  "description": "Configurable parallel worker waves for Pi: /ultra launches bounded implementation lanes, binds models via named agents, and keeps the manager as auditor.",
+  "version": "0.2.0",
+  "description": "Session-wide, permit-governed Pi worker waves with the active model as manager and final reviewer.",
   "keywords": [
     "pi-package",
     "pi",
@@ -20,7 +20,8 @@
     "test": "node --import tsx --test tests/*.test.ts",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test",
-    "pack:check": "npm pack --dry-run"
+    "pack:check": "npm pack --dry-run",
+    "smoke:packed": "node tests/packed-runtime-smoke.mjs"
   },
   "pi": {
     "extensions": [
@@ -54,6 +55,7 @@
     "typescript": "^5.9.0"
   },
   "bundledDependencies": [
+    "@narumitw/pi-tui-kit",
     "pi-subagents"
   ]
 }

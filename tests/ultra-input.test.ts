@@ -48,6 +48,7 @@ function harness(options: {
 } = {}) {
   let loaded: LoadUltraSettingsResult = options.loaded ?? { kind: 'loaded', settings: { ...ENABLED }, revision: 'revision-1', path: '/tmp/pi-ultra.json' };
   const policyInstalls: Array<'blocked' | 'enabled'> = [];
+  const policySessions: string[] = [];
   const registrations: UltraPolicyRegistration[] = [];
   const preparedInputs: any[] = [];
   const launches: any[] = [];
@@ -69,8 +70,9 @@ function harness(options: {
     backupAndReset: async () => { throw new Error('not used'); },
     showMenu: async () => { menuCalls += 1; return { kind: 'closed', reason: 'close' } as any; },
     checkCapabilities: async () => options.capabilities ?? true,
-    installPolicy: async ({ mode }) => {
+    installPolicy: async ({ mode, sessionId }) => {
       policyInstalls.push(mode);
+      policySessions.push(sessionId);
       const registration: UltraPolicyRegistration = {
         mode,
         operational: mode === 'enabled',
@@ -92,7 +94,7 @@ function harness(options: {
   createUltraExtension(deps)(pi as any);
 
   return {
-    pi, deps, policyInstalls, registrations, preparedInputs, launches,
+    pi, deps, policyInstalls, policySessions, registrations, preparedInputs, launches,
     setLoaded(value: LoadUltraSettingsResult) { loaded = value; },
     async start() { await pi.emit('session_start', { type: 'session_start' }); },
     async change() { await watcher?.(); await new Promise((resolve) => setImmediate(resolve)); },
@@ -113,6 +115,7 @@ test('registers one command/tool, removes passive input interception, and append
   assert.match(turn.systemPrompt ?? '', /one focused repair/i);
   assert.doesNotMatch(turn.systemPrompt ?? '', /ultra-planner/i);
   assert.deepEqual(h.policyInstalls, ['blocked', 'enabled']);
+  assert.deepEqual(h.policySessions, ['/tmp/fake-session.jsonl', '/tmp/fake-session.jsonl']);
 });
 
 test('keeps the exact command contract and sends explicit tasks to the active main model', async () => {

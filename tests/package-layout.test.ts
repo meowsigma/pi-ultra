@@ -17,6 +17,9 @@ const requiredPackedFiles = [
   'package/agents/ultra-scout.md',
   'package/agents/ultra-worker.md',
   'package/agents/ultra-reviewer.md',
+  'package/node_modules/pi-subagents/src/api/launch-authority.ts',
+  'package/node_modules/pi-subagents/src/extension/rpc.ts',
+  'package/node_modules/@narumitw/pi-tui-kit/dist/types.d.ts',
 ];
 
 test('package exposes exactly one Pi extension and the Ultra subagent layout', () => {
