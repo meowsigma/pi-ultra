@@ -88,6 +88,14 @@ const execFile = promisify(execFileCallback);
 const MANAGER_SCOPE_SCHEMA = Type.Object({
   scopeId: Type.String({ minLength: 1, maxLength: 128 }),
 }, { additionalProperties: false });
+const MANAGER_REVIEW_FINDINGS_SCHEMA = Type.Object({
+  operationId: Type.String({ minLength: 1, maxLength: 128 }),
+  findings: Type.String({ minLength: 1, maxLength: 2048 }),
+}, { additionalProperties: false });
+const MANAGER_DISPOSITION_SCHEMA = Type.Object({
+  operationId: Type.String({ minLength: 1, maxLength: 128 }),
+  disposition: Type.Union([Type.Literal('verified'), Type.Literal('repair-queued'), Type.Literal('taken-over')]),
+}, { additionalProperties: false });
 const MANAGER_REVIEW_CANDIDATE_SCHEMA = Type.Object({
   operationId: Type.String({ minLength: 1, maxLength: 128 }),
   lanes: Type.Array(Type.Object({
@@ -705,6 +713,43 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
     });
 
     pi.registerTool({
+      name: 'ultra_record_review_findings',
+      label: 'Ultra Record Reviewer Findings',
+      description: 'Persist findings from the reviewer bound to a materialized candidate.',
+      promptSnippet: 'Record the independent reviewer findings before deciding verification, repair, or takeover.',
+      executionMode: 'sequential', parameters: MANAGER_REVIEW_FINDINGS_SCHEMA,
+      async execute(_id, params) {
+        const operationId = isRecord(params) && typeof params.operationId === 'string' ? params.operationId : undefined;
+        const findings = isRecord(params) && typeof params.findings === 'string' ? params.findings : undefined;
+        if (!operationId || !findings) return toolError('Reviewer findings require an operation ID and non-empty findings.');
+        try {
+          const operation = operations.recordReviewerFindings(operationId, findings);
+          return { content: [{ type: 'text' as const, text: `Reviewer findings recorded for ${operationId}; Manager disposition is now required.` }], details: { kind: 'review-findings', operationId, updatedAt: operation.updatedAt } };
+        } catch (error) { return toolError(boundedMessage(error)); }
+      },
+    });
+
+    pi.registerTool({
+      name: 'ultra_dispose_handoff',
+      label: 'Ultra Dispose Handoff Review',
+      description: 'Record a Manager verification, one repair queue, or accountable takeover after reviewer findings.',
+      promptSnippet: 'Make the explicit post-review Manager disposition; only this terminal decision can close the scope.',
+      executionMode: 'sequential', parameters: MANAGER_DISPOSITION_SCHEMA,
+      async execute(_id, params, _signal, _update, ctx) {
+        const operationId = isRecord(params) && typeof params.operationId === 'string' ? params.operationId : undefined;
+        const disposition = isRecord(params) && (params.disposition === 'verified' || params.disposition === 'repair-queued' || params.disposition === 'taken-over') ? params.disposition : undefined;
+        const scopeId = currentManagerScopeId;
+        const binding = scopeId ? managerBinding(ctx, scopeId) : undefined;
+        if (!operationId || !disposition || !binding || !managerState.hasActiveScope(binding)) return toolError('Handoff disposition requires an active Manager scope, operation ID, and valid disposition.');
+        try {
+          const operation = operations.recordManagerDisposition(operationId, disposition);
+          if (disposition !== 'repair-queued') managerState.closeScope({ ...binding, createdAt: Date.now() });
+          return { content: [{ type: 'text' as const, text: `Handoff ${operationId} disposition recorded as ${disposition}.${disposition === 'repair-queued' ? ' Launch one bound repair next.' : ' Manager scope closed.'}` }], details: { kind: 'handoff-disposition', operationId, disposition, updatedAt: operation.updatedAt } };
+        } catch (error) { return toolError(boundedMessage(error)); }
+      },
+    });
+
+    pi.registerTool({
       name: 'ultra_review_candidate',
       label: 'Ultra Review Handoff Candidate',
       description: 'Launch a separately preflighted read-only reviewer wave against a materialized candidate.',
@@ -1071,7 +1116,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
         return { block: true, reason: 'Ultra governs new subagent launches. Use ultra_delegate for one exact authorized wave, or let the main model take over directly.' };
       }
       if (!effective?.enabled || effective.orchestrationMode !== 'manager' || !policy?.operational) return;
-      if (event.toolName === 'ultra_begin_scope' || event.toolName === 'ultra_takeover' || event.toolName === 'ultra_delegate' || event.toolName === 'ultra_materialize_handoff' || event.toolName === 'ultra_review_candidate' || MANAGER_READ_ONLY_TOOLS.has(event.toolName)) return;
+      if (event.toolName === 'ultra_begin_scope' || event.toolName === 'ultra_takeover' || event.toolName === 'ultra_delegate' || event.toolName === 'ultra_materialize_handoff' || event.toolName === 'ultra_review_candidate' || event.toolName === 'ultra_record_review_findings' || event.toolName === 'ultra_dispose_handoff' || MANAGER_READ_ONLY_TOOLS.has(event.toolName)) return;
       // There is no sound heuristic for shell/custom-tool mutability. Unknown
       // tools are therefore denied until a durable takeover matches this turn.
       const scopeId = currentManagerScopeId;
