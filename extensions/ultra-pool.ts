@@ -117,7 +117,8 @@ export function createUltraPool(input: { append(data: UltraPoolEntry): void; now
       if (permit.jobId !== inputPermit.jobId || permit.leaseId !== inputPermit.leaseId || permit.targetRunId !== inputPermit.targetRunId || permit.requestDigest !== inputPermit.requestDigest || JSON.stringify(permit.worker) !== JSON.stringify(inputPermit.worker)) throw new Error('Resume permit does not match the exact durable lease intent.');
       permit.state = 'consumed'; permit.updatedAt = now(); return persistResumePermit(permit);
     },
-    get(id: string) { const job = jobs.get(id); return job ? clone(job) : undefined; }, 
+    getResumePermit(id: string) { const permit = resumePermits.get(id); return permit ? clone(permit) : undefined; },
+    get(id: string) { const job = jobs.get(id); return job ? clone(job) : undefined; },  
     dashboard() { const values = [...jobs.values()]; return { queued: values.filter((job) => job.state === 'queued').length, active: values.filter((job) => job.state === 'leased').length, cancelled: values.filter((job) => job.state === 'cancelled').length, repairsQueued: values.filter((job) => job.state === 'queued' && job.repairOf).length }; },
   };
   return api;
