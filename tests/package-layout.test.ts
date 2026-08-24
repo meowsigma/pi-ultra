@@ -15,6 +15,7 @@ const requiredPackedFiles = [
   'package/extensions/ultra.ts',
   'package/extensions/ultra-protocol.ts',
   'package/extensions/ultra-session-settings.ts',
+  'package/extensions/ultra-resume.ts',
   'package/agents/ultra-scout.md',
   'package/agents/ultra-worker.md',
   'package/agents/ultra-reviewer.md',
@@ -31,7 +32,7 @@ test('package exposes exactly one Pi extension and the Ultra subagent layout', (
   assert.deepEqual(packageJson.pi.subagents.agents, ['./agents']);
   assert.equal(packageJson.pi.prompts, undefined);
   assert.equal(packageJson.keywords.includes('prompt-template'), false);
-  assert.equal(packageJson.dependencies['pi-subagents'], 'https://github.com/meowsigma/pi-subagents/archive/089ae7e2aa2a6acb4e8e17dce79bda9b721b4167.tar.gz');
+  assert.equal(packageJson.dependencies['pi-subagents'], 'https://github.com/meowsigma/pi-subagents/archive/49e9809d.tar.gz');
   assert.equal(packageJson.peerDependencies['pi-subagents'], '0.55.1-ultra.5');
   assert.deepEqual(packageJson.bundledDependencies.sort(), ['@narumitw/pi-tui-kit', 'pi-subagents']);
   for (const required of ['extensions', 'agents', 'README.md', 'LICENSE']) {

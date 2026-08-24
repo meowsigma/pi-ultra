@@ -8,7 +8,8 @@ import {
   type UltraPolicyRegistration,
 } from '../extensions/ultra.js';
 import type { UltraDelegateInput, UltraPreparedWave } from '../extensions/ultra-protocol.js';
-import { validateUltraDelegateInput } from '../extensions/ultra-protocol.js';
+import { validateUltraDelegateInput, SUBAGENT_RPC_REQUEST, subagentRpcReply } from '../extensions/ultra-protocol.js';
+import { ULTRA_POOL_ENTRY } from '../extensions/ultra-pool.js';
 import { buildSettingsScreen } from '../extensions/ultra-menu.js';
 import { appendSessionUltraOverrides, CommittedSessionUpdateError } from '../extensions/ultra-session-settings.js';
 import { FakePi, type FakePiOptions } from './fixtures/fake-pi.js';
@@ -70,7 +71,8 @@ function harness(options: {
   let watcherError: ((error: Error) => void) | undefined;
   let menuCalls = 0;
   let uuid = 0;
-  const authority = { issueOnce: () => 'permit', revokeUnused() {}, dispose() {} };
+  const authorityIssueInputs: unknown[] = [];
+  const authority = { issueOnce: (input: unknown) => { authorityIssueInputs.push(input); return 'permit'; }, revokeUnused() {}, dispose() {} }; 
   const deps: UltraExtensionDependencies = {
     loadSettings: async () => state.current,
     updateSettings: async (patch) => {
@@ -114,7 +116,7 @@ function harness(options: {
   createUltraExtension(deps)(pi as any);
 
   return {
-    pi, deps, policyInstalls, policySessions, registrations, preparedInputs, launches, revisionValidators,
+    pi, deps, policyInstalls, policySessions, registrations, preparedInputs, launches, revisionValidators, authorityIssueInputs,
     setLoaded(value: LoadUltraSettingsResult) { state.current = value; },
     async start() { await pi.emit('session_start', { type: 'session_start' }); },
     async change() { await watcher?.(); await new Promise((resolve) => setImmediate(resolve)); },
@@ -137,6 +139,33 @@ test('registers one command/tool, removes passive input interception, and append
   assert.doesNotMatch(turn.systemPrompt ?? '', /ultra-planner/i);
   assert.deepEqual(h.policyInstalls, ['blocked', 'enabled']);
   assert.deepEqual(h.policySessions, ['/tmp/fake-session.jsonl', '/tmp/fake-session.jsonl']);
+});
+
+test('controlled resume consumes one exact active-lease permit and emits only authorized rpc.resume', async () => {
+  const message = 'Continue focused repair.';
+  const authorityModule = 'pi-subagents/launch-authority';
+  const { digestSubagentLaunchRequest } = await import(authorityModule) as { digestSubagentLaunchRequest(value: Record<string, unknown>, domain?: string): string };
+  const digest = digestSubagentLaunchRequest({ id: 'retained-run', message }, 'rpc.resume');
+  const worker = { key: 'repair-worker', agent: 'ultra-worker', modelCandidates: ['openai/test-model'], launchContractDigest: 'b'.repeat(64), workspaceBase: 'c'.repeat(40), promptDigest: 'd'.repeat(64) };
+  const session = { branch: [
+    { type: 'custom', customType: ULTRA_POOL_ENTRY, data: { version: 1, kind: 'job', id: 'job', jobKind: 'read-only', state: 'leased', objective: 'repair', ownedPaths: [], createdAt: 1, updatedAt: 1 } },
+    { type: 'custom', customType: ULTRA_POOL_ENTRY, data: { version: 1, kind: 'lease', leaseId: 'lease', jobId: 'job', expiresAt: Date.now() + 60_000, state: 'active', createdAt: 1, updatedAt: 1 } },
+    { type: 'custom', customType: ULTRA_POOL_ENTRY, data: { version: 1, kind: 'resume-permit', id: 'resume', jobId: 'job', leaseId: 'lease', targetRunId: 'retained-run', requestDigest: digest, worker, expiresAt: Date.now() + 60_000, state: 'issued', createdAt: 1, updatedAt: 1 } },
+  ] } satisfies FakePiOptions;
+  const h = harness({ session });
+  h.pi.events.on(SUBAGENT_RPC_REQUEST, (request: any) => h.pi.events.emit(subagentRpcReply(request.requestId), { requestId: request.requestId, success: true, data: { resumed: true } }));
+  await h.start();
+  const result: any = await h.pi.tool('ultra_resume_worker', { permitId: 'resume', message });
+  assert.match(resultText(result), /retained-run/);
+  const rpc: any = h.pi.events.lastEmission(SUBAGENT_RPC_REQUEST)?.data;
+  assert.deepEqual(rpc.params, { id: 'retained-run', message });
+  assert.deepEqual(rpc.authorization, { launchPermits: ['permit'] });
+  assert.equal(h.authorityIssueInputs.length, 1);
+  assert.deepEqual(h.authorityIssueInputs[0], { configRevision: (h.authorityIssueInputs[0] as any).configRevision, expiresInMs: 5_000, requestDigest: digest, minLanes: 1, maxLanes: 1, lanes: [{ key: worker.key, agent: worker.agent, modelCandidates: worker.modelCandidates, launchContractDigest: worker.launchContractDigest }] });
+  assert.match((h.authorityIssueInputs[0] as any).configRevision, /^[a-f0-9]{64}$/);
+  const replay: any = await h.pi.tool('ultra_resume_worker', { permitId: 'resume', message });
+  assert.match(resultText(replay), /failed closed/i);
+  assert.equal(h.authorityIssueInputs.length, 1);
 });
 
 test('keeps the exact command contract and sends explicit tasks to the active main model', async () => {
