@@ -32,6 +32,7 @@ The global JSON file is the **baseline** configuration that every Pi session sta
   "version": 1,
   "enabled": true,
   "routingMode": "uniform",
+  "orchestrationMode": "collaborator",
   "workerModel": "openai-codex/gpt-5.6-sol",
   "minLanes": 4,
   "maxLanes": 100
@@ -53,6 +54,19 @@ Ordinary edits are **session-scoped**: opening `/ultra` and using `/ultra on`, `
 - Independent sessions can differ in enabled state, routing mode, worker model, and lane range.
 - An invalid global config blocks all sessions, even overridden ones: effective settings always resolve against a valid global baseline.
 - If a session change commits but post-commit verification fails, Ultra stays fail-closed and surfaces a warning instead of claiming the settings applied.
+
+### Manager mode
+
+`orchestrationMode` defaults to `collaborator`, which preserves the normal governed-wave workflow. In `manager` mode, Ultra fail-closes unknown or mutating parent tools until the manager opens a scope and records an eligible durable takeover. Direct `subagent` spawning remains blocked in both enabled modes.
+
+Writer work requires a clean, existing Git repository and is denied before permit issuance when that cannot be verified; Ultra never initializes Git, stashes, stages, commits, or modifies the source checkout. The Manager-mode lifecycle is explicit:
+
+1. `ultra_begin_scope` then `ultra_delegate` for an exact writer wave;
+2. `ultra_materialize_handoff` validates the worker manifest and applies patches only in a fresh candidate clone;
+3. `ultra_review_candidate` launches a separate read-only reviewer wave against that candidate;
+4. `ultra_record_review_findings` then `ultra_dispose_handoff` records `verified`, one `repair-queued`, or `taken-over`.
+
+Worker output, patches, and reviewer reports are evidence only; none is accepted automatically.
 
 ### Pi Goal-X coexistence
 
