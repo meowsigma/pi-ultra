@@ -6,7 +6,7 @@ import { basename, dirname, join } from 'node:path';
 
 export const ULTRA_CONFIG_VERSION = 1 as const;
 export const ULTRA_MIN_LANES = 1 as const;
-export const ULTRA_MAX_LANES = 8 as const;
+export const ULTRA_MAX_LANES = 100 as const;
 export const ULTRA_ROLE_NAMES = ['scout', 'worker', 'reviewer'] as const;
 export const ULTRA_SETTINGS_FILE = 'pi-ultra.json';
 

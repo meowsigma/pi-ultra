@@ -86,7 +86,7 @@ function invalid(field: string, detail: string): never {
  * Validate a raw session patch. Throws with a bounded message on any of:
  * non-object data, unknown fields, invalid types, bad routing mode, invalid
  * model strings, and one-sided minLanes/maxLanes overrides. Paired bounds must
- * be safe integers within 1..8 and ordered. Returns a fresh plain object.
+ * be safe integers within the shared inclusive configured limit and ordered. Returns a fresh plain object.
  */
 export function validateUltraSessionOverrides(value: unknown): UltraSessionOverrides {
   if (!isRecord(value)) throw new Error('Session Ultra overrides must be an object.');
@@ -124,7 +124,7 @@ export function validateUltraSessionOverrides(value: unknown): UltraSessionOverr
     for (const field of ['minLanes', 'maxLanes'] as const) {
       const lane = value[field];
       if (typeof lane !== 'number' || !Number.isSafeInteger(lane) || lane < ULTRA_MIN_LANES || lane > ULTRA_MAX_LANES) {
-        invalid(field, 'must be an integer between 1 and 8.');
+        invalid(field, `must be an integer between ${ULTRA_MIN_LANES} and ${ULTRA_MAX_LANES}.`);
       }
     }
     if ((value.minLanes as number) > (value.maxLanes as number)) {

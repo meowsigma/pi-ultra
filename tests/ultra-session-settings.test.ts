@@ -92,15 +92,15 @@ test('validate rejects unknown fields, bad types, bad routing, invalid models, n
   assert.throws(() => validateUltraSessionOverrides({ workerModel: 'bare-model' }), /workerModel/i);
   assert.throws(() => validateUltraSessionOverrides({ workerModel: 'openai/model with space' }), /workerModel/i);
   assert.throws(() => validateUltraSessionOverrides({ minLanes: 0, maxLanes: 4 }), /minLanes/i);
-  assert.throws(() => validateUltraSessionOverrides({ minLanes: 2, maxLanes: 9 }), /maxLanes/i);
+  assert.throws(() => validateUltraSessionOverrides({ minLanes: 2, maxLanes: 101 }), /maxLanes/i);
   assert.throws(() => validateUltraSessionOverrides({ minLanes: 5, maxLanes: 3 }), /maxLanes|minLanes/i);
 });
 
 test('incomplete lane ranges are rejected one-sided', () => {
   assert.throws(() => validateUltraSessionOverrides({ minLanes: 5 }), /both|minLanes|maxLanes/i);
   assert.throws(() => validateUltraSessionOverrides({ maxLanes: 3 }), /both|minLanes|maxLanes/i);
-  // Paired bounds stay inside 1..8 and ordered
-  assert.doesNotThrow(() => validateUltraSessionOverrides({ minLanes: 1, maxLanes: 8 }));
+  // Paired bounds stay inside 1..100 and ordered
+  assert.doesNotThrow(() => validateUltraSessionOverrides({ minLanes: 1, maxLanes: 100 }));
   assert.doesNotThrow(() => validateUltraSessionOverrides({ minLanes: 4, maxLanes: 4 }));
 });
 

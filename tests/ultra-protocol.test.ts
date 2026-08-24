@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { parseStaticRunsAllWorkflow } from '../node_modules/pi-subagents/src/workflows/static-workflow-manifest.js';
 import {
   ROLE_AGENTS,
   buildUltraWorkflow,
@@ -36,7 +37,7 @@ function input(lanes: UltraDelegateInput['lanes'] = [
   };
 }
 
-function prepared(role: keyof typeof ROLE_AGENTS, id = role): UltraPreparedLane {
+function prepared(role: keyof typeof ROLE_AGENTS, id: string = role): UltraPreparedLane {
   return {
     lane: {
       id,
@@ -98,6 +99,24 @@ test('builds one strict static runs.all workflow preserving roles and worker-onl
   assert.ok(items[0].task.includes('READ-ONLY'));
   assert.ok(items[1].task.includes('Owned paths: src/worker'));
   assert.equal(items.every((item: any) => item.context === 'fresh' && item.output === undefined), true, 'runtime-generated output paths must not destabilize launch digests');
+});
+
+test('accepts an exact 100-lane custom wave without truncation or batching', () => {
+  const lanes = Array.from({ length: 100 }, (_, index) => prepared(index % 2 === 0 ? 'scout' : 'worker', `lane-${index}`));
+  const delegateLanes = lanes.map(({ lane }, index) => ({ ...lane, task: `Task ${index}.`, deliverable: `Deliverable ${index}.` }));
+  const validated = validateUltraDelegateInput(input(delegateLanes), { minLanes: 1, maxLanes: 100 });
+  assert.equal(validated.lanes.length, 100);
+  assert.throws(
+    () => validateUltraDelegateInput(input([...delegateLanes, { ...prepared('scout', 'lane-100').lane, task: 'Task 100.', deliverable: 'Deliverable 100.' }]), { minLanes: 1, maxLanes: 100 }),
+    /between 1 and 100/i,
+  );
+
+  const script = buildUltraWorkflow(lanes);
+  const items = JSON.parse(script.slice('return await runs.all('.length, -2));
+  assert.equal(items.length, 100);
+  assert.deepEqual(items.map((item: any) => item.key), lanes.map((entry) => entry.lane.id));
+  assert.equal(items.filter((item: any) => item.worktree === true).length, 50);
+  assert.deepEqual(parseStaticRunsAllWorkflow(script).map((call) => call.key), lanes.map((entry) => entry.lane.id));
 });
 
 test('preflights fixed uniform, automatic, and role-default model contracts exactly', async () => {

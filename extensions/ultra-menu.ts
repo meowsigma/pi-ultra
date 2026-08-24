@@ -11,7 +11,7 @@ import type {
   SettingsScreen,
 } from '@narumitw/pi-tui-kit';
 import type { ExtensionCommandContext } from '@earendil-works/pi-coding-agent';
-import { UltraSettingsCleanupError } from './ultra-config.js';
+import { ULTRA_MAX_LANES, UltraSettingsCleanupError } from './ultra-config.js';
 import type {
   InvalidUltraSettingsResult,
   LoadUltraSettingsResult,
@@ -259,7 +259,7 @@ export function buildLaneRangeScreen(settings: UltraSettings, scope: UltraMenuSc
     lines: ['Hard inclusive bounds for each admitted wave.'],
     items: [
       ...PRESETS.map((item) => ({ id: item.id, label: item.label })),
-      { id: 'custom', label: 'Custom…', description: 'Enter MIN-MAX within 1–8' },
+      { id: 'custom', label: 'Custom…', description: `Enter MIN-MAX within 1–${ULTRA_MAX_LANES}` },
     ],
     action: scopedAction(scope, 'set-lane-range'),
     currentItemId: preset?.id ?? 'custom',
@@ -275,7 +275,7 @@ export function parseCustomLaneRange(value: string): { minLanes: number; maxLane
   if (!match) return undefined;
   const minLanes = Number(match[1]);
   const maxLanes = Number(match[2]);
-  if (!Number.isSafeInteger(minLanes) || !Number.isSafeInteger(maxLanes) || minLanes < 1 || maxLanes > 8 || minLanes > maxLanes) return undefined;
+  if (!Number.isSafeInteger(minLanes) || !Number.isSafeInteger(maxLanes) || minLanes < 1 || maxLanes > ULTRA_MAX_LANES || minLanes > maxLanes) return undefined;
   return { minLanes, maxLanes };
 }
 
@@ -293,12 +293,12 @@ function customLaneRangeLoop(applyPair: LaneRangeApply, ui: ShowUltraMenuOptions
   return (async () => {
     let previousDraft: string | undefined;
     while (true) {
-      const draft = await ui.input(previousDraft ? 'Correct custom lane range' : 'Custom lane range', previousDraft ?? 'MIN-MAX (1–8)');
+      const draft = await ui.input(previousDraft ? 'Correct custom lane range' : 'Custom lane range', previousDraft ?? `MIN-MAX (1–${ULTRA_MAX_LANES})`);
       if (draft === undefined) return { kind: 'stay' as const };
       const parsed = parseCustomLaneRange(draft);
       if (parsed) return applyPair(parsed);
       previousDraft = draft;
-      ui.notify('Enter MIN-MAX with 1 <= MIN <= MAX <= 8.', 'warning');
+      ui.notify(`Enter MIN-MAX with 1 <= MIN <= MAX <= ${ULTRA_MAX_LANES}.`, 'warning');
     }
   })();
 }

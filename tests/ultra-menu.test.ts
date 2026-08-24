@@ -195,11 +195,14 @@ test('model ChoiceScreen enables fuzzy search, bounds viewport, saves raw ids, a
   assert.match(screen.items.find((item) => item.id === 'anthropic/model-b')?.searchText ?? '', /anthropic.*model-b.*Claude B/);
 });
 
-test('lane presets and custom parser enforce inclusive 1–8 ranges', () => {
-  assert.deepEqual(buildLaneRangeScreen(SETTINGS).items.map((item) => item.label), ['Small — 1–2', 'Balanced — 2–4', 'Large — 4–8', 'Custom…']);
+test('lane presets remain 1–8 while custom parser enforces inclusive 1–100 ranges', () => {
+  const screen = buildLaneRangeScreen(SETTINGS);
+  assert.deepEqual(screen.items.map((item) => item.label), ['Small — 1–2', 'Balanced — 2–4', 'Large — 4–8', 'Custom…']);
+  assert.equal(screen.items.at(-1)?.description, 'Enter MIN-MAX within 1–100');
   assert.deepEqual(parseCustomLaneRange(' 3 – 6 '), { minLanes: 3, maxLanes: 6 });
-  assert.deepEqual(parseCustomLaneRange('1-8'), { minLanes: 1, maxLanes: 8 });
-  for (const invalid of ['0-2', '4-3', '1-9', '1.5-2', '1', 'a-b']) assert.equal(parseCustomLaneRange(invalid), undefined, invalid);
+  assert.deepEqual(parseCustomLaneRange('1-100'), { minLanes: 1, maxLanes: 100 });
+  assert.deepEqual(parseCustomLaneRange('100–100'), { minLanes: 100, maxLanes: 100 });
+  for (const invalid of ['0-2', '4-3', '1-101', '1.5-2', '1', 'a-b']) assert.equal(parseCustomLaneRange(invalid), undefined, invalid);
 });
 
 test('session routing, model, and lane-range edits call only the session updater', async () => {

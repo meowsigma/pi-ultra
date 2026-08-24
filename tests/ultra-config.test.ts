@@ -31,7 +31,7 @@ test('module exports all required symbols', async () => {
 
   assert.equal(ultra.ULTRA_CONFIG_VERSION, 1);
   assert.equal(ultra.ULTRA_MIN_LANES, 1);
-  assert.equal(ultra.ULTRA_MAX_LANES, 8);
+  assert.equal(ultra.ULTRA_MAX_LANES, 100);
   assert.deepEqual(ultra.ULTRA_ROLE_NAMES, ['scout', 'worker', 'reviewer']);
   assert.equal(ultra.ULTRA_SETTINGS_FILE, 'pi-ultra.json');
 
@@ -97,11 +97,11 @@ test('normalizeUltraSettings fills defaults for partial object', async () => {
   assert.notEqual(rd, undefined);
   assert.equal(rd.routingMode, 'role-defaults');
 
-  // Equal min/max allowed
-  const eq = normalizeUltraSettings({ minLanes: 8, maxLanes: 8 });
+  // Equal min/max allowed at the inclusive upper bound.
+  const eq = normalizeUltraSettings({ minLanes: 100, maxLanes: 100 });
   assert.notEqual(eq, undefined);
-  assert.equal(eq.minLanes, 8);
-  assert.equal(eq.maxLanes, 8);
+  assert.equal(eq.minLanes, 100);
+  assert.equal(eq.maxLanes, 100);
 });
 
 // ── NORMALIZE — INVALID (returns undefined, never throws) ─────────
@@ -133,9 +133,9 @@ test('normalizeUltraSettings returns undefined for invalid inputs', async () => 
 
   // min/max out of range
   assert.equal(normalizeUltraSettings({ minLanes: 0 }), undefined);
-  assert.equal(normalizeUltraSettings({ minLanes: 9 }), undefined);
+  assert.equal(normalizeUltraSettings({ minLanes: 101 }), undefined);
   assert.equal(normalizeUltraSettings({ maxLanes: 0 }), undefined);
-  assert.equal(normalizeUltraSettings({ maxLanes: 9 }), undefined);
+  assert.equal(normalizeUltraSettings({ maxLanes: 101 }), undefined);
 
   // non-integer lanes
   assert.equal(normalizeUltraSettings({ minLanes: 1.5 }), undefined);

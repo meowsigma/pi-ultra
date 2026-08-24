@@ -34,11 +34,11 @@ The global JSON file is the **baseline** configuration that every Pi session sta
   "routingMode": "uniform",
   "workerModel": "openai-codex/gpt-5.6-sol",
   "minLanes": 4,
-  "maxLanes": 8
+  "maxLanes": 100
 }
 ```
 
-Lane bounds are inclusive and limited to `1–8`. Changes use lock-scoped read/modify/write transactions, preserve unknown top-level fields, and are committed through exclusive temporary files plus atomic rename.
+Lane bounds are inclusive and custom ranges are limited to `1–100`. Changes use lock-scoped read/modify/write transactions, preserve unknown top-level fields, and are committed through exclusive temporary files plus atomic rename.
 
 A missing file uses validated defaults. A malformed, unreadable, or invalid file does **not** expose executable defaults: Ultra enters `Ultra: blocked`, preserves the exact bytes, and installs an empty-agent capability ceiling. The TUI recovery action asks for confirmation, writes an exact timestamped backup, then resets to disabled defaults.
 
@@ -53,6 +53,12 @@ Ordinary edits are **session-scoped**: opening `/ultra` and using `/ultra on`, `
 - Independent sessions can differ in enabled state, routing mode, worker model, and lane range.
 - An invalid global config blocks all sessions, even overridden ones: effective settings always resolve against a valid global baseline.
 - If a session change commits but post-commit verification fails, Ultra stays fail-closed and surfaces a warning instead of claiming the settings applied.
+
+### Pi Goal-X coexistence
+
+Ultra is compatible with `pi-goal-x` as a peer extension. Goal-X tracks the main-session goal, task state, auto-continuation, and independent completion auditing; Ultra supplies isolated worker-wave evidence. They do not share private APIs or worker-session extensions.
+
+Use them together by having the main-session manager launch an Ultra wave, inspect its receipts and repository evidence, then explicitly update the relevant Goal-X task or request goal completion. Worker claims never auto-complete Goal-X tasks, suppress its continuation policy, or bypass its auditor.
 
 ## Commands
 
@@ -94,9 +100,9 @@ Lane presets are:
 - **Small** — `1–2`
 - **Balanced** — `2–4`
 - **Large** — `4–8`
-- **Custom** — validated `MIN-MAX`
+- **Custom** — validated `MIN-MAX` within `1–100`
 
-Bounds are hard per admitted wave. The main session is not a lane, and Ultra never manufactures filler work to meet a minimum.
+Bounds are hard per admitted wave. The main session is not a lane, and Ultra never manufactures filler work to meet a minimum. A custom 100-lane wave starts **100 concurrent workers** in one atomic `runs.all` request; it is not a queued pool. Choose a range your provider rate limits, account budget, and local worktree capacity can sustain.
 
 ## Routing
 

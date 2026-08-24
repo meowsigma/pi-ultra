@@ -197,6 +197,26 @@ test('direct subagent spawn is blocked while enabled but proven non-spawning man
   assert.equal((recoveringSteer as any).block, true);
 });
 
+test('coexists with a Goal-X-like peer lifecycle extension without bypassing Ultra authority', async () => {
+  const h = harness();
+  const peerToolCalls: string[] = [];
+  h.pi.on('before_agent_start', (event: any) => ({ systemPrompt: `${event.systemPrompt}\n\n[PI GOAL peer policy]` }));
+  h.pi.on('tool_call', (event: any) => { peerToolCalls.push(event.toolName); });
+  await h.start();
+
+  const turn = await h.pi.inputToAgentStart('Complete the tracked task.');
+  assert.match(turn.systemPrompt ?? '', /Ultra manager/i);
+  assert.match(turn.systemPrompt ?? '', /PI GOAL peer policy/);
+
+  const [direct] = await h.pi.emit('tool_call', { toolName: 'subagent', input: { agent: 'worker', task: 'bypass' } });
+  assert.equal((direct as any).block, true);
+  assert.deepEqual(peerToolCalls, ['subagent']);
+
+  await h.pi.tool('ultra_delegate', delegateInput());
+  assert.deepEqual(peerToolCalls, ['subagent']);
+  assert.equal(h.launches.length, 1);
+});
+
 test('invalid or incompatible configuration stays blocked with an empty ceiling and fast tool failure', async () => {
   for (const h of [
     harness({ loaded: { kind: 'invalid', reason: 'bad json', path: '/tmp/pi-ultra.json' } }),
