@@ -426,6 +426,7 @@ export function createUltraOperationStore(options: {
         throw new Error(`Ultra permits one repair for root operation '${rootOperationId}'; a repair is already reserved/consumed and the main model must take over.`);
       }
       if (!['completed', 'failed', 'stopped'].includes(source.status)) throw new Error(`Repair operation '${repairOf}' is not terminal.`);
+      if (source.handoffCandidate && source.review?.state !== 'repair-queued') throw new Error(`Repair operation '${repairOf}' requires a bound reviewer finding and Manager repair disposition.`);
       return { rootOperationId, repairCount: 1 };
     },
 
