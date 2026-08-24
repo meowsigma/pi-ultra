@@ -63,8 +63,10 @@ export function createUltraPool(input: { append(data: UltraPoolEntry): void; now
       const timestamp = now();
       return persistJob({ version: 1, kind: 'job', id: inputJob.id, jobKind: inputJob.kind, state: 'queued', objective: inputJob.objective.slice(0, 4096), ownedPaths: [...new Set(inputJob.ownedPaths)].slice(0, 32), ...(inputJob.repairOf ? { repairOf: inputJob.repairOf } : {}), createdAt: timestamp, updatedAt: timestamp });
     },
-    admitNext(inputLease: { leaseId: string; expiresAt: number }) {
+    admitNext(inputLease: { leaseId: string; expiresAt: number; maxActive?: number }) {
       if (leases.has(inputLease.leaseId)) throw new Error(`Duplicate pool lease '${inputLease.leaseId}'.`);
+      if (inputLease.maxActive !== undefined && (!Number.isSafeInteger(inputLease.maxActive) || inputLease.maxActive < 1)) throw new Error('Pool maxActive must be a positive integer.');
+      if (inputLease.maxActive !== undefined && [...leases.values()].filter((lease) => lease.state === 'active').length >= inputLease.maxActive) return undefined;
       const candidates = [...jobs.values()].filter((job) => job.state === 'queued').sort((a, b) => Number(Boolean(b.repairOf)) - Number(Boolean(a.repairOf)) || a.createdAt - b.createdAt);
       const job = candidates.find((candidate) => !writerConflicts(candidate));
       if (!job) return undefined;

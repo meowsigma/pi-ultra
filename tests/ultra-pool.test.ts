@@ -12,8 +12,9 @@ test('admission is durable, FIFO within priority, and repairs outrank ordinary q
   pool.enqueue(job('ordinary-a'));
   pool.enqueue(job('ordinary-b'));
   pool.enqueue(job('repair', 'read-only', 'ordinary-a'));
-  assert.deepEqual(pool.admitNext({ leaseId: 'lease-1', expiresAt: 200 })?.job.id, 'repair');
-  assert.deepEqual(pool.admitNext({ leaseId: 'lease-2', expiresAt: 200 })?.job.id, 'ordinary-a');
+  assert.deepEqual(pool.admitNext({ leaseId: 'lease-1', expiresAt: 200, maxActive: 1 })?.job.id, 'repair');
+  assert.equal(pool.admitNext({ leaseId: 'blocked-by-capacity', expiresAt: 200, maxActive: 1 }), undefined);
+  assert.deepEqual(pool.admitNext({ leaseId: 'lease-2', expiresAt: 200, maxActive: 2 })?.job.id, 'ordinary-a');
   assert.deepEqual(entries.map((entry) => entry.data.kind), ['job', 'job', 'job', 'job', 'lease', 'job', 'lease']);
 });
 
