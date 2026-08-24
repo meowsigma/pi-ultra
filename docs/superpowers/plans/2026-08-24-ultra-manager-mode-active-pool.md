@@ -103,6 +103,7 @@
 
 ### Phase 2 verification and release
 
+- Before cancellation, turn writer-worktree admission failures into a loud, actionable preflight warning that explains the safe paths (user-approved Git setup, read-only work, or typed Manager takeover). This follows the completed Phase 1/2 safety work; it must never auto-initialize, stage, or commit a user repository.
 - full Ultra and fork suites;
 - packed smoke using distinct active/bundled fork copies;
 - no direct-spawn/resume bypass probes;
