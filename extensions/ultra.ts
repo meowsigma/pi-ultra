@@ -45,6 +45,7 @@ import {
   admitUltraWave,
   type UltraWriterAdmissionResult,
 } from './ultra-writer-admission.js';
+import { ULTRA_POOL_ENTRY, createUltraPool } from './ultra-pool.js';
 import {
   createUltraManagerState,
   ULTRA_MANAGER_ENTRY,
@@ -424,6 +425,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
 
     const operations = createUltraOperationStore({ append: (data) => pi.appendEntry(ULTRA_OPERATION_ENTRY, data) });
     const managerState = createUltraManagerState({ append: (data) => pi.appendEntry(ULTRA_MANAGER_ENTRY, data) });
+    const pool = createUltraPool({ append: (data) => pi.appendEntry(ULTRA_POOL_ENTRY, data) });
     // Scope binding must survive leaf changes caused by compaction and reload.
     // A scope ID is still explicitly re-established per agent turn below, so
     // durable history cannot silently grant a newly started turn authority.
@@ -668,6 +670,19 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
       timer.unref?.();
       timers.add(timer);
     };
+
+    pi.registerTool({
+      name: 'ultra_pool_status',
+      label: 'Ultra Active Pool Status',
+      description: 'Show durable Active Pool queue, lease, cancellation, and repair counts.',
+      promptSnippet: 'Inspect the durable Active Pool dashboard without launching or mutating work.',
+      executionMode: 'sequential',
+      parameters: Type.Object({}, { additionalProperties: false }),
+      async execute() {
+        const dashboard = pool.dashboard();
+        return { content: [{ type: 'text' as const, text: `Ultra pool: queued=${dashboard.queued}, active=${dashboard.active}, cancelled=${dashboard.cancelled}, repairs queued=${dashboard.repairsQueued}.` }], details: { kind: 'pool-dashboard', ...dashboard } };
+      },
+    });
 
     pi.registerTool({
       name: 'ultra_begin_scope',
@@ -1116,7 +1131,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
         return { block: true, reason: 'Ultra governs new subagent launches. Use ultra_delegate for one exact authorized wave, or let the main model take over directly.' };
       }
       if (!effective?.enabled || effective.orchestrationMode !== 'manager' || !policy?.operational) return;
-      if (event.toolName === 'ultra_begin_scope' || event.toolName === 'ultra_takeover' || event.toolName === 'ultra_delegate' || event.toolName === 'ultra_materialize_handoff' || event.toolName === 'ultra_review_candidate' || event.toolName === 'ultra_record_review_findings' || event.toolName === 'ultra_dispose_handoff' || MANAGER_READ_ONLY_TOOLS.has(event.toolName)) return;
+      if (event.toolName === 'ultra_begin_scope' || event.toolName === 'ultra_takeover' || event.toolName === 'ultra_delegate' || event.toolName === 'ultra_pool_status' || event.toolName === 'ultra_materialize_handoff' || event.toolName === 'ultra_review_candidate' || event.toolName === 'ultra_record_review_findings' || event.toolName === 'ultra_dispose_handoff' || MANAGER_READ_ONLY_TOOLS.has(event.toolName)) return;
       // There is no sound heuristic for shell/custom-tool mutability. Unknown
       // tools are therefore denied until a durable takeover matches this turn.
       const scopeId = currentManagerScopeId;
@@ -1131,6 +1146,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
       // session override patch before the fail-closed synchronization.
       operations.restore(ctx.sessionManager.getBranch());
       managerState.restore(ctx.sessionManager.getBranch());
+      pool.restore(ctx.sessionManager.getBranch());
       refreshSessionOverrides(ctx);
       await synchronize(ctx);
       if (disposed || generation !== lifecycleGeneration) return;
