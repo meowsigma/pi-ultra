@@ -696,11 +696,29 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
               },
               // Global-scope updater: the existing transactional locked write,
               // then resync this session; inheriting sessions observe the same
-              // change through the settings watcher without losing patched fields.
+              // change through the settings watcher without losing patched
+              // fields. The returned state is the refreshed session-effective
+              // result — raw globals would make the menu render unpatched
+              // values under "This session" while overrides are active.
               updateGlobal: async (patchInput) => {
-                const committed = await dependencies.updateSettings(patchInput);
+                await dependencies.updateSettings(patchInput);
                 await synchronize(ctx);
-                return committed;
+                const refreshed = await dependencies.loadSettings();
+                if (refreshed.kind === 'invalid') {
+                  throw new Error(`Ultra configuration is blocked: ${refreshed.reason}`);
+                }
+                let applied: UltraSettings;
+                try {
+                  applied = resolveEffectiveUltraSettings(refreshed.settings, sessionPatch);
+                } catch (error) {
+                  throw new Error(boundedMessage(error));
+                }
+                return {
+                  kind: 'loaded',
+                  settings: applied,
+                  revision: bindRevision(refreshed.revision, stablePatchDigest(sessionPatch)),
+                  path: refreshed.path,
+                } satisfies ValidUltraSettingsResult;
               },
               recover: async () => {
                 try {

@@ -9,6 +9,7 @@ import {
 } from '../extensions/ultra.js';
 import type { UltraDelegateInput, UltraPreparedWave } from '../extensions/ultra-protocol.js';
 import { validateUltraDelegateInput } from '../extensions/ultra-protocol.js';
+import { buildSettingsScreen } from '../extensions/ultra-menu.js';
 import { appendSessionUltraOverrides } from '../extensions/ultra-session-settings.js';
 import { FakePi, type FakePiOptions } from './fixtures/fake-pi.js';
 
@@ -491,6 +492,41 @@ test('menu global updater writes pi-ultra.json transactionally while reset only 
   h.deps.showMenu = async (options) => { reopened = options; return {}; };
   await h.pi.command('ultra');
   assert.equal(reopened.hasSessionOverrides, false, 'a cleared session reports no overrides');
+});
+
+test('menu global updater returns session-effective state so post-edit screens show overrides, not raw globals', async () => {
+  const h = harness();
+  await h.start();
+  await applySessionPatch(h, { workerModel: 'openai/session-model' });
+
+  let opts!: ShowMenuOptions;
+  h.deps.showMenu = async (options) => { opts = options; return {}; };
+  await h.pi.command('ultra');
+  assert.equal(opts.hasSessionOverrides, true);
+
+  const globalWrites: unknown[] = [];
+  const innerUpdateSettings = h.deps.updateSettings;
+  h.deps.updateSettings = async (patch) => {
+    globalWrites.push(patch);
+    return innerUpdateSettings(patch);
+  };
+
+  // Global-scope edit of a non-model field while a session workerModel override is active.
+  const refreshed = await opts.updateGlobal({ minLanes: 3 });
+  assert.equal(refreshed.kind, 'loaded');
+  assert.deepEqual(globalWrites, [{ minLanes: 3 }], 'the global file is transactionally updated exactly once');
+  assert.equal(refreshed.settings.minLanes, 3, 'the committed global edit is reflected in the returned state');
+  assert.equal(refreshed.settings.workerModel, 'openai/session-model', 'returned state overlays the session override instead of raw globals');
+  assert.match(refreshed.revision, /^[a-f0-9]{64}$/u, 'revision binds the refreshed global revision with the stable session patch digest');
+  assert.equal(refreshed.path, '/tmp/pi-ultra.json');
+
+  // The menu commits this exact updater result into its displayed state, so
+  // rendering it as session-scoped state must show effective values after
+  // the global edit — not the raw pi-ultra.json globals.
+  const screen = buildSettingsScreen(refreshed.settings, [], 'session');
+  assert.equal(screen.title, 'Ultra Settings — This session');
+  assert.equal(screen.items.find((item) => item.id === 'worker-model')?.currentValue, 'openai/session-model', 'menu displays the session model after a global edit');
+  assert.equal(screen.items.find((item) => item.id === 'lane-range')?.currentValue.includes('3'), true, 'menu displays the freshly edited global lane range');
 });
 
 test('shutdown disposes policy, watcher, completion listeners, and prevents stale delivery', async () => {
