@@ -41,7 +41,7 @@ test('manager mode denies parent mutation until an urgent scoped takeover is dur
   assert.equal((before as any).block, true);
   assert.match((before as any).reason, /takeover/i);
 
-  assert.deepEqual([...pi.tools.keys()].sort(), ['ultra_begin_scope', 'ultra_delegate', 'ultra_takeover']);
+  assert.deepEqual([...pi.tools.keys()].sort(), ['ultra_begin_scope', 'ultra_delegate', 'ultra_materialize_handoff', 'ultra_takeover']);
   const scope = await pi.tool('ultra_begin_scope', { scopeId: 'scope-1' });
   assert.equal((scope as any).isError, undefined);
   const takeover = await pi.tool('ultra_takeover', { scopeId: 'scope-1', reason: 'urgent-user-directed', explanation: 'The user requires a direct urgent fix.' });
@@ -51,6 +51,14 @@ test('manager mode denies parent mutation until an urgent scoped takeover is dur
 
   const [after] = await pi.emit('tool_call', { toolName: 'write', input: { path: 'a', content: 'b' } });
   assert.equal(after, undefined);
+});
+
+test('manager handoff materialization fails closed without an admitted completed writer operation', async () => {
+  const pi = harness();
+  await pi.emit('session_start', { type: 'session_start' });
+  const result = await pi.tool('ultra_materialize_handoff', { operationId: 'missing', manifestPath: '/handoff.json' }) as any;
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /not an admitted writer/i);
 });
 
 test('manager mode requires a durable scope before dispatching an Ultra wave', async () => {

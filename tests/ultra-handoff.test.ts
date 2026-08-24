@@ -29,7 +29,7 @@ function manifest(overrides: Record<string, unknown> = {}) {
   };
 }
 
-const expected = { runId: 'run-1', repositoryRoot: '/repo', baseCommit: 'a'.repeat(40), workerAgents: ['ultra-worker'] };
+const expected = { runId: 'run-1', repositoryRoot: '/repo', baseCommit: 'a'.repeat(40), manifestPath: '/artifacts/handoff.json', workerAgents: ['ultra-worker'] };
 
 test('validates a completed immutable patch handoff against its exact run, base, root, and worker contract', () => {
   const validated = validateUltraParallelHandoff(manifest(), expected);
@@ -46,4 +46,5 @@ test('fails closed for a forged run/root/base, missing cleanup, untrusted agent,
   assert.throws(() => validateUltraParallelHandoff(manifest({ groups: [{ ...(manifest().groups[0] as any), cleanup: { state: 'partial', tasks: [] } }] }), expected), /cleanup/i);
   assert.throws(() => validateUltraParallelHandoff(manifest({ groups: [{ ...(manifest().groups[0] as any), children: [{ ...(manifest().groups[0] as any).children[0], agent: 'other-worker' }] }] }), expected), /agent/i);
   assert.throws(() => validateUltraParallelHandoff(manifest({ groups: [{ ...(manifest().groups[0] as any), children: [{ ...(manifest().groups[0] as any).children[0], patch: { ...(manifest().groups[0] as any).children[0].patch, changed: false } }] }] }), expected), /patch/i);
+  assert.throws(() => validateUltraParallelHandoff(manifest({ groups: [{ ...(manifest().groups[0] as any), children: [{ ...(manifest().groups[0] as any).children[0], patch: { ...(manifest().groups[0] as any).children[0].patch, path: '/elsewhere/patch' } }] }] }), expected), /artifact directory/i);
 });

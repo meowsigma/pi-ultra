@@ -22,6 +22,8 @@ export interface UltraHandoffExpectation {
   runId: string;
   repositoryRoot: string;
   baseCommit: string;
+  /** Absolute manifest location; patch artifacts must live beside it. */
+  manifestPath: string;
   workerAgents: readonly string[];
 }
 
@@ -61,6 +63,8 @@ export function validateUltraParallelHandoff(raw: unknown, expected: UltraHandof
   if (repositoryRoot !== expected.repositoryRoot) throw new Error('Parallel handoff repository root does not match the admitted writer repository.');
   if (!Array.isArray(raw.groups) || raw.groups.length < 1 || raw.groups.length > 100) throw new Error('Parallel handoff groups are invalid.');
 
+  const manifestPath = absolutePath(expected.manifestPath, 'expected manifest path');
+  const artifactRoot = manifestPath.slice(0, manifestPath.lastIndexOf('/')) || '/';
   const patches: UltraHandoffPatch[] = [];
   const seenChildren = new Set<number>();
   const seenPatches = new Set<string>();
@@ -83,6 +87,7 @@ export function validateUltraParallelHandoff(raw: unknown, expected: UltraHandof
       if (child.status !== 'completed') throw new Error(`Parallel handoff writer '${agent}' did not complete successfully.`);
       if (!isRecord(child.patch) || child.patch.changed !== true) throw new Error(`Parallel handoff writer '${agent}' has no immutable patch.`);
       const patch = absolutePath(child.patch.path, 'patch path');
+      if (patch !== artifactRoot && !patch.startsWith(`${artifactRoot}/`)) throw new Error('Parallel handoff patch is outside the durable manifest artifact directory.');
       if (seenPatches.has(patch)) throw new Error(`Parallel handoff patch '${patch}' is duplicated.`);
       seenPatches.add(patch);
       patches.push({ childIndex, taskIndex, agent, path: patch });

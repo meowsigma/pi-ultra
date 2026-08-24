@@ -1,5 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile as execFileCallback } from 'node:child_process';
+import { readFile, mkdtemp } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import { Type } from 'typebox';
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from '@earendil-works/pi-coding-agent';
@@ -47,6 +50,8 @@ import {
   type UltraManagerBinding,
   type UltraTakeoverReason,
 } from './ultra-manager-state.js';
+import { validateUltraParallelHandoff, type UltraValidatedParallelHandoff } from './ultra-handoff.js';
+import { materializeUltraCandidate } from './ultra-candidate.js';
 import {
   appendSessionUltraOverrides,
   clearSessionUltraOverrides,
@@ -81,6 +86,10 @@ const MAX_DIAGNOSTIC_TEXT = 512;
 const execFile = promisify(execFileCallback);
 const MANAGER_SCOPE_SCHEMA = Type.Object({
   scopeId: Type.String({ minLength: 1, maxLength: 128 }),
+}, { additionalProperties: false });
+const MANAGER_MATERIALIZE_HANDOFF_SCHEMA = Type.Object({
+  operationId: Type.String({ minLength: 1, maxLength: 128 }),
+  manifestPath: Type.String({ minLength: 1, maxLength: 4096 }),
 }, { additionalProperties: false });
 const MANAGER_TAKEOVER_SCHEMA = Type.Object({
   scopeId: Type.String({ minLength: 1, maxLength: 128 }),
@@ -128,6 +137,10 @@ export interface UltraExtensionDependencies {
   launchWave(input: Parameters<typeof launchUltraWave>[0]): Promise<unknown>;
   queryStatus(events: ExtensionAPI['events'], runId: string, signal: AbortSignal): Promise<unknown | undefined>;
   admitWriterWave(input: { lanes: ReadonlyArray<{ id: string; role: 'scout' | 'worker' | 'reviewer' }>; cwd: string }): Promise<UltraWriterAdmissionResult>;
+  /** Optional test seam; production reads JSON from a supplied manifest path. */
+  readHandoffManifest?(path: string): Promise<unknown>;
+  /** Optional test seam; production clones a separate checkout and applies patches there. */
+  materializeCandidate?(handoff: UltraValidatedParallelHandoff): Promise<{ candidatePath: string; appliedPatches: string[] }>;
   randomId(): string;
 }
 
@@ -283,6 +296,26 @@ async function defaultAdmitWriterWave(input: Parameters<UltraExtensionDependenci
   });
 }
 
+async function defaultReadHandoffManifest(path: string): Promise<unknown> {
+  return JSON.parse(await readFile(path, 'utf8')) as unknown;
+}
+
+async function defaultMaterializeCandidate(handoff: UltraValidatedParallelHandoff): Promise<{ candidatePath: string; appliedPatches: string[] }> {
+  const parent = await mkdtemp(join(tmpdir(), 'pi-ultra-candidate-'));
+  const candidatePath = join(parent, handoff.runId.replace(/[^A-Za-z0-9._-]/gu, '_'));
+  return materializeUltraCandidate({
+    handoff,
+    createCheckout: async ({ repositoryRoot, baseCommit }) => {
+      await execFile('git', ['clone', '--no-checkout', '--no-local', repositoryRoot, candidatePath], { encoding: 'utf8', maxBuffer: 1024 * 1024 });
+      await execFile('git', ['-C', candidatePath, 'checkout', '--detach', baseCommit], { encoding: 'utf8', maxBuffer: 1024 * 1024 });
+      return candidatePath;
+    },
+    applyPatch: async ({ candidatePath: target, patchPath, checkOnly }) => {
+      await execFile('git', ['-C', target, 'apply', ...(checkOnly ? ['--check'] : []), '--', patchPath], { encoding: 'utf8', maxBuffer: 1024 * 1024 });
+    },
+  });
+}
+
 const DEFAULT_DEPENDENCIES: UltraExtensionDependencies = {
   loadSettings: () => loadUltraSettings(),
   updateSettings: (patch) => updateUltraSettings(patch),
@@ -296,6 +329,8 @@ const DEFAULT_DEPENDENCIES: UltraExtensionDependencies = {
   launchWave: launchUltraWave,
   queryStatus: defaultQueryStatus,
   admitWriterWave: defaultAdmitWriterWave,
+  readHandoffManifest: defaultReadHandoffManifest,
+  materializeCandidate: defaultMaterializeCandidate,
   randomId: randomUUID,
 };
 
@@ -659,6 +694,38 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
     });
 
     pi.registerTool({
+      name: 'ultra_materialize_handoff',
+      label: 'Ultra Materialize Handoff Candidate',
+      description: 'Validate a completed writer handoff and apply its patches only in a new candidate checkout.',
+      promptSnippet: 'Materialize a validated worker handoff in an isolated candidate checkout before sequential review.',
+      executionMode: 'sequential',
+      parameters: MANAGER_MATERIALIZE_HANDOFF_SCHEMA,
+      async execute(_toolCallId, params, _toolSignal, _onUpdate, ctx) {
+        if (!effective || effective.orchestrationMode !== 'manager' || !effectiveRevisionValue) return toolError('Ultra Manager mode is not active and synchronized.');
+        const operationId = isRecord(params) && typeof params.operationId === 'string' ? params.operationId : undefined;
+        const manifestPath = isRecord(params) && typeof params.manifestPath === 'string' ? params.manifestPath : undefined;
+        if (!operationId || !manifestPath) return toolError('Handoff materialization requires an operation ID and manifest path.');
+        try {
+          const operation = operations.get(operationId);
+          if (!operation?.writerBase) return toolError(`Operation '${operationId}' is not an admitted writer operation.`);
+          const raw = await (dependencies.readHandoffManifest ?? defaultReadHandoffManifest)(manifestPath);
+          const handoff = validateUltraParallelHandoff(raw, {
+            runId: operation.runId,
+            repositoryRoot: operation.writerBase.repositoryRoot,
+            baseCommit: operation.writerBase.baseCommit,
+            manifestPath,
+            workerAgents: operation.lanes.filter((lane) => lane.role === 'worker').map((lane) => lane.agent),
+          });
+          const candidate = await (dependencies.materializeCandidate ?? defaultMaterializeCandidate)(handoff);
+          const persisted = operations.recordMaterializedHandoff(operationId, { manifestPath, candidatePath: candidate.candidatePath });
+          return { content: [{ type: 'text' as const, text: `Ultra handoff for ${operationId} was materialized in candidate ${candidate.candidatePath}. Launch a separate reviewer wave against that candidate; this is not acceptance.` }], details: { kind: 'handoff-candidate', operationId, candidatePath: candidate.candidatePath, patches: candidate.appliedPatches, updatedAt: persisted.updatedAt } };
+        } catch (error) {
+          return toolError(`Ultra handoff materialization failed closed: ${boundedMessage(error)}`);
+        }
+      },
+    });
+
+    pi.registerTool({
       name: 'ultra_delegate',
       label: 'Ultra Delegate',
       description: 'Launch one exact, preflighted Ultra worker wave. Use only for genuinely independent lanes; completion is evidence, not acceptance.',
@@ -946,7 +1013,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
         return { block: true, reason: 'Ultra governs new subagent launches. Use ultra_delegate for one exact authorized wave, or let the main model take over directly.' };
       }
       if (!effective?.enabled || effective.orchestrationMode !== 'manager' || !policy?.operational) return;
-      if (event.toolName === 'ultra_begin_scope' || event.toolName === 'ultra_takeover' || event.toolName === 'ultra_delegate' || MANAGER_READ_ONLY_TOOLS.has(event.toolName)) return;
+      if (event.toolName === 'ultra_begin_scope' || event.toolName === 'ultra_takeover' || event.toolName === 'ultra_delegate' || event.toolName === 'ultra_materialize_handoff' || MANAGER_READ_ONLY_TOOLS.has(event.toolName)) return;
       // There is no sound heuristic for shell/custom-tool mutability. Unknown
       // tools are therefore denied until a durable takeover matches this turn.
       const scopeId = currentManagerScopeId;
