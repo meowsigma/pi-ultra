@@ -33,6 +33,23 @@ test('writer ownership conflicts wait, cancellation is terminal, and expired lea
   assert.equal(pool.get('writer-a')?.state, 'queued');
 });
 
+test('resume permits are durable, exact-bound, idempotent, and one-use', () => {
+  let now = 10;
+  const entries: any[] = [];
+  const pool = createUltraPool({ append: (data) => entries.push({ type: 'custom', customType: ULTRA_POOL_ENTRY, data }), now: () => now });
+  pool.enqueue(job('job'));
+  pool.admitNext({ leaseId: 'lease', expiresAt: 100 });
+  const intent = { id: 'permit', jobId: 'job', leaseId: 'lease', targetRunId: 'run', requestDigest: 'a'.repeat(64), expiresAt: 50 };
+  assert.equal(pool.issueResumePermit(intent).state, 'issued');
+  assert.equal(pool.issueResumePermit(intent).state, 'issued');
+  assert.throws(() => pool.consumeResumePermit({ ...intent, targetRunId: 'other' }), /exact/i);
+  assert.equal(pool.consumeResumePermit(intent).state, 'consumed');
+  assert.throws(() => pool.consumeResumePermit(intent), /consumed/i);
+  const restored = createUltraPool({ append: () => assert.fail('no append'), now: () => now });
+  restored.restore(entries);
+  assert.throws(() => restored.consumeResumePermit(intent), /consumed/i);
+});
+
 test('restore fails closed for malformed entries and exposes dashboard state', () => {
   const entries: any[] = [];
   const pool = createUltraPool({ append: (data) => entries.push({ type: 'custom', customType: ULTRA_POOL_ENTRY, data }), now: () => 1 });
