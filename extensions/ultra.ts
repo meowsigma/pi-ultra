@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { execFile as execFileCallback } from 'node:child_process';
+import { promisify } from 'node:util';
 import { Type } from 'typebox';
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import {
@@ -34,6 +36,10 @@ import {
   type UltraOperationLane,
   type UltraOutboxItem,
 } from './ultra-operations.js';
+import {
+  admitUltraWave,
+  type UltraWriterAdmissionResult,
+} from './ultra-writer-admission.js';
 import {
   createUltraManagerState,
   ULTRA_MANAGER_ENTRY,
@@ -71,6 +77,7 @@ const RECONCILE_DELAYS = [0, 250, 750, 1_500] as const;
 // per distinct malformed set.
 const SESSION_OVERRIDE_DIAGNOSTIC_TYPE = 'pi-ultra-session-settings-diagnostic';
 const MAX_DIAGNOSTIC_TEXT = 512;
+const execFile = promisify(execFileCallback);
 const MANAGER_SCOPE_SCHEMA = Type.Object({
   scopeId: Type.String({ minLength: 1, maxLength: 128 }),
 }, { additionalProperties: false });
@@ -119,6 +126,7 @@ export interface UltraExtensionDependencies {
   prepareWave(input: PrepareUltraWaveInput): Promise<UltraPreparedWave>;
   launchWave(input: Parameters<typeof launchUltraWave>[0]): Promise<unknown>;
   queryStatus(events: ExtensionAPI['events'], runId: string, signal: AbortSignal): Promise<unknown | undefined>;
+  admitWriterWave(input: { lanes: ReadonlyArray<{ id: string; role: 'scout' | 'worker' | 'reviewer' }>; cwd: string }): Promise<UltraWriterAdmissionResult>;
   randomId(): string;
 }
 
@@ -256,6 +264,24 @@ async function defaultQueryStatus(events: ExtensionAPI['events'], runId: string,
   });
 }
 
+async function defaultAdmitWriterWave(input: Parameters<UltraExtensionDependencies['admitWriterWave']>[0]): Promise<UltraWriterAdmissionResult> {
+  const git = async (args: string[]): Promise<string | null> => {
+    try { return (await execFile('git', ['-C', input.cwd, ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 })).stdout.trim(); }
+    catch { return null; }
+  };
+  return admitUltraWave({
+    lanes: input.lanes,
+    cwd: input.cwd,
+    probes: {
+      repositoryRoot: async () => git(['rev-parse', '--show-toplevel']),
+      headCommit: async () => git(['rev-parse', '--verify', 'HEAD']),
+      resolveRef: async (_cwd, ref) => git(['rev-parse', '--verify', ref]),
+      mergeBase: async (_cwd, one, two) => git(['merge-base', one, two]),
+      worktreeStatus: async () => (await execFile('git', ['-C', input.cwd, 'status', '--porcelain=v1', '--untracked-files=all'], { encoding: 'utf8', maxBuffer: 256 * 1024 })).stdout,
+    },
+  });
+}
+
 const DEFAULT_DEPENDENCIES: UltraExtensionDependencies = {
   loadSettings: () => loadUltraSettings(),
   updateSettings: (patch) => updateUltraSettings(patch),
@@ -268,6 +294,7 @@ const DEFAULT_DEPENDENCIES: UltraExtensionDependencies = {
   prepareWave: prepareUltraWave,
   launchWave: launchUltraWave,
   queryStatus: defaultQueryStatus,
+  admitWriterWave: defaultAdmitWriterWave,
   randomId: randomUUID,
 };
 
@@ -673,6 +700,18 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
           }
           if (!policy?.operational || !policy.authority) return toolError('Ultra is blocked because compatible launch authority is unavailable. The main model must take over directly.');
           const input = params as UltraDelegateInput;
+          const admission = await dependencies.admitWriterWave({
+            lanes: input.lanes.map((lane) => ({ id: lane.id, role: lane.role })),
+            cwd: ctx.cwd,
+          });
+          if (!admission.admitted) {
+            const scopeId = currentManagerScopeId;
+            const binding = scopeId ? managerBinding(ctx, scopeId) : undefined;
+            if (binding && admission.reason === 'dirty-worktree') {
+              managerState.recordEvidence({ ...binding, evidence: 'dirty-worktree', createdAt: Date.now() });
+            }
+            return toolError(`Ultra writer admission denied (${admission.reason}): ${admission.diagnostics.join(' ') || 'repository safety could not be verified.'}`);
+          }
           if (input.repairOf) operations.assertRepairAllowed(input.repairOf);
           const revision = bindRevision(loaded.revision, stablePatchDigest(sessionPatch));
           const prepared = await dependencies.prepareWave({

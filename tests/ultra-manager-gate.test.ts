@@ -27,6 +27,7 @@ function harness() {
     installPolicy: async ({ mode }) => mode === 'enabled' ? registration : { mode, operational: false, dispose() {} },
     watchSettings: () => () => {}, prepareWave: async () => { throw new Error('unused'); },
     launchWave: async () => { throw new Error('unused'); }, queryStatus: async () => undefined,
+    admitWriterWave: async () => ({ admitted: true, checkedGit: true, reason: 'admitted', diagnostics: [] }),
     randomId: () => 'id-1',
   };
   createUltraExtension(deps)(pi as any);

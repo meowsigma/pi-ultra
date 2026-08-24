@@ -104,6 +104,7 @@ function harness(options: {
     },
     launchWave: async (value) => { launches.push(value); return options.launchReceipt ?? { text: 'Async workflow', details: { runId: 'run-1', asyncDir: '/tmp/run-1' } }; },
     queryStatus: async () => options.queryResult,
+    admitWriterWave: async () => ({ admitted: true, checkedGit: true, reason: 'admitted', diagnostics: [] }),
     randomId: () => `op-${++uuid}`,
   };
   const pi = new FakePi('tui', '/repo', options.session);
