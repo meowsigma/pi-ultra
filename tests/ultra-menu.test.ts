@@ -136,14 +136,15 @@ test('main screen proves session override provenance and scopes both settings ti
 
   assert.equal(buildSettingsScreen(SETTINGS, [], 'session').title, 'Ultra Settings — This session');
   assert.equal(buildSettingsScreen(GLOBAL_SETTINGS, [], 'global').title, 'Ultra Global Defaults — All sessions');
-  assert.deepEqual(buildSettingsScreen(SETTINGS, []).items.map((item) => item.label), ['Ultra', 'Routing mode', 'Worker model', 'Lane range']);
+  assert.deepEqual(buildSettingsScreen(SETTINGS, []).items.map((item) => item.label), ['Ultra', 'Orchestration mode', 'Routing mode', 'Worker model', 'Lane range']);
+  assert.equal(buildSettingsScreen({ ...SETTINGS, orchestrationMode: 'manager' }, []).items.find((item) => item.id === 'orchestration-mode')?.currentValue, 'Manager — dispatch or takeover required');
   assert.equal(laneRangeLabel({ ...SETTINGS, minLanes: 3, maxLanes: 6 }), 'Custom · 3–6');
 });
 
 test('global settings screen renders disabled, Automatic, and small range with global-only action ids', () => {
   const screen = buildSettingsScreen({ ...GLOBAL_SETTINGS, enabled: false }, [], 'global');
   assert.equal(screen.title, 'Ultra Global Defaults — All sessions');
-  assert.deepEqual(screen.items.map((item) => item.action), ['set-ultra-global', 'set-routing-global', 'set-model-global', 'set-lane-range-global']);
+  assert.deepEqual(screen.items.map((item) => item.action), ['set-ultra-global', 'set-orchestration-global', 'set-routing-global', 'set-model-global', 'set-lane-range-global']);
   assert.equal(screen.items.find((item) => item.id === 'ultra')?.currentValue, 'Disabled');
   assert.equal(screen.items.find((item) => item.id === 'worker-model')?.currentValue, 'Automatic');
   assert.equal(screen.items.find((item) => item.id === 'lane-range')?.currentValue, 'Small · 1–2');
@@ -450,6 +451,7 @@ test('invalid custom draft remains available for correction and saves exactly on
     tui.press('tui.select.down');
     tui.press('tui.select.confirm');
     await tui.waitForOpen();
+    tui.press('tui.select.down');
     tui.press('tui.select.down');
     tui.press('tui.select.down');
     tui.press('tui.select.down');

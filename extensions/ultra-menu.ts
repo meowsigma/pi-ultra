@@ -37,9 +37,9 @@ export type UltraScreenId =
 export type UltraActionId =
   | 'enable-ultra' | 'disable-ultra'
   // Session-scoped (current-session override) setting edits.
-  | 'set-ultra' | 'set-routing' | 'set-model' | 'set-lane-range'
+  | 'set-ultra' | 'set-orchestration' | 'set-routing' | 'set-model' | 'set-lane-range'
   // Global-defaults (pi-ultra.json) setting edits.
-  | 'set-ultra-global' | 'set-routing-global' | 'set-model-global' | 'set-lane-range-global'
+  | 'set-ultra-global' | 'set-orchestration-global' | 'set-routing-global' | 'set-model-global' | 'set-lane-range-global'
   | 'reset-session' | 'recover-config';
 
 export interface UltraMenuContext extends Pick<ExtensionCommandContext, 'mode' | 'hasUI' | 'model' | 'scopedModels'> {
@@ -88,6 +88,8 @@ const RESET_SESSION_LABEL = 'Reset this session to global defaults';
 const GLOBAL_DEFAULTS_LABEL = 'Global defaults…';
 const ROUTING_UNIFORM_LABEL = 'One model for every lane';
 const ROUTING_ROLE_DEFAULTS_LABEL = 'Role defaults';
+const ORCHESTRATION_COLLABORATOR_LABEL = 'Collaborator — delegate when useful';
+const ORCHESTRATION_MANAGER_LABEL = 'Manager — dispatch or takeover required';
 
 function isValidState(state: LoadUltraSettingsResult): state is ValidUltraSettingsResult {
   return state.kind !== 'invalid';
@@ -95,6 +97,10 @@ function isValidState(state: LoadUltraSettingsResult): state is ValidUltraSettin
 
 function routingLabel(mode: UltraSettings['routingMode']): string {
   return mode === 'uniform' ? ROUTING_UNIFORM_LABEL : ROUTING_ROLE_DEFAULTS_LABEL;
+}
+
+function orchestrationLabel(mode: UltraSettings['orchestrationMode']): string {
+  return mode === 'manager' ? ORCHESTRATION_MANAGER_LABEL : ORCHESTRATION_COLLABORATOR_LABEL;
 }
 
 function presetFor(settings: UltraSettings): (typeof PRESETS)[number] | undefined {
@@ -163,7 +169,7 @@ function settingsTitle(scope: UltraMenuScope): string {
   return scope === 'global' ? 'Ultra Global Defaults — All sessions' : 'Ultra Settings — This session';
 }
 
-function scopedAction(scope: UltraMenuScope, base: 'set-ultra' | 'set-routing' | 'set-model' | 'set-lane-range'): UltraActionId {
+function scopedAction(scope: UltraMenuScope, base: 'set-ultra' | 'set-orchestration' | 'set-routing' | 'set-model' | 'set-lane-range'): UltraActionId {
   return scope === 'global' ? `${base}-global` as UltraActionId : base;
 }
 
@@ -182,6 +188,7 @@ export function buildSettingsScreen(
     title: settingsTitle(scope),
     items: [
       { id: 'ultra', label: 'Ultra', currentValue: settings.enabled ? 'Enabled' : 'Disabled', values: ['Enabled', 'Disabled'], action: scopedAction(scope, 'set-ultra') },
+      { id: 'orchestration-mode', label: 'Orchestration mode', currentValue: orchestrationLabel(settings.orchestrationMode), values: [ORCHESTRATION_COLLABORATOR_LABEL, ORCHESTRATION_MANAGER_LABEL], action: scopedAction(scope, 'set-orchestration'), description: 'Collaborator is optional; Manager requires a dispatch or takeover decision before work.' },
       { id: 'routing-mode', label: 'Routing mode', currentValue: routingLabel(settings.routingMode), values: [ROUTING_UNIFORM_LABEL, ROUTING_ROLE_DEFAULTS_LABEL], action: scopedAction(scope, 'set-routing') },
       {
         id: 'worker-model', label: 'Worker model', currentValue: settings.workerModel ?? 'Automatic', values: [settings.workerModel ?? 'Automatic', 'Choose…'], action: scopedAction(scope, 'set-model'),
@@ -283,7 +290,7 @@ type ScopedUpdater = (patch: UltraSettingsPatch | UltraSettingsMutator) => Promi
 /** Updater already wrapped to commit its result into displayed menu state. */
 type ScopedApply = (patch: UltraSettingsPatch) => Promise<MenuActionResult<UltraScreenId>>;
 type LaneRangeApply = (patch: { minLanes: number; maxLanes: number }) => Promise<MenuActionResult<UltraScreenId>>;
-type SettingActionId = 'set-ultra' | 'set-routing' | 'set-model' | 'set-lane-range';
+type SettingActionId = 'set-ultra' | 'set-orchestration' | 'set-routing' | 'set-model' | 'set-lane-range';
 
 /**
  * Shared correction loop for custom lane ranges: invalid drafts stay in the
@@ -311,6 +318,11 @@ function customLaneRangeLoop(applyPair: LaneRangeApply, ui: ShowUltraMenuOptions
 function scopedSettingActions(targets: ScopeTargets, apply: ScopedApply): Record<SettingActionId, MenuActionHandler<UltraMenuState, UltraScreenId, UltraMenuContext>> {
   return {
     'set-ultra': (ctx) => apply({ enabled: ctx.value === 'Enabled' }),
+    'set-orchestration': (ctx) => {
+      if (ctx.value === ORCHESTRATION_COLLABORATOR_LABEL) return apply({ orchestrationMode: 'collaborator' });
+      if (ctx.value === ORCHESTRATION_MANAGER_LABEL) return apply({ orchestrationMode: 'manager' });
+      return { kind: 'rejected', error: 'Invalid orchestration mode.' };
+    },
     'set-routing': (ctx) => {
       if (ctx.value === ROUTING_UNIFORM_LABEL) return apply({ routingMode: 'uniform' });
       if (ctx.value === ROUTING_ROLE_DEFAULTS_LABEL) return apply({ routingMode: 'role-defaults' });
@@ -399,6 +411,7 @@ export async function showUltraMenu(options: ShowUltraMenuOptions): Promise<RunM
     'enable-ultra': () => commitSessionUpdate({ enabled: true }),
     'disable-ultra': () => commitSessionUpdate({ enabled: false }),
     'set-ultra-global': globalActions['set-ultra'],
+    'set-orchestration-global': globalActions['set-orchestration'],
     'set-routing-global': globalActions['set-routing'],
     'set-model-global': globalActions['set-model'],
     'set-lane-range-global': globalActions['set-lane-range'],

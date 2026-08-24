@@ -281,7 +281,7 @@ test('settings watcher applies global off-to-on and invalid transitions in fail-
   await h.start();
   h.setLoaded({ kind: 'loaded', settings: { ...ENABLED }, revision: 'on', path: '/tmp/pi-ultra.json' });
   await h.change();
-  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on');
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: collaborator');
   h.setLoaded({ kind: 'invalid', reason: 'replaced badly', path: '/tmp/pi-ultra.json' });
   await h.change();
   assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: blocked');
@@ -291,7 +291,7 @@ test('settings watcher applies global off-to-on and invalid transitions in fail-
 test('blocked synchronize denies ultra_delegate launches until a successful resync restores delegation', async () => {
   const h = harness();
   await h.start();
-  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on');
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: collaborator');
 
   // Persistent installPolicy failure after a previous enabled policy exists:
   // synchronize reports blocked but retains the stale enabled registration,
@@ -312,7 +312,7 @@ test('blocked synchronize denies ultra_delegate launches until a successful resy
   // A subsequent successful watcher resync restores normal authorized delegation.
   h.deps.installPolicy = realInstall;
   await h.change();
-  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on');
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: collaborator');
   const delegated = await h.pi.tool('ultra_delegate', delegateInput()) as any;
   assert.equal(delegated.isError, undefined);
   assert.equal(h.preparedInputs.length, 1);
@@ -327,7 +327,7 @@ test('watcher failure remains blocked until a successful watcher change resynchr
   const blocked = await h.pi.tool('ultra_delegate', delegateInput()) as any;
   assert.equal(blocked.isError, true);
   await h.change();
-  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on');
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: collaborator');
 });
 
 test('shutdown fences delayed policy install, preflight, and spawn continuations', async () => {
@@ -343,7 +343,7 @@ test('shutdown fences delayed policy install, preflight, and spawn continuations
   await starting;
   assert.equal(delayedRegistration.disposed, true);
   assert.equal(policyHarness.watcherActive, false);
-  assert.notEqual(policyHarness.pi.statuses.at(-1)?.value, 'Ultra: on');
+  assert.notEqual(policyHarness.pi.statuses.at(-1)?.value, 'Ultra: collaborator');
 
   const preflightHarness = harness();
   await preflightHarness.start();
@@ -448,7 +448,7 @@ test('menu disable resolves a bound off result without touching globals and reje
 
   const disabled = await update({ enabled: false });
   assert.equal(disabled.kind, 'loaded');
-  assert.deepEqual(disabled.settings, { ...ENABLED, enabled: false }, 'absent fields inherit global defaults');
+  assert.deepEqual(disabled.settings, { ...ENABLED, enabled: false, orchestrationMode: 'collaborator' }, 'absent fields inherit global defaults');
   assert.match(disabled.revision, /^[a-f0-9]{64}$/u, 'revision binds global revision and session patch digest');
   assert.equal(disabled.path, '/tmp/pi-ultra.json');
   assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: off');
@@ -532,7 +532,7 @@ test('pre-append validation failure stays an ordinary rejection and appends noth
   await assert.rejects(() => update({ workerModel: 'missing-provider-separator' }), (error: unknown) =>
     !(error instanceof CommittedSessionUpdateError));
   assert.equal(h.pi.entries.some((entry) => entry.customType === SESSION_OVERRIDE_TYPE), false, 'nothing was durably appended before validation failed');
-  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on', 'failed-before-append updates do not disturb effective enforcement');
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: collaborator', 'failed-before-append updates do not disturb effective enforcement');
 });
 
 test('menu Automatic maps an explicit clear to workerModel null and restores across a new FakePi branch', async () => {
@@ -549,7 +549,7 @@ test('menu Automatic maps an explicit clear to workerModel null and restores acr
   assert.equal('workerModel' in automatic.settings, false, 'Automatic removes the effective worker model');
   assert.equal(automatic.settings.routingMode, 'uniform');
   assert.equal(effectiveUniformModel(automatic.settings), 'automatic');
-  assert.equal(first.pi.statuses.at(-1)?.value, 'Ultra: on');
+  assert.equal(first.pi.statuses.at(-1)?.value, 'Ultra: collaborator');
   let snapshots = first.pi.entries.filter((entry) => entry.customType === SESSION_OVERRIDE_TYPE);
   assert.deepEqual((snapshots.at(-1)?.data as any).patch, { routingMode: 'uniform', workerModel: null });
 
@@ -563,7 +563,7 @@ test('menu Automatic maps an explicit clear to workerModel null and restores acr
     session: { sessionId: 'auto-model', sessionFile: '/tmp/auto-model.jsonl', branch: [...first.pi.entries] },
   });
   await second.start();
-  assert.equal(second.pi.statuses.at(-1)?.value, 'Ultra: on');
+  assert.equal(second.pi.statuses.at(-1)?.value, 'Ultra: collaborator');
   const delegated = await second.pi.tool('ultra_delegate', delegateInput()) as any;
   assert.equal(delegated.isError, undefined);
   assert.equal('workerModel' in second.preparedInputs[0]!.settings, false, 'restored branch keeps explicit Automatic');
@@ -596,7 +596,7 @@ test('menu global updater writes pi-ultra.json transactionally while reset only 
   // The session updater keeps writing only local snapshots.
   await opts.updateSession({ enabled: true });
   assert.deepEqual(globalWrites, [{ enabled: false }]);
-  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on');
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: collaborator');
 
   // Reset appends exactly one empty snapshot and returns effective global defaults.
   const before = h.pi.entries.filter((entry) => entry.customType === SESSION_OVERRIDE_TYPE).length;
@@ -604,7 +604,7 @@ test('menu global updater writes pi-ultra.json transactionally while reset only 
   assert.equal(reset.kind, 'loaded');
   assert.deepEqual(
     reset.settings,
-    { version: 1, enabled: false, routingMode: 'uniform', workerModel: 'openai/test-model', minLanes: 2, maxLanes: 4 },
+    { version: 1, enabled: false, routingMode: 'uniform', orchestrationMode: 'collaborator', workerModel: 'openai/test-model', minLanes: 2, maxLanes: 4 },
     'reset reports the effective global defaults, not the prior session patch',
   );
   const snapshots = h.pi.entries.filter((entry) => entry.customType === SESSION_OVERRIDE_TYPE);
@@ -704,7 +704,7 @@ test('two fake sessions sharing global defaults diverge in enabled, model, and l
   await applySessionPatch(one, { enabled: false, workerModel: 'openai/session-model', minLanes: 4, maxLanes: 8 });
 
   assert.equal(one.pi.statuses.at(-1)?.value, 'Ultra: off');
-  assert.equal(two.pi.statuses.at(-1)?.value, 'Ultra: on');
+  assert.equal(two.pi.statuses.at(-1)?.value, 'Ultra: collaborator');
 
   const blocked = await one.pi.tool('ultra_delegate', laneInput(4)) as any;
   assert.equal(blocked.isError, true);
@@ -734,7 +734,7 @@ test('off in session one appends only a local snapshot and leaves session two an
   await two.start();
   await one.pi.command('ultra', 'off');
   assert.equal(one.pi.statuses.at(-1)?.value, 'Ultra: off');
-  assert.equal(two.pi.statuses.at(-1)?.value, 'Ultra: on');
+  assert.equal(two.pi.statuses.at(-1)?.value, 'Ultra: collaborator');
 
   const snapshots = one.pi.entries.filter((entry) => entry.customType === SESSION_OVERRIDE_TYPE);
   assert.equal(snapshots.length, 1);
@@ -764,7 +764,7 @@ test('a new FakePi built from a prior branch restores the session override state
   assert.match(resultText(blocked), /Run \/ultra on first\./);
 
   await second.pi.command('ultra', 'on');
-  assert.equal(second.pi.statuses.at(-1)?.value, 'Ultra: on');
+  assert.equal(second.pi.statuses.at(-1)?.value, 'Ultra: collaborator');
   const revived = await second.pi.tool('ultra_delegate', laneInput(4)) as any;
   assert.equal(revived.isError, undefined);
   assert.equal(second.preparedInputs[0]?.settings.workerModel, 'openai/session-model');
@@ -821,7 +821,7 @@ test('invalid global configuration blocks a fully overridden session and ultra_d
   const h = harness();
   await h.start();
   await applySessionPatch(h, { workerModel: 'openai/session-model', minLanes: 4, maxLanes: 8 });
-  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on');
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: collaborator');
 
   h.setLoaded({ kind: 'invalid', reason: 'rewritten badly', path: '/tmp/pi-ultra.json' });
   await h.change();
@@ -892,7 +892,7 @@ test('a blocked synchronize transition never yields a verified-looking session u
   // A later successful watcher change restores the on-state with the patch applied.
   h.deps.installPolicy = innerInstall;
   await h.change();
-  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on');
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: collaborator');
 });
 
 test('a blocked synchronize transition never yields a verified-looking global update result', async () => {
@@ -921,7 +921,7 @@ test('a blocked synchronize transition never yields a verified-looking global up
 
   h.deps.installPolicy = innerInstall;
   await h.change();
-  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on');
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: collaborator');
 });
 
 test('malformed restored overrides record at most one sanitized non-model diagnostic per distinct set', async () => {
@@ -938,7 +938,7 @@ test('malformed restored overrides record at most one sanitized non-model diagno
   const serialized = JSON.stringify(diagnostics);
   assert.doesNotMatch(serialized, /[\u0000-\u001f\u007f]/gu);
   assert.match(serialized, /Unsupported session Ultra override field/);
-  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on', 'valid later snapshot still applies');
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: collaborator', 'valid later snapshot still applies');
 
   await h.change();
   assert.equal(h.pi.entries.filter((entry) => entry.customType === SESSION_DIAGNOSTIC_TYPE).length, 1, 'no duplicate diagnostics for the same set');

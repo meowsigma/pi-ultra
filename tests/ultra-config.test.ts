@@ -39,6 +39,7 @@ test('module exports all required symbols', async () => {
     version: 1,
     enabled: true,
     routingMode: 'role-defaults',
+    orchestrationMode: 'collaborator',
     minLanes: 2,
     maxLanes: 4,
   });
@@ -62,6 +63,7 @@ test('normalizeUltraSettings fills defaults for partial object', async () => {
   assert.equal(r1.version, 1);
   assert.equal(r1.enabled, true);
   assert.equal(r1.routingMode, 'role-defaults');
+  assert.equal(r1.orchestrationMode, 'collaborator');
   assert.equal(r1.minLanes, 2);
   assert.equal(r1.maxLanes, 4);
   assert.equal('workerModel' in r1, false);
@@ -130,6 +132,9 @@ test('normalizeUltraSettings returns undefined for invalid inputs', async () => 
 
   // Bad workerModel
   assert.equal(normalizeUltraSettings({ workerModel: 123 }), undefined);
+
+  // Bad orchestration mode
+  assert.equal(normalizeUltraSettings({ orchestrationMode: 'swarm' }), undefined);
 
   // min/max out of range
   assert.equal(normalizeUltraSettings({ minLanes: 0 }), undefined);
@@ -262,7 +267,7 @@ test('transactional update then load returns committed settings and preserves un
   await updateUltraSettings({ enabled: false, routingMode: 'uniform', minLanes: 1, maxLanes: 3, workerModel: 'openai/gpt-4o' }, p);
   const result = await loadUltraSettings(p);
   assert.equal(result.kind, 'loaded');
-  assert.deepEqual(result.settings, { version: 1, enabled: false, routingMode: 'uniform', minLanes: 1, maxLanes: 3, workerModel: 'openai/gpt-4o' });
+  assert.deepEqual(result.settings, { version: 1, enabled: false, routingMode: 'uniform', orchestrationMode: 'collaborator', minLanes: 1, maxLanes: 3, workerModel: 'openai/gpt-4o' });
   const saved = JSON.parse(await readFile(p, 'utf8'));
   assert.equal(saved.customField, 'keep-me');
   assert.deepEqual(saved.anotherExtra, { nested: true });

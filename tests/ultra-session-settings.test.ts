@@ -63,6 +63,7 @@ test('validate accepts declared optional fields and trims provider-qualified mod
   const patch = validateUltraSessionOverrides({
     enabled: false,
     routingMode: 'uniform',
+    orchestrationMode: 'manager',
     workerModel: '  openai/gpt-5.6-sol  ',
     minLanes: 2,
     maxLanes: 6,
@@ -70,6 +71,7 @@ test('validate accepts declared optional fields and trims provider-qualified mod
   assert.deepEqual(patch, {
     enabled: false,
     routingMode: 'uniform',
+    orchestrationMode: 'manager',
     workerModel: 'openai/gpt-5.6-sol',
     minLanes: 2,
     maxLanes: 6,
@@ -86,6 +88,7 @@ test('validate rejects unknown fields, bad types, bad routing, invalid models, n
   assert.throws(() => validateUltraSessionOverrides({ extra: true }), /extra/i);
   assert.throws(() => validateUltraSessionOverrides({ enabled: 'yes' }), /enabled/i);
   assert.throws(() => validateUltraSessionOverrides({ routingMode: 'chaos' }), /routingMode/i);
+  assert.throws(() => validateUltraSessionOverrides({ orchestrationMode: 'swarm' }), /orchestrationMode/i);
   assert.throws(() => validateUltraSessionOverrides({ workerModel: 42 }), /workerModel/i);
   assert.throws(() => validateUltraSessionOverrides({ workerModel: '' }), /workerModel/i);
   assert.throws(() => validateUltraSessionOverrides({ workerModel: '   ' }), /workerModel/i);

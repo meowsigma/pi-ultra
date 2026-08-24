@@ -9,6 +9,7 @@ import {
   ULTRA_MIN_LANES,
   normalizeUltraSettings,
   type RoutingMode,
+  type UltraOrchestrationMode,
   type UltraSettings,
 } from './ultra-config.js';
 
@@ -29,6 +30,7 @@ const MAX_IGNORED_DIAGNOSTICS = 32;
 export interface UltraSessionOverrides {
   enabled?: boolean;
   routingMode?: RoutingMode;
+  orchestrationMode?: UltraOrchestrationMode;
   workerModel?: string | null;
   minLanes?: number;
   maxLanes?: number;
@@ -90,7 +92,7 @@ function invalid(field: string, detail: string): never {
  */
 export function validateUltraSessionOverrides(value: unknown): UltraSessionOverrides {
   if (!isRecord(value)) throw new Error('Session Ultra overrides must be an object.');
-  const allowed = new Set(['enabled', 'routingMode', 'workerModel', 'minLanes', 'maxLanes']);
+  const allowed = new Set(['enabled', 'routingMode', 'orchestrationMode', 'workerModel', 'minLanes', 'maxLanes']);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) throw new Error(boundedReason(`Unsupported session Ultra override field '${key}'.`));
   }
@@ -102,6 +104,10 @@ export function validateUltraSessionOverrides(value: unknown): UltraSessionOverr
   if (value.routingMode !== undefined) {
     if (value.routingMode !== 'uniform' && value.routingMode !== 'role-defaults') invalid('routingMode', "expected 'uniform' or 'role-defaults'.");
     out.routingMode = value.routingMode;
+  }
+  if (value.orchestrationMode !== undefined) {
+    if (value.orchestrationMode !== 'collaborator' && value.orchestrationMode !== 'manager') invalid('orchestrationMode', "expected 'collaborator' or 'manager'.");
+    out.orchestrationMode = value.orchestrationMode;
   }
   if (value.workerModel !== undefined) {
     if (value.workerModel === null) {
@@ -240,6 +246,7 @@ export function resolveEffectiveUltraSettings(
   if (patch) {
     if (patch.enabled !== undefined) merged.enabled = patch.enabled;
     if (patch.routingMode !== undefined) merged.routingMode = patch.routingMode;
+    if (patch.orchestrationMode !== undefined) merged.orchestrationMode = patch.orchestrationMode;
     if (patch.workerModel !== undefined) {
       if (patch.workerModel === null) delete merged.workerModel;
       else merged.workerModel = patch.workerModel;

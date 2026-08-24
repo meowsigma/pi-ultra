@@ -403,8 +403,9 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
       }
     };
 
-    const status = (ctx: ExtensionContext, value: 'on' | 'off' | 'blocked') => {
-      if (ctx.hasUI) ctx.ui.setStatus('ultra', `Ultra: ${value}`);
+    const status = (ctx: ExtensionContext, value: 'on' | 'off' | 'blocked', settings?: UltraSettings) => {
+      const mode = settings?.orchestrationMode ?? effective?.orchestrationMode ?? 'collaborator';
+      if (ctx.hasUI) ctx.ui.setStatus('ultra', value === 'on' ? `Ultra: ${mode}` : `Ultra: ${value}`);
     };
 
     const validateRevision = async (revision: string, _signal: AbortSignal): Promise<boolean> => {
@@ -491,7 +492,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
           guard.dispose();
           effective = resolved;
           effectiveRevisionValue = bindRevision(loaded.revision, stablePatchDigest(sessionPatch));
-          status(ctx, 'on');
+          status(ctx, 'on', resolved);
           return 'on';
         } catch (error) {
           next?.dispose();
@@ -694,6 +695,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
                 const record = isRecord(patch) ? patch : {};
                 if (record.enabled !== undefined) override.enabled = record.enabled === true;
                 if (record.routingMode !== undefined) override.routingMode = record.routingMode;
+                if (record.orchestrationMode !== undefined) override.orchestrationMode = record.orchestrationMode;
                 // Key presence, not value: an explicit undefined (menu
                 // Automatic) must override any inherited model, while an
                 // absent field keeps inheriting.

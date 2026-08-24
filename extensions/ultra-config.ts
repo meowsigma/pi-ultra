@@ -15,18 +15,21 @@ const LOCK_RETRY_MS = 50;
 const STALE_LOCK_MS = 30_000;
 export const MAX_MODEL_BYTES = 256;
 const MAX_REASON_LENGTH = 512;
-const ULTRA_FIELDS = new Set(['version', 'enabled', 'routingMode', 'workerModel', 'minLanes', 'maxLanes']);
+const ULTRA_FIELDS = new Set(['version', 'enabled', 'orchestrationMode', 'routingMode', 'workerModel', 'minLanes', 'maxLanes']);
 // Provider-qualified model id: 'provider/model' with no whitespace or control chars.
 // Exported so session-override validation accepts identical ids.
 export const MODEL_ID = /^[^\s\u0000-\u001f\u007f/]+\/[^\s\u0000-\u001f\u007f]+$/u;
 
 export type RoutingMode = 'uniform' | 'role-defaults';
+export type UltraOrchestrationMode = 'collaborator' | 'manager';
 export type UltraRole = (typeof ULTRA_ROLE_NAMES)[number];
 
 export interface UltraSettings {
   version: 1;
   enabled: boolean;
   routingMode: RoutingMode;
+  /** Always normalized; optional only to preserve source compatibility with older callers. */
+  orchestrationMode?: UltraOrchestrationMode;
   workerModel?: string;
   minLanes: number;
   maxLanes: number;
@@ -36,6 +39,7 @@ export const DEFAULT_ULTRA_SETTINGS: UltraSettings = {
   version: 1,
   enabled: true,
   routingMode: 'role-defaults',
+  orchestrationMode: 'collaborator',
   minLanes: 2,
   maxLanes: 4,
 };
@@ -125,6 +129,10 @@ export function normalizeUltraSettings(value: unknown): UltraSettings | undefine
   if (value.routingMode !== undefined) {
     if (value.routingMode !== 'uniform' && value.routingMode !== 'role-defaults') return undefined;
     out.routingMode = value.routingMode;
+  }
+  if (value.orchestrationMode !== undefined) {
+    if (value.orchestrationMode !== 'collaborator' && value.orchestrationMode !== 'manager') return undefined;
+    out.orchestrationMode = value.orchestrationMode;
   }
   if (value.workerModel !== undefined) {
     if (typeof value.workerModel !== 'string') return undefined;
@@ -260,6 +268,7 @@ function mergeOutput(existing: Record<string, unknown>, settings: UltraSettings)
   output.version = settings.version;
   output.enabled = settings.enabled;
   output.routingMode = settings.routingMode;
+  output.orchestrationMode = settings.orchestrationMode ?? 'collaborator';
   if (settings.workerModel !== undefined) output.workerModel = settings.workerModel;
   output.minLanes = settings.minLanes;
   output.maxLanes = settings.maxLanes;
