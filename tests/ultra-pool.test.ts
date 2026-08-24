@@ -46,6 +46,14 @@ test('resume permits are durable, exact-bound, idempotent, and one-use', () => {
   assert.throws(() => pool.consumeResumePermit({ ...intent, worker: { ...intent.worker, promptDigest: 'e'.repeat(64) } }), /exact/i);
   assert.equal(pool.consumeResumePermit(intent).state, 'consumed');
   assert.throws(() => pool.consumeResumePermit(intent), /consumed/i);
+  let expiredNow = 100;
+  const expiredLeasePool = createUltraPool({ append() {}, now: () => expiredNow });
+  expiredLeasePool.enqueue({ id: 'job', kind: 'read-only', objective: 'x', ownedPaths: [] });
+  expiredLeasePool.admitNext({ leaseId: 'lease', expiresAt: 101 });
+  expiredLeasePool.issueResumePermit({ ...intent, expiresAt: 200 });
+  expiredNow = 101;
+  expiredLeasePool.expireLeases();
+  assert.throws(() => expiredLeasePool.consumeResumePermit(intent), /active exact job lease/i);
   const restored = createUltraPool({ append: () => assert.fail('no append'), now: () => now });
   restored.restore(entries);
   assert.throws(() => restored.consumeResumePermit(intent), /consumed/i);

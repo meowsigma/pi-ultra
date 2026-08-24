@@ -113,6 +113,8 @@ export function createUltraPool(input: { append(data: UltraPoolEntry): void; now
     consumeResumePermit(inputPermit: { id: string; jobId: string; leaseId: string; targetRunId: string; requestDigest: string; worker: UltraPoolResumePermit['worker'] }) {
       const permit = resumePermits.get(inputPermit.id);
       if (!permit || permit.state !== 'issued') throw new Error('Resume permit is absent or already consumed.');
+      const lease = leases.get(permit.leaseId);
+      if (!lease || lease.state !== 'active' || lease.jobId !== permit.jobId) throw new Error('Resume permit requires an active exact job lease.');
       if (permit.expiresAt <= now()) { permit.state = 'expired'; permit.updatedAt = now(); persistResumePermit(permit); throw new Error('Resume permit expired.'); }
       if (permit.jobId !== inputPermit.jobId || permit.leaseId !== inputPermit.leaseId || permit.targetRunId !== inputPermit.targetRunId || permit.requestDigest !== inputPermit.requestDigest || JSON.stringify(permit.worker) !== JSON.stringify(inputPermit.worker)) throw new Error('Resume permit does not match the exact durable lease intent.');
       permit.state = 'consumed'; permit.updatedAt = now(); return persistResumePermit(permit);
