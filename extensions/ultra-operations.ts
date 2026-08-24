@@ -89,6 +89,10 @@ export interface UltraOperation {
   status: UltraOperationStatus;
   outbox: UltraOperationOutbox;
   actualLanes?: UltraActualLane[];
+  /** Exact read-only admission facts that bind a writer handoff to its source. */
+  writerBase?: { repositoryRoot: string; baseCommit: string };
+  /** Durable evidence that a validated worker patch was materialized elsewhere. */
+  handoffCandidate?: { manifestPath: string; candidatePath: string; createdAt: number };
   createdAt: number;
   updatedAt: number;
 }
@@ -310,6 +314,8 @@ function validSnapshot(value: unknown): value is UltraOperation {
   if (!['running', 'paused', 'completed', 'failed', 'stopped'].includes(String(value.status))) return false;
   if (!['none', 'ready', 'sent'].includes(String(value.outbox))) return false;
   if (value.repairCount !== 0 && value.repairCount !== 1) return false;
+  if (value.writerBase !== undefined && (!isRecord(value.writerBase) || typeof value.writerBase.repositoryRoot !== 'string' || typeof value.writerBase.baseCommit !== 'string')) return false;
+  if (value.handoffCandidate !== undefined && (!isRecord(value.handoffCandidate) || typeof value.handoffCandidate.manifestPath !== 'string' || typeof value.handoffCandidate.candidatePath !== 'string' || !Number.isSafeInteger(value.handoffCandidate.createdAt))) return false;
   return true;
 }
 
@@ -533,6 +539,7 @@ export function createUltraOperationStore(options: {
       receipt: unknown;
       repairOf?: string;
       repairReservationId?: string;
+      writerBase?: { repositoryRoot: string; baseCommit: string };
     }): UltraOperation {
       if (operations.has(input.operationId)) throw new Error(`Duplicate Ultra operation '${input.operationId}'.`);
       if (runToOperation.has(input.runId)) throw new Error(`Duplicate Ultra run '${input.runId}'.`);
@@ -558,11 +565,23 @@ export function createUltraOperationStore(options: {
         acceptance: input.acceptance.slice(0, 32).map((item) => item.slice(0, 2_048)),
         lanes: input.lanes.slice(0, 8).map((lane) => ({ ...lane, modelCandidates: [...lane.modelCandidates], ...(lane.ownedPaths ? { ownedPaths: [...lane.ownedPaths] } : {}) })),
         receipt: safeJsonClone(input.receipt, 'Ultra receipt'),
+        ...(input.writerBase ? { writerBase: { repositoryRoot: input.writerBase.repositoryRoot.slice(0, 4_096), baseCommit: input.writerBase.baseCommit.slice(0, 128) } } : {}),
         status: 'running',
         outbox: 'none',
         createdAt: timestamp,
         updatedAt: timestamp,
       };
+      return persist(operation);
+    },
+
+    recordMaterializedHandoff(operationId: string, input: { manifestPath: string; candidatePath: string }): UltraOperation {
+      const operation = operations.get(operationId);
+      if (!operation) throw new Error(`Ultra operation '${operationId}' was not found.`);
+      if (operation.status !== 'completed') throw new Error('A handoff candidate requires a completed writer operation.');
+      if (!operation.writerBase || !operation.lanes.some((lane) => lane.role === 'worker')) throw new Error('Only admitted writer operations may materialize a handoff candidate.');
+      if (operation.handoffCandidate) throw new Error(`Ultra operation '${operationId}' already has a materialized handoff candidate.`);
+      operation.handoffCandidate = { manifestPath: input.manifestPath.slice(0, 4_096), candidatePath: input.candidatePath.slice(0, 4_096), createdAt: now() };
+      operation.updatedAt = now();
       return persist(operation);
     },
 

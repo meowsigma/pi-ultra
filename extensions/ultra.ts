@@ -765,6 +765,9 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             acceptance: prepared.acceptance,
             lanes: operationLanes(prepared),
             receipt,
+            ...(admission.evidence?.repositoryRoot && admission.evidence.headCommit
+              ? { writerBase: { repositoryRoot: admission.evidence.repositoryRoot, baseCommit: admission.evidence.headCommit } }
+              : {}),
             ...(input.repairOf ? { repairOf: input.repairOf, repairReservationId } : {}),
           });
           const buffered = completionBuffer.get(runId);

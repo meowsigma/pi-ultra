@@ -102,6 +102,19 @@ test('treats paused as nonterminal, dedupes terminal events, and records actual 
   assert.equal(appended.length, count);
 });
 
+test('records a validated handoff candidate once for an admitted completed writer', () => {
+  const store = createUltraOperationStore({ append: () => undefined });
+  store.recordLaunch({
+    operationId: 'op-1', runId: 'run-1', objective: 'Implement parser.', acceptance: ['Run tests.'], lanes: [lane()], receipt: {},
+    writerBase: { repositoryRoot: '/repo', baseCommit: 'a'.repeat(40) },
+  });
+  assert.throws(() => store.recordMaterializedHandoff('op-1', { manifestPath: '/handoff.json', candidatePath: '/candidate' }), /completed/i);
+  store.applyCompletion({ runId: 'run-1', state: 'completed', results: [] });
+  const updated = store.recordMaterializedHandoff('op-1', { manifestPath: '/handoff.json', candidatePath: '/candidate' });
+  assert.deepEqual(updated.handoffCandidate, { manifestPath: '/handoff.json', candidatePath: '/candidate', createdAt: updated.handoffCandidate?.createdAt });
+  assert.throws(() => store.recordMaterializedHandoff('op-1', { manifestPath: '/other.json', candidatePath: '/other' }), /already/i);
+});
+
 test('retains a nested parallel handoff manifest path as durable completion evidence', () => {
   const store = createUltraOperationStore({ append: () => undefined });
   launch(store);
