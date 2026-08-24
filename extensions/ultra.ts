@@ -54,6 +54,7 @@ import {
 } from './ultra-manager-state.js';
 import { validateUltraParallelHandoff, type UltraValidatedParallelHandoff } from './ultra-handoff.js';
 import { materializeUltraCandidate } from './ultra-candidate.js';
+import { buildControlledResumeRequest } from './ultra-resume.js';
 import {
   appendSessionUltraOverrides,
   clearSessionUltraOverrides,
@@ -88,6 +89,10 @@ const MAX_DIAGNOSTIC_TEXT = 512;
 const execFile = promisify(execFileCallback);
 const MANAGER_SCOPE_SCHEMA = Type.Object({
   scopeId: Type.String({ minLength: 1, maxLength: 128 }),
+}, { additionalProperties: false });
+const CONTROLLED_RESUME_SCHEMA = Type.Object({
+  permitId: Type.String({ minLength: 1, maxLength: 128 }),
+  message: Type.String({ minLength: 1, maxLength: 16_384 }),
 }, { additionalProperties: false });
 const MANAGER_REVIEW_FINDINGS_SCHEMA = Type.Object({
   operationId: Type.String({ minLength: 1, maxLength: 128 }),
@@ -313,6 +318,34 @@ async function defaultAdmitWriterWave(input: Parameters<UltraExtensionDependenci
       mergeBase: async (_cwd, one, two) => git(['merge-base', one, two]),
       worktreeStatus: async () => (await execFile('git', ['-C', input.cwd, 'status', '--porcelain=v1', '--untracked-files=all'], { encoding: 'utf8', maxBuffer: 256 * 1024 })).stdout,
     },
+  });
+}
+
+async function controlledResumeDigest(params: Record<string, unknown>): Promise<string> {
+  const authority = await import(AUTHORITY_MODULE) as { digestSubagentLaunchRequest(value: Record<string, unknown>, domain?: string): string };
+  return authority.digestSubagentLaunchRequest(params, 'rpc.resume');
+}
+
+async function requestControlledResume(events: ExtensionAPI['events'], params: { id: string; message: string }, token: string): Promise<unknown> {
+  const requestId = randomUUID();
+  const reply = subagentRpcReply(requestId);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const dispose = events.on(reply, (payload) => {
+      if (!isRecord(payload) || payload.requestId !== requestId || settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (typeof dispose === 'function') dispose();
+      if (payload.success === true) resolve(payload.data);
+      else reject(new Error(isRecord(payload.error) && typeof payload.error.message === 'string' ? payload.error.message : 'Controlled resume RPC failed.'));
+    });
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      if (typeof dispose === 'function') dispose();
+      reject(new Error('Controlled resume RPC timed out.'));
+    }, 5_000);
+    events.emit(SUBAGENT_RPC_REQUEST, { version: 1, requestId, method: 'resume', params, authorization: { launchPermits: [token] }, source: { extension: 'pi-ultra' } });
   });
 }
 
@@ -670,6 +703,36 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
       timer.unref?.();
       timers.add(timer);
     };
+
+    pi.registerTool({
+      name: 'ultra_resume_worker',
+      label: 'Ultra Resume Retained Worker',
+      description: 'Consume one durable, exact-bound lease permit to resume a retained worker through controlled RPC.',
+      promptSnippet: 'Resume only the exact retained worker bound to a durable Active Pool permit; generic resume remains denied.',
+      executionMode: 'sequential', parameters: CONTROLLED_RESUME_SCHEMA,
+      async execute(_id, params) {
+        if (!policy?.operational || !policy.authority || !effectiveRevisionValue) return toolError('Ultra controlled resume is unavailable because launch authority is not synchronized.');
+        const permitId = isRecord(params) && typeof params.permitId === 'string' ? params.permitId : undefined;
+        const message = isRecord(params) && typeof params.message === 'string' ? params.message : undefined;
+        const durable = permitId ? pool.getResumePermit(permitId) : undefined;
+        if (!durable || !message) return toolError('Controlled resume requires an issued durable pool permit and message.');
+        try {
+          const request = buildControlledResumeRequest(durable, message, (_value, domain) => {
+            if (domain !== 'rpc.resume') throw new Error('Unexpected resume authority domain.');
+            return durable.requestDigest;
+          });
+          // buildControlledResumeRequest intentionally checks the digest before
+          // issuance; use the fork canonicalizer, never JSON.stringify.
+          const digest = await controlledResumeDigest({ id: durable.targetRunId, message: message.trim() });
+          if (digest !== durable.requestDigest) return toolError('Controlled resume request does not match the durable permit.');
+          const authorityLane = request.authorityLane;
+          const token = policy.authority.issueOnce({ configRevision: effectiveRevisionValue, expiresInMs: 5_000, requestDigest: digest, minLanes: 1, maxLanes: 1, lanes: [authorityLane] });
+          pool.consumeResumePermit(durable);
+          const receipt = await requestControlledResume(pi.events, { id: durable.targetRunId, message: message.trim() }, token);
+          return { content: [{ type: 'text' as const, text: `Controlled resume requested for retained run ${durable.targetRunId}. Receipt is evidence only.` }], details: { kind: 'controlled-resume', permitId: durable.id, runId: durable.targetRunId, receipt } };
+        } catch (error) { return toolError(`Controlled resume failed closed: ${boundedMessage(error)}`); }
+      },
+    });
 
     pi.registerTool({
       name: 'ultra_pool_status',
@@ -1131,7 +1194,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
         return { block: true, reason: 'Ultra governs new subagent launches. Use ultra_delegate for one exact authorized wave, or let the main model take over directly.' };
       }
       if (!effective?.enabled || effective.orchestrationMode !== 'manager' || !policy?.operational) return;
-      if (event.toolName === 'ultra_begin_scope' || event.toolName === 'ultra_takeover' || event.toolName === 'ultra_delegate' || event.toolName === 'ultra_pool_status' || event.toolName === 'ultra_materialize_handoff' || event.toolName === 'ultra_review_candidate' || event.toolName === 'ultra_record_review_findings' || event.toolName === 'ultra_dispose_handoff' || MANAGER_READ_ONLY_TOOLS.has(event.toolName)) return;
+      if (event.toolName === 'ultra_begin_scope' || event.toolName === 'ultra_takeover' || event.toolName === 'ultra_delegate' || event.toolName === 'ultra_pool_status' || event.toolName === 'ultra_resume_worker' || event.toolName === 'ultra_materialize_handoff' || event.toolName === 'ultra_review_candidate' || event.toolName === 'ultra_record_review_findings' || event.toolName === 'ultra_dispose_handoff' || MANAGER_READ_ONLY_TOOLS.has(event.toolName)) return;
       // There is no sound heuristic for shell/custom-tool mutability. Unknown
       // tools are therefore denied until a durable takeover matches this turn.
       const scopeId = currentManagerScopeId;
