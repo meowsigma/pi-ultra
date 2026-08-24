@@ -1,8 +1,13 @@
+import { createHash } from 'node:crypto';
+
 export const ULTRA_OPERATION_ENTRY = 'ultra.operation.v1' as const;
 const MAX_OPERATIONS = 256;
 const MAX_ENTRY_BYTES = 131_072;
 const MAX_RESULTS = 64;
 const MAX_CHANGED_PATHS = 128;
+const MAX_LAUNCH_ATTEMPTS = 512;
+const MAX_IDEMPOTENCY_KEY_CHARS = 256;
+const MAX_FAILURE_REASON_CHARS = 2_048;
 
 export type UltraOperationStatus = 'running' | 'paused' | 'completed' | 'failed' | 'stopped';
 export type UltraOperationOutbox = 'none' | 'ready' | 'sent';
@@ -41,7 +46,34 @@ export interface UltraRepairReservation {
   updatedAt: number;
 }
 
-export type UltraOperationEntry = UltraOperation | UltraRepairReservation;
+/**
+ * Durable launch-attempt lifecycle.
+ *
+ * - 'queued': durably recorded BEFORE any permit is issued or child spawned.
+ * - 'admitted': permit granted; last durable write BEFORE spawn confirmation.
+ *   An attempt found here (especially after restore/replay) is ambiguous: the
+ *   child may or may not exist, so it must be inspected, never auto-relaunched.
+ * - 'launched': child spawn confirmed by the runtime.
+ * - 'failed-pre-spawn': deterministically failed before any child could spawn,
+ *   so a retry under a NEW idempotency key is safe. Terminal.
+ */
+export type UltraLaunchAttemptState = 'queued' | 'admitted' | 'launched' | 'failed-pre-spawn';
+
+export interface UltraLaunchAttempt {
+  version: 1;
+  kind: 'launch-attempt';
+  idempotencyKey: string;
+  operationId: string;
+  runId: string;
+  lanes: UltraOperationLane[];
+  receipt: unknown;
+  state: UltraLaunchAttemptState;
+  reason?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type UltraOperationEntry = UltraOperation | UltraRepairReservation | UltraLaunchAttempt;
 
 export interface UltraOperation {
   version: 1;
@@ -89,6 +121,31 @@ function operationClone(operation: UltraOperation): UltraOperation {
   return safeJsonClone(operation, 'Ultra operation');
 }
 
+function attemptClone(attempt: UltraLaunchAttempt): UltraLaunchAttempt {
+  return safeJsonClone(attempt, 'Ultra launch attempt');
+}
+
+/**
+ * Derives a deterministic idempotency key for a launch attempt from stable
+ * intent inputs. Identical inputs always produce the identical key across
+ * restarts and processes, so crash-recovery can look up whether an attempt was
+ * already durably recorded instead of blindly launching again.
+ */
+export function ultraLaunchIdempotencyKey(input: {
+  operationId: string;
+  runId?: string;
+  laneId?: string;
+  attemptIndex?: number;
+}): string {
+  const parts = [
+    String(input.operationId ?? ''),
+    String(input.runId ?? ''),
+    String(input.laneId ?? ''),
+    String(input.attemptIndex ?? 0),
+  ];
+  return `ula1:${createHash('sha256').update(parts.join('\u001f'), 'utf8').digest('hex')}`;
+}
+
 function terminalStatus(value: unknown): UltraOperationStatus | undefined {
   if (value === 'complete' || value === 'completed' || value === 'success') return 'completed';
   if (value === 'failed' || value === 'error' || value === 'cancelled') return 'failed';
@@ -102,9 +159,11 @@ function stateFromPayload(payload: Record<string, unknown>): unknown {
 
 function normalizePath(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
+  // Preserve escaping/absolute reports as evidence: actualForLane will mark
+  // them outside the owned path rather than silently erasing an authority
+  // violation from the audit record.
   const path = value.trim().replace(/\\/gu, '/').replace(/^\.\//u, '');
-  if (!path || path.startsWith('/') || path.startsWith('../') || path.includes('/../')) return undefined;
-  return path;
+  return path || undefined;
 }
 
 function collectArtifactPaths(result: Record<string, unknown>): string[] {
@@ -218,10 +277,28 @@ function validReservation(value: unknown): value is UltraRepairReservation {
     && (value.state === 'reserved' || value.state === 'released' || value.state === 'consumed');
 }
 
+function validLaunchAttempt(value: unknown): value is UltraLaunchAttempt {
+  return isRecord(value)
+    && value.version === 1
+    && value.kind === 'launch-attempt'
+    && typeof value.idempotencyKey === 'string'
+    && typeof value.operationId === 'string'
+    && typeof value.runId === 'string'
+    && Array.isArray(value.lanes)
+    && ['queued', 'admitted', 'launched', 'failed-pre-spawn'].includes(String(value.state));
+}
+
 function validSnapshot(value: unknown): value is UltraOperation {
   if (!isRecord(value) || value.version !== 1) return false;
-  if (typeof value.operationId !== 'string' || typeof value.rootOperationId !== 'string' || typeof value.runId !== 'string') return false;
-  if (!Array.isArray(value.lanes) || !Array.isArray(value.acceptance)) return false;
+  if (typeof value.operationId !== 'string' || typeof value.rootOperationId !== 'string' || typeof value.runId !== 'string' || typeof value.objective !== 'string') return false;
+  if (!Array.isArray(value.lanes) || !Array.isArray(value.acceptance) || !value.acceptance.every((item) => typeof item === 'string')) return false;
+  if (!value.lanes.every((lane) => isRecord(lane)
+    && typeof lane.id === 'string'
+    && (lane.role === 'scout' || lane.role === 'worker' || lane.role === 'reviewer')
+    && typeof lane.agent === 'string'
+    && Array.isArray(lane.modelCandidates) && lane.modelCandidates.every((model) => typeof model === 'string')
+    && typeof lane.launchContractDigest === 'string'
+    && (lane.ownedPaths === undefined || Array.isArray(lane.ownedPaths) && lane.ownedPaths.every((path) => typeof path === 'string')))) return false;
   if (!['running', 'paused', 'completed', 'failed', 'stopped'].includes(String(value.status))) return false;
   if (!['none', 'ready', 'sent'].includes(String(value.outbox))) return false;
   if (value.repairCount !== 0 && value.repairCount !== 1) return false;
@@ -234,6 +311,7 @@ export function createUltraOperationStore(options: {
 }) {
   const operations = new Map<string, UltraOperation>();
   const reservations = new Map<string, UltraRepairReservation>();
+  const launchAttempts = new Map<string, UltraLaunchAttempt>();
   const runToOperation = new Map<string, string>();
   const now = options.now ?? Date.now;
 
@@ -252,10 +330,38 @@ export function createUltraOperationStore(options: {
     return safeJsonClone(snapshot, 'Ultra repair reservation');
   };
 
+  const persistAttempt = (attempt: UltraLaunchAttempt): UltraLaunchAttempt => {
+    const snapshot = attemptClone(attempt);
+    launchAttempts.set(snapshot.idempotencyKey, snapshot);
+    options.append(attemptClone(snapshot));
+    return attemptClone(snapshot);
+  };
+
+  const transitionAttempt = (
+    rawIdempotencyKey: unknown,
+    allowedFrom: readonly UltraLaunchAttemptState[],
+    state: UltraLaunchAttemptState,
+    decorate?: (attempt: UltraLaunchAttempt) => Partial<UltraLaunchAttempt>,
+  ): UltraLaunchAttempt => {
+    const key = typeof rawIdempotencyKey === 'string' ? rawIdempotencyKey : '';
+    const attempt = launchAttempts.get(key);
+    if (!attempt) throw new Error(`Ultra launch attempt '${String(rawIdempotencyKey).slice(0, 128)}' was not found.`);
+    if (attempt.state !== state && !allowedFrom.includes(attempt.state)) {
+      throw new Error(`Ultra launch attempt '${key}' cannot move from '${attempt.state}' to '${state}'.`);
+    }
+    // Repeating an already-recorded transition is an at-least-once no-op.
+    if (attempt.state === state) return attemptClone(attempt);
+    attempt.state = state;
+    attempt.updatedAt = now();
+    if (decorate) Object.assign(attempt, decorate(attempt));
+    return persistAttempt(attempt);
+  };
+
   const api = {
     restore(entries: readonly unknown[]): void {
       operations.clear();
       reservations.clear();
+      launchAttempts.clear();
       runToOperation.clear();
       for (const entry of entries.slice(-10_000)) {
         if (!isRecord(entry) || entry.type !== 'custom' || entry.customType !== ULTRA_OPERATION_ENTRY) continue;
@@ -263,6 +369,15 @@ export function createUltraOperationStore(options: {
           if (validReservation(entry.data)) {
             const reservation = safeJsonClone(entry.data, 'Ultra repair reservation');
             reservations.set(reservation.reservationId, reservation);
+            continue;
+          }
+          if (validLaunchAttempt(entry.data)) {
+            const attempt = attemptClone(entry.data);
+            launchAttempts.set(attempt.idempotencyKey, attempt);
+            if (launchAttempts.size > MAX_LAUNCH_ATTEMPTS) {
+              const oldest = launchAttempts.keys().next().value as string | undefined;
+              if (oldest) launchAttempts.delete(oldest);
+            }
             continue;
           }
           if (!validSnapshot(entry.data)) continue;
@@ -321,6 +436,84 @@ export function createUltraOperationStore(options: {
       reservation.state = 'released';
       reservation.updatedAt = now();
       return persistReservation(reservation);
+    },
+
+    // --- Durable launch-attempt state (pre-spawn crash boundary) ---
+
+    /**
+     * Durably records a 'queued' attempt. Integration must call this BEFORE
+     * issuing the permit/spawning so every launch has an on-disk record first.
+     * Repeating the same idempotency key returns the stored attempt unchanged
+     * (no duplicate append); conflicting reuse of a key is rejected.
+     */
+    recordQueuedLaunch(input: {
+      idempotencyKey: string;
+      operationId: string;
+      runId: string;
+      lanes: UltraOperationLane[];
+      receipt?: unknown;
+    }): UltraLaunchAttempt {
+      const key = typeof input.idempotencyKey === 'string' ? input.idempotencyKey.trim() : '';
+      if (!key || key.length > MAX_IDEMPOTENCY_KEY_CHARS) {
+        throw new Error(`Ultra launch idempotency key must be a non-empty string of at most ${MAX_IDEMPOTENCY_KEY_CHARS} characters.`);
+      }
+      if (typeof input.operationId !== 'string' || !input.operationId || typeof input.runId !== 'string' || !input.runId) {
+        throw new Error('Ultra launch attempt requires non-empty operationId and runId strings.');
+      }
+      const existing = launchAttempts.get(key);
+      if (existing) {
+        if (existing.operationId !== input.operationId || existing.runId !== input.runId) {
+          throw new Error(`Ultra launch idempotency key '${key}' already belongs to operation '${existing.operationId}' run '${existing.runId}'; conflicting reuse is rejected.`);
+        }
+        return attemptClone(existing);
+      }
+      const timestamp = now();
+      return persistAttempt({
+        version: 1,
+        kind: 'launch-attempt',
+        idempotencyKey: key,
+        operationId: input.operationId,
+        runId: input.runId,
+        lanes: input.lanes.slice(0, 8).map((lane) => ({ ...lane, modelCandidates: [...lane.modelCandidates], ...(lane.ownedPaths ? { ownedPaths: [...lane.ownedPaths] } : {}) })),
+        receipt: safeJsonClone(input.receipt ?? null, 'Ultra launch receipt'),
+        state: 'queued',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      });
+    },
+
+    markLaunchAdmitted(idempotencyKey: string): UltraLaunchAttempt {
+      return transitionAttempt(idempotencyKey, ['queued'], 'admitted');
+    },
+
+    markLaunched(idempotencyKey: string): UltraLaunchAttempt {
+      return transitionAttempt(idempotencyKey, ['admitted'], 'launched');
+    },
+
+    markFailedPreSpawn(idempotencyKey: string, reason: string): UltraLaunchAttempt {
+      const text = typeof reason === 'string' ? reason.trim() : '';
+      if (!text) throw new Error('Ultra pre-spawn failure requires a non-empty reason.');
+      return transitionAttempt(idempotencyKey, ['queued', 'admitted'], 'failed-pre-spawn', (attempt) => ({ ...attempt, reason: text.slice(0, MAX_FAILURE_REASON_CHARS) }));
+    },
+
+    getLaunchAttempt(idempotencyKey: string): UltraLaunchAttempt | undefined {
+      const attempt = launchAttempts.get(idempotencyKey);
+      return attempt ? attemptClone(attempt) : undefined;
+    },
+
+    listLaunchAttempts(): UltraLaunchAttempt[] {
+      return [...launchAttempts.values()].map(attemptClone);
+    },
+
+    /**
+     * Attempts still in 'admitted' sit in the pre-spawn ambiguity window: the
+     * durable log says admitted but spawn confirmation ('launched') was never
+     * recorded. Callers must inspect these (session files, receipts) and settle
+     * them explicitly via markLaunched/markFailedPreSpawn; the store never
+     * relaunches them implicitly.
+     */
+    ambiguousAdmittedLaunches(): UltraLaunchAttempt[] {
+      return [...launchAttempts.values()].filter((attempt) => attempt.state === 'admitted').map(attemptClone);
     },
 
     recordLaunch(input: {

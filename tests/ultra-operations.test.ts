@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   ULTRA_OPERATION_ENTRY,
   createUltraOperationStore,
+  ultraLaunchIdempotencyKey,
   type UltraOperationLane,
 } from '../extensions/ultra-operations.js';
 
@@ -101,6 +102,18 @@ test('treats paused as nonterminal, dedupes terminal events, and records actual 
   assert.equal(appended.length, count);
 });
 
+test('retains escaping changed paths as ownership mismatches instead of dropping their evidence', () => {
+  const store = createUltraOperationStore({ append: () => undefined });
+  launch(store);
+  const terminal = store.applyCompletion({
+    runId: 'run-1', state: 'complete',
+    results: [{ workflowKey: 'worker-a', agent: 'ultra-worker', model: 'openai/test', launchContractDigest: 'a'.repeat(64), authorityLaunchContractDigest: 'a'.repeat(64), changedFiles: ['/etc/cron.d/x', '../secrets'] }],
+  });
+  assert.ok(terminal);
+  assert.deepEqual(terminal.operation.actualLanes?.[0]?.changedFiles, ['/etc/cron.d/x', '../secrets']);
+  assert.match(terminal.operation.actualLanes?.[0]?.mismatches.join('\n') ?? '', /outside owned paths/);
+});
+
 test('accepts role-default fallback only inside the exact candidate list', () => {
   const store = createUltraOperationStore({ append: () => undefined });
   store.recordLaunch({
@@ -160,13 +173,149 @@ test('never positionally reuses keyed partial results for a missing lane', () =>
   assert.equal(terminal.operation.actualLanes?.[1]?.agent, 'ultra-worker');
 });
 
-test('bounds malformed restore entries and unknown completions', () => {
+test('rejects malformed restored snapshots before ready outbox rendering and unknown completions', () => {
   const store = createUltraOperationStore({ append: () => undefined });
   store.restore([
     { type: 'custom', customType: ULTRA_OPERATION_ENTRY, data: { version: 999, operationId: 'bad' } },
+    { type: 'custom', customType: ULTRA_OPERATION_ENTRY, data: {
+      version: 1, operationId: 'corrupt', rootOperationId: 'corrupt', runId: 'corrupt-run', objective: 'x',
+      acceptance: [42], lanes: [{}], receipt: {}, status: 'failed', outbox: 'ready', repairCount: 0,
+      createdAt: 1, updatedAt: 1,
+    } },
     { type: 'custom', customType: 'other', data: { version: 1 } },
     { type: 'custom', customType: ULTRA_OPERATION_ENTRY, data: 'not-object' },
   ]);
   assert.deepEqual(store.list(), []);
+  assert.deepEqual(store.pendingOutbox(), []);
   assert.equal(store.applyCompletion({ runId: 'unknown', state: 'complete' }), undefined);
+});
+
+test('persists a queued launch attempt before permit issue, then admits and launches through the append log', () => {
+  const entries: any[] = [];
+  const store = createUltraOperationStore({ append: (data) => entries.push({ type: 'custom', customType: ULTRA_OPERATION_ENTRY, data }), now: () => entries.length + 1 });
+  const key = ultraLaunchIdempotencyKey({ operationId: 'op-1', laneId: 'worker-a', attemptIndex: 0 });
+  const queued = store.recordQueuedLaunch({ idempotencyKey: key, operationId: 'op-1', runId: 'run-1', lanes: [lane()], receipt: { details: { runId: 'run-1' } } });
+
+  assert.equal(queued.state, 'queued');
+  assert.equal(queued.operationId, 'op-1');
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].customType, ULTRA_OPERATION_ENTRY);
+  assert.equal(entries[0].data.kind, 'launch-attempt');
+  assert.equal(entries[0].data.state, 'queued');
+
+  const admitted = store.markLaunchAdmitted(key);
+  assert.equal(admitted.state, 'admitted');
+  const launched = store.markLaunched(key);
+  assert.equal(launched.state, 'launched');
+  assert.equal(store.getLaunchAttempt(key)?.state, 'launched');
+  assert.deepEqual(JSON.parse(JSON.stringify(entries.map((entry) => entry.data.state))), ['queued', 'admitted', 'launched']);
+
+  // Terminal states are immutable; repeats of an already-recorded transition stay at-least-once safe.
+  assert.deepEqual(store.markLaunched(key), launched);
+  assert.equal(entries.length, 3);
+  assert.throws(() => store.markLaunchAdmitted(key), /cannot move/i);
+  assert.throws(() => store.markFailedPreSpawn(key, 'late failure'), /cannot move/i);
+});
+
+test('derives deterministic idempotency keys and dedupes duplicate queue requests without appending', () => {
+  const input = { operationId: 'op-1', runId: 'run-1', laneId: 'worker-a', attemptIndex: 2 };
+  assert.equal(ultraLaunchIdempotencyKey(input), ultraLaunchIdempotencyKey({ ...input }));
+  assert.notEqual(ultraLaunchIdempotencyKey(input), ultraLaunchIdempotencyKey({ ...input, attemptIndex: 3 }));
+  assert.notEqual(ultraLaunchIdempotencyKey(input), ultraLaunchIdempotencyKey({ ...input, laneId: 'worker-b' }));
+  assert.notEqual(ultraLaunchIdempotencyKey(input), ultraLaunchIdempotencyKey({ operationId: 'op-2', runId: 'run-1', laneId: 'worker-a', attemptIndex: 2 }));
+
+  const appended: any[] = [];
+  const store = createUltraOperationStore({ append: (data) => appended.push(data), now: () => 1 });
+  const key = ultraLaunchIdempotencyKey(input);
+  const first = store.recordQueuedLaunch({ idempotencyKey: key, operationId: 'op-1', runId: 'run-1', lanes: [lane()], receipt: {} });
+  const second = store.recordQueuedLaunch({ idempotencyKey: key, operationId: 'op-1', runId: 'run-1', lanes: [lane()], receipt: {} });
+  assert.deepEqual(second, first);
+  assert.equal(appended.length, 1);
+  assert.equal(store.listLaunchAttempts().length, 1);
+  assert.throws(
+    () => store.recordQueuedLaunch({ idempotencyKey: key, operationId: 'other-op', runId: 'run-1', lanes: [lane()], receipt: {} }),
+    /already belongs|conflict/i,
+  );
+});
+
+test('records failed-pre-spawn from queued or admitted and keeps the failure durable across reload', () => {
+  const entries: any[] = [];
+  const store = createUltraOperationStore({ append: (data) => entries.push({ type: 'custom', customType: ULTRA_OPERATION_ENTRY, data }), now: () => 5 });
+  const queuedKey = ultraLaunchIdempotencyKey({ operationId: 'op-a', attemptIndex: 0 });
+  store.recordQueuedLaunch({ idempotencyKey: queuedKey, operationId: 'op-a', runId: 'run-a', lanes: [lane()], receipt: {} });
+
+  const failedQueued = store.markFailedPreSpawn(queuedKey, 'permit denied before spawn');
+  assert.equal(failedQueued.state, 'failed-pre-spawn');
+  assert.equal(failedQueued.reason, 'permit denied before spawn');
+
+  const admittedKey = ultraLaunchIdempotencyKey({ operationId: 'op-b', attemptIndex: 0 });
+  store.recordQueuedLaunch({ idempotencyKey: admittedKey, operationId: 'op-b', runId: 'run-b', lanes: [lane()], receipt: {} });
+  store.markLaunchAdmitted(admittedKey);
+  const failedAdmitted = store.markFailedPreSpawn(admittedKey, new Array(3_000).fill('x').join(''));
+  assert.equal(failedAdmitted.state, 'failed-pre-spawn');
+  assert.equal(failedAdmitted.reason?.length, 2_048);
+
+  assert.throws(() => store.markFailedPreSpawn(queuedKey, ''), /non-empty reason/i);
+
+  const restored = createUltraOperationStore({ append: () => undefined, now: () => 6 });
+  restored.restore(entries);
+  assert.equal(restored.getLaunchAttempt(queuedKey)?.state, 'failed-pre-spawn');
+  assert.equal(restored.getLaunchAttempt(queuedKey)?.reason, 'permit denied before spawn');
+  assert.equal(restored.getLaunchAttempt(admittedKey)?.reason?.length, 2_048);
+});
+
+test('replays the append log and surfaces ambiguous admitted launches instead of relaunching them', () => {
+  const entries: any[] = [];
+  const store = createUltraOperationStore({ append: (data) => entries.push({ type: 'custom', customType: ULTRA_OPERATION_ENTRY, data }) });
+  const crashedKey = ultraLaunchIdempotencyKey({ operationId: 'op-crash', laneId: 'worker-a' });
+  const launchedKey = ultraLaunchIdempotencyKey({ operationId: 'op-ok', laneId: 'worker-a' });
+  const failedKey = ultraLaunchIdempotencyKey({ operationId: 'op-bad', laneId: 'worker-a' });
+  store.recordQueuedLaunch({ idempotencyKey: crashedKey, operationId: 'op-crash', runId: 'run-crash', lanes: [lane()], receipt: {} });
+  store.recordQueuedLaunch({ idempotencyKey: launchedKey, operationId: 'op-ok', runId: 'run-ok', lanes: [lane()], receipt: {} });
+  store.recordQueuedLaunch({ idempotencyKey: failedKey, operationId: 'op-bad', runId: 'run-bad', lanes: [lane()], receipt: {} });
+  store.markLaunchAdmitted(crashedKey);
+  store.markLaunchAdmitted(launchedKey);
+  store.markLaunchAdmitted(failedKey);
+  store.markLaunched(launchedKey);
+  store.markFailedPreSpawn(failedKey, 'spawn rejected');
+
+  // Crash before confirmation: replaying the durable log leaves exactly the
+  // admitted-only attempt in the ambiguous window.
+  const recovered = createUltraOperationStore({ append: () => undefined });
+  recovered.restore(entries);
+  assert.deepEqual(recovered.ambiguousAdmittedLaunches().map((attempt) => attempt.idempotencyKey), [crashedKey]);
+  assert.equal(recovered.getLaunchAttempt(launchedKey)?.state, 'launched');
+  assert.equal(recovered.getLaunchAttempt(failedKey)?.state, 'failed-pre-spawn');
+
+  // Recovery resolves the ambiguity explicitly; relaunch decisions stay outside the store.
+  const settled = recovered.markFailedPreSpawn(crashedKey, 'post-crash inspection found no child session');
+  assert.equal(settled.state, 'failed-pre-spawn');
+  assert.deepEqual(recovered.ambiguousAdmittedLaunches(), []);
+});
+
+test('guards launch-attempt transitions, JSON safety, and malformed restore entries', () => {
+  const store = createUltraOperationStore({ append: () => undefined });
+  assert.throws(() => store.markLaunched(ultraLaunchIdempotencyKey({ operationId: 'ghost' })), /not found/i);
+  assert.throws(() => store.markLaunchAdmitted('missing-key'), /not found/i);
+  assert.throws(
+    () => store.recordQueuedLaunch({ idempotencyKey: '', operationId: 'op', runId: 'run', lanes: [], receipt: {} }),
+    /idempotency key/i,
+  );
+  assert.throws(
+    () => store.recordQueuedLaunch({ idempotencyKey: 'k', operationId: '', runId: '', lanes: [], receipt: {} }),
+    /operationId and runId/i,
+  );
+  assert.throws(
+    () => store.recordQueuedLaunch({ idempotencyKey: 'k-json', operationId: 'op', runId: 'run', lanes: [], receipt: { bad: 1n } }),
+    /JSON-safe/i,
+  );
+
+  const restored = createUltraOperationStore({ append: () => undefined });
+  restored.restore([
+    { type: 'custom', customType: ULTRA_OPERATION_ENTRY, data: { version: 1, kind: 'launch-attempt', idempotencyKey: 'bad', operationId: 'op', runId: 'run', lanes: [], state: 'teleported' } },
+    { type: 'custom', customType: ULTRA_OPERATION_ENTRY, data: 'junk' },
+    { type: 'custom', customType: ULTRA_OPERATION_ENTRY, data: { version: 1, kind: 'launch-attempt', idempotencyKey: 'good', operationId: 'op', runId: 'run', lanes: [], receipt: null, state: 'queued', createdAt: 1, updatedAt: 1 } },
+  ]);
+  assert.equal(restored.listLaunchAttempts().length, 1);
+  assert.equal(restored.getLaunchAttempt('good')?.state, 'queued');
 });
