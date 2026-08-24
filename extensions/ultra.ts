@@ -29,6 +29,7 @@ import {
   type PrepareUltraWaveInput,
   type UltraCapabilityCeiling,
   type UltraDelegateInput,
+  type UltraDelegateLane,
   type UltraLaunchAuthorityHandle,
   type UltraPreparedWave,
 } from './ultra-protocol.js';
@@ -86,6 +87,16 @@ const MAX_DIAGNOSTIC_TEXT = 512;
 const execFile = promisify(execFileCallback);
 const MANAGER_SCOPE_SCHEMA = Type.Object({
   scopeId: Type.String({ minLength: 1, maxLength: 128 }),
+}, { additionalProperties: false });
+const MANAGER_REVIEW_CANDIDATE_SCHEMA = Type.Object({
+  operationId: Type.String({ minLength: 1, maxLength: 128 }),
+  lanes: Type.Array(Type.Object({
+    id: Type.String({ minLength: 1, maxLength: 48 }),
+    role: Type.Literal('reviewer'),
+    task: Type.String({ minLength: 1, maxLength: 16_384 }),
+    deliverable: Type.String({ minLength: 1, maxLength: 2_048 }),
+  }, { additionalProperties: false }), { minItems: 1, maxItems: 100 }),
+  acceptance: Type.Array(Type.String({ minLength: 1, maxLength: 2_048 }), { minItems: 1, maxItems: 32 }),
 }, { additionalProperties: false });
 const MANAGER_MATERIALIZE_HANDOFF_SCHEMA = Type.Object({
   operationId: Type.String({ minLength: 1, maxLength: 128 }),
@@ -694,6 +705,42 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
     });
 
     pi.registerTool({
+      name: 'ultra_review_candidate',
+      label: 'Ultra Review Handoff Candidate',
+      description: 'Launch a separately preflighted read-only reviewer wave against a materialized candidate.',
+      promptSnippet: 'Review a materialized candidate with an independent, read-only reviewer wave before disposition.',
+      executionMode: 'sequential',
+      parameters: MANAGER_REVIEW_CANDIDATE_SCHEMA,
+      async execute(_toolCallId, params, toolSignal, _onUpdate, ctx) {
+        if (!effective || effective.orchestrationMode !== 'manager' || !effectiveRevisionValue || !policy?.operational || !policy.authority) return toolError('Ultra Manager mode is not active and synchronized.');
+        const operationId = isRecord(params) && typeof params.operationId === 'string' ? params.operationId : undefined;
+        const lanes = isRecord(params) && Array.isArray(params.lanes) ? params.lanes as UltraDelegateLane[] : undefined;
+        const acceptance = isRecord(params) && Array.isArray(params.acceptance) ? params.acceptance as string[] : undefined;
+        const operation = operationId ? operations.get(operationId) : undefined;
+        if (!operation?.handoffCandidate || !lanes || !acceptance) return toolError('Candidate review requires a materialized writer operation, reviewer lanes, and acceptance checks.');
+        try {
+          const prepared = await dependencies.prepareWave({
+            input: { objective: `Review materialized candidate for: ${operation.objective}`, lanes, acceptance },
+            settings: effective,
+            cwd: operation.handoffCandidate.candidatePath,
+            sessionId: sessionIdentity(ctx), revision: effectiveRevisionValue,
+            availableModels: ctx.modelRegistry.getAvailable().map((model) => ({ provider: model.provider, id: model.id, fullId: `${model.provider}/${model.id}`, reasoning: model.reasoning })),
+            parentModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
+            capabilityCeiling: policy.capabilityCeiling, events: pi.events,
+          });
+          if (prepared.lanes.some((lane) => lane.lane.role !== 'reviewer')) return toolError('Candidate review permits reviewer lanes only.');
+          const receipt = await dependencies.launchWave({ events: pi.events, authority: policy.authority, prepared, signal: toolSignal });
+          const reviewerRunId = receiptRunId(receipt);
+          if (!reviewerRunId) return toolError('Reviewer launch receipt could not be correlated. Do not relaunch; inspect subagent status.');
+          operations.beginReviewer(operation.operationId, reviewerRunId);
+          return { content: [{ type: 'text' as const, text: `Ultra reviewer wave ${reviewerRunId} is running against candidate ${operation.handoffCandidate.candidatePath}. Record its findings before any manager disposition.` }], details: { kind: 'reviewer-receipt', operationId, reviewerRunId, candidatePath: operation.handoffCandidate.candidatePath } };
+        } catch (error) {
+          return toolError(`Ultra candidate review failed closed: ${boundedMessage(error)}`);
+        }
+      },
+    });
+
+    pi.registerTool({
       name: 'ultra_materialize_handoff',
       label: 'Ultra Materialize Handoff Candidate',
       description: 'Validate a completed writer handoff and apply its patches only in a new candidate checkout.',
@@ -1013,7 +1060,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
         return { block: true, reason: 'Ultra governs new subagent launches. Use ultra_delegate for one exact authorized wave, or let the main model take over directly.' };
       }
       if (!effective?.enabled || effective.orchestrationMode !== 'manager' || !policy?.operational) return;
-      if (event.toolName === 'ultra_begin_scope' || event.toolName === 'ultra_takeover' || event.toolName === 'ultra_delegate' || event.toolName === 'ultra_materialize_handoff' || MANAGER_READ_ONLY_TOOLS.has(event.toolName)) return;
+      if (event.toolName === 'ultra_begin_scope' || event.toolName === 'ultra_takeover' || event.toolName === 'ultra_delegate' || event.toolName === 'ultra_materialize_handoff' || event.toolName === 'ultra_review_candidate' || MANAGER_READ_ONLY_TOOLS.has(event.toolName)) return;
       // There is no sound heuristic for shell/custom-tool mutability. Unknown
       // tools are therefore denied until a durable takeover matches this turn.
       const scopeId = currentManagerScopeId;
