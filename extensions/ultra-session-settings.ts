@@ -5,6 +5,8 @@ import type { CustomEntry } from '@earendil-works/pi-coding-agent';
 import {
   MAX_MODEL_BYTES,
   MODEL_ID,
+  ULTRA_MAX_LANES,
+  ULTRA_MIN_LANES,
   normalizeUltraSettings,
   type RoutingMode,
   type UltraSettings,
@@ -104,7 +106,7 @@ export function validateUltraSessionOverrides(value: unknown): UltraSessionOverr
   if (hasMin) {
     for (const field of ['minLanes', 'maxLanes'] as const) {
       const lane = value[field];
-      if (typeof lane !== 'number' || !Number.isSafeInteger(lane) || lane < 1 || lane > 8) {
+      if (typeof lane !== 'number' || !Number.isSafeInteger(lane) || lane < ULTRA_MIN_LANES || lane > ULTRA_MAX_LANES) {
         invalid(field, 'must be an integer between 1 and 8.');
       }
     }
@@ -153,10 +155,21 @@ interface ParsedSnapshot {
   reason?: string;
 }
 
+/**
+ * Safe label for a malformed journal version. Explicitly handles Symbol
+ * (whose string coercion via template interpolation throws TypeError) so
+ * snapshot parsing stays diagnostic-only and never throws.
+ */
+function describeVersion(value: unknown): string {
+  if (typeof value === 'symbol') return value.toString();
+  if (typeof value === 'bigint') return `${value}n`;
+  return String(value);
+}
+
 function parseSnapshotData(data: unknown): ParsedSnapshot {
   if (!isRecord(data)) return { ok: false, reason: boundedReason(`Journal entry data must be an object, got ${data === null ? 'null' : typeof data}.`) };
   if (data.version !== ULTRA_SESSION_JOURNAL_VERSION) {
-    return { ok: false, reason: boundedReason(`Unsupported journal entry version ${String(data.version)}; expected ${ULTRA_SESSION_JOURNAL_VERSION}.`) };
+    return { ok: false, reason: boundedReason(`Unsupported journal entry version ${describeVersion(data.version)}; expected ${ULTRA_SESSION_JOURNAL_VERSION}.`) };
   }
   try {
     return { ok: true, patch: validateUltraSessionOverrides(data.patch) };

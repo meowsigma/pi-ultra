@@ -180,6 +180,20 @@ test('scan never throws on adversarial entry shapes', () => {
   );
 });
 
+test('same-type entry with Symbol version is ignored without throwing', () => {
+  const goodEntry = customEntry(ULTRA_SESSION_SETTINGS_CUSTOM_TYPE, { version: 1, patch: { enabled: false } }, 'good-1');
+  const scan = scanSessionUltraOverrides([
+    goodEntry,
+    customEntry(ULTRA_SESSION_SETTINGS_CUSTOM_TYPE, { version: Symbol('x'), patch: {} }, 'sym-1'),
+  ]);
+  assert.doesNotThrow(() => scanSessionUltraOverrides([customEntry(ULTRA_SESSION_SETTINGS_CUSTOM_TYPE, { version: Symbol('x'), patch: {} })]));
+  assert.deepEqual(scan.patch, { enabled: false }, 'the valid snapshot before the malformed one still wins');
+  assert.equal(scan.ignoredCount, 1);
+  assert.equal(scan.ignored[0].id, 'sym-1');
+  assert.ok(scan.ignored[0].reason.length > 0);
+  assert.ok(/version/i.test(scan.ignored[0].reason), 'diagnostic mentions the unsupported version');
+});
+
 // ── RESOLVER ───────────────────────────────────────────────────────
 test('session overrides touch only declared fields', () => {
   const global = globalSettings({ workerModel: 'anthropic/claude-opus' });
