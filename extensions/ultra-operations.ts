@@ -168,8 +168,16 @@ function normalizePath(value: unknown): string | undefined {
 
 function collectArtifactPaths(result: Record<string, unknown>): string[] {
   const values: unknown[] = [];
-  for (const field of ['artifactPath', 'outputPath', 'savedOutputPath', 'sessionPath', 'sessionFile']) values.push(result[field]);
-  if (isRecord(result.artifactPaths)) values.push(...Object.values(result.artifactPaths));
+  // Fork completion payloads put the durable patch manifest at
+  // payload.parallelHandoff.path. Preserve that exact reference as evidence;
+  // materialization validates it later instead of trusting a disposable branch.
+  const payload = isRecord(result.payload) ? result.payload : undefined;
+  for (const source of [result, payload]) {
+    if (!source) continue;
+    for (const field of ['artifactPath', 'outputPath', 'savedOutputPath', 'sessionPath', 'sessionFile']) values.push(source[field]);
+    if (isRecord(source.artifactPaths)) values.push(...Object.values(source.artifactPaths));
+    if (isRecord(source.parallelHandoff)) values.push(source.parallelHandoff.path);
+  }
   return [...new Set(values.filter((value): value is string => typeof value === 'string' && value.trim().length > 0).map((value) => value.trim().slice(0, 4_096)))].slice(0, 32);
 }
 

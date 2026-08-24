@@ -102,6 +102,16 @@ test('treats paused as nonterminal, dedupes terminal events, and records actual 
   assert.equal(appended.length, count);
 });
 
+test('retains a nested parallel handoff manifest path as durable completion evidence', () => {
+  const store = createUltraOperationStore({ append: () => undefined });
+  launch(store);
+  store.applyCompletion({
+    runId: 'run-1', state: 'completed',
+    results: [{ workflowKey: 'worker-a', agent: 'ultra-worker', model: 'openai/test', authorityLaunchContractDigest: 'a'.repeat(64), payload: { parallelHandoff: { path: '/safe/handoffs/run-1.json' } } }],
+  });
+  assert.deepEqual(store.get('op-1')?.actualLanes?.[0]?.artifactPaths, ['/safe/handoffs/run-1.json']);
+});
+
 test('retains escaping changed paths as ownership mismatches instead of dropping their evidence', () => {
   const store = createUltraOperationStore({ append: () => undefined });
   launch(store);
