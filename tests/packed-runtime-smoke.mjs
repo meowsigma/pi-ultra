@@ -69,6 +69,7 @@ async function main() {
     version: 1,
     enabled: true,
     routingMode: 'uniform',
+    orchestrationMode: 'manager',
     workerModel: 'openai-codex/gpt-5.6-sol',
     minLanes: 4,
     maxLanes: 8,
@@ -141,6 +142,9 @@ export default function probe(pi) {
 
   const result = JSON.parse(readFileSync(resultPath, 'utf8'));
   assert.equal(result.tools.filter((tool) => tool.name === 'ultra_delegate').length, 1);
+  for (const toolName of ['ultra_begin_scope', 'ultra_takeover', 'ultra_materialize_handoff', 'ultra_review_candidate', 'ultra_record_review_findings', 'ultra_dispose_handoff']) {
+    assert.equal(result.tools.filter((tool) => tool.name === toolName).length, 1, `missing Manager-mode tool ${toolName}`);
+  }
   assert.equal(result.tools.filter((tool) => tool.name === 'subagent').length, 1);
   assert.equal(result.commands.filter((command) => command.name === 'ultra').length, 1);
   assert.equal(result.spawnReply.success, false, JSON.stringify(result.spawnReply));
@@ -167,6 +171,7 @@ export default function probe(pi) {
     toolCount: result.tools.length,
     commandCount: result.commands.length,
     directLaunchBlocked: true,
+    managerModeToolsRegistered: true,
   }));
 }
 
