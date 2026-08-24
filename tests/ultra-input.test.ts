@@ -8,7 +8,9 @@ import {
   type UltraPolicyRegistration,
 } from '../extensions/ultra.js';
 import type { UltraDelegateInput, UltraPreparedWave } from '../extensions/ultra-protocol.js';
-import { FakePi } from './fixtures/fake-pi.js';
+import { validateUltraDelegateInput } from '../extensions/ultra-protocol.js';
+import { appendSessionUltraOverrides } from '../extensions/ultra-session-settings.js';
+import { FakePi, type FakePiOptions } from './fixtures/fake-pi.js';
 
 const ENABLED: UltraSettings = {
   version: 1, enabled: true, routingMode: 'uniform', workerModel: 'openai/test-model', minLanes: 2, maxLanes: 4,
@@ -47,10 +49,15 @@ function harness(options: {
   capabilities?: boolean;
   launchReceipt?: unknown;
   queryResult?: unknown;
+  /** Shared global-settings box so multiple sessions observe the same file. */
+  globals?: { current: LoadUltraSettingsResult };
+  /** Distinct FakePi session identity and seeded branch entries. */
+  session?: FakePiOptions;
 } = {}) {
-  let loaded: LoadUltraSettingsResult = options.loaded ?? { kind: 'loaded', settings: { ...ENABLED }, revision: 'revision-1', path: '/tmp/pi-ultra.json' };
+  const state = options.globals ?? { current: options.loaded ?? { kind: 'loaded', settings: { ...ENABLED }, revision: 'revision-1', path: '/tmp/pi-ultra.json' } as LoadUltraSettingsResult };
   const policyInstalls: Array<'blocked' | 'enabled'> = [];
   const policySessions: string[] = [];
+  const revisionValidators: Array<(revision: string, signal: AbortSignal) => Promise<boolean>> = [];
   const registrations: UltraPolicyRegistration[] = [];
   const preparedInputs: any[] = [];
   const launches: any[] = [];
@@ -58,23 +65,23 @@ function harness(options: {
   let watcherError: ((error: Error) => void) | undefined;
   let menuCalls = 0;
   let uuid = 0;
-
   const authority = { issueOnce: () => 'permit', revokeUnused() {}, dispose() {} };
   const deps: UltraExtensionDependencies = {
-    loadSettings: async () => loaded,
+    loadSettings: async () => state.current,
     updateSettings: async (patch) => {
-      if (loaded.kind === 'invalid') throw new Error('blocked config');
-      const nextPatch = typeof patch === 'function' ? patch(loaded.settings) : patch;
-      const settings = { ...loaded.settings, ...nextPatch } as UltraSettings;
-      loaded = { kind: 'loaded', settings, revision: `revision-${++uuid + 1}`, path: '/tmp/pi-ultra.json' };
-      return loaded;
+      if (state.current.kind === 'invalid') throw new Error('blocked config');
+      const nextPatch = typeof patch === 'function' ? patch(state.current.settings) : patch;
+      const settings = { ...state.current.settings, ...nextPatch } as UltraSettings;
+      state.current = { kind: 'loaded', settings, revision: `revision-${++uuid + 1}`, path: '/tmp/pi-ultra.json' };
+      return state.current;
     },
     backupAndReset: async () => { throw new Error('not used'); },
     showMenu: async () => { menuCalls += 1; return { kind: 'closed', reason: 'close' } as any; },
     checkCapabilities: async () => options.capabilities ?? true,
-    installPolicy: async ({ mode, sessionId }) => {
+    installPolicy: async ({ mode, sessionId, validateRevision }) => {
       policyInstalls.push(mode);
       policySessions.push(sessionId);
+      if (mode === 'enabled') revisionValidators.push(validateRevision);
       const registration: UltraPolicyRegistration = {
         mode,
         operational: mode === 'enabled',
@@ -85,19 +92,24 @@ function harness(options: {
       return registration;
     },
     watchSettings: (onChange, onError) => { watcher = onChange; watcherError = onError; return () => { watcher = undefined; watcherError = undefined; }; },
-    prepareWave: async (value) => { preparedInputs.push(value); return prepared(value.settings, value.revision); },
+    prepareWave: async (value) => {
+      // Validate against the session-effective bounds exactly like the real preflight.
+      const validated = validateUltraDelegateInput(value.input, { minLanes: value.settings.minLanes, maxLanes: value.settings.maxLanes });
+      preparedInputs.push({ ...value, input: validated });
+      return prepared(value.settings, value.revision);
+    },
     launchWave: async (value) => { launches.push(value); return options.launchReceipt ?? { text: 'Async workflow', details: { runId: 'run-1', asyncDir: '/tmp/run-1' } }; },
     queryStatus: async () => options.queryResult,
     randomId: () => `op-${++uuid}`,
   };
-  const pi = new FakePi('tui', '/repo');
-  pi.availableModels.push({ provider: 'openai', id: 'test-model' });
+  const pi = new FakePi('tui', '/repo', options.session);
+  pi.availableModels.push({ provider: 'openai', id: 'test-model' }, { provider: 'openai', id: 'session-model' });
   pi.context.model = { provider: 'openai', id: 'manager' };
   createUltraExtension(deps)(pi as any);
 
   return {
-    pi, deps, policyInstalls, policySessions, registrations, preparedInputs, launches,
-    setLoaded(value: LoadUltraSettingsResult) { loaded = value; },
+    pi, deps, policyInstalls, policySessions, registrations, preparedInputs, launches, revisionValidators,
+    setLoaded(value: LoadUltraSettingsResult) { state.current = value; },
     async start() { await pi.emit('session_start', { type: 'session_start' }); },
     async change() { await watcher?.(); await new Promise((resolve) => setImmediate(resolve)); },
     async failWatcher(message = 'watch failed') { await watcherError?.(new Error(message)); await new Promise((resolve) => setImmediate(resolve)); },
@@ -325,17 +337,15 @@ test('shutdown fences a reconciliation reply resolved immediately before shutdow
   assert.equal(h.pi.entries.filter((entry) => (entry.data as any)?.status === 'completed').length, 0);
 });
 
-test('committed cleanup errors still resynchronize direct commands, menu updates, and recovery', async () => {
+test('committed cleanup errors still resynchronize menu updates and recovery; slash commands never write globals', async () => {
   const direct = harness();
   await direct.start();
-  const off = { kind: 'loaded' as const, settings: { ...DISABLED }, revision: 'off-cleanup', path: '/tmp/pi-ultra.json' };
-  direct.deps.updateSettings = async () => {
-    direct.setLoaded(off);
-    throw new UltraSettingsCleanupError('committed cleanup warning', off);
-  };
+  direct.deps.updateSettings = async () => { throw new Error('global writes must not happen from slash commands'); };
   await direct.pi.command('ultra', 'off');
   assert.equal(direct.pi.statuses.at(-1)?.value, 'Ultra: off');
-  assert.equal(direct.pi.notifications.at(-1)?.level, 'warning');
+  assert.equal(direct.pi.entries.some((entry) => entry.customType === 'pi-ultra-session-settings'), true);
+
+  const off = { kind: 'loaded' as const, settings: { ...DISABLED }, revision: 'off-cleanup', path: '/tmp/pi-ultra.json' };
 
   const menu = harness();
   await menu.start();
@@ -373,4 +383,221 @@ test('shutdown disposes policy, watcher, completion listeners, and prevents stal
   assert.equal((h.registrations.at(-1) as any).disposed, true);
   h.pi.events.emit('subagent:async-complete', { runId: 'run-1', state: 'complete' });
   assert.equal(h.pi.messages.length, 0);
+});
+
+const SESSION_OVERRIDE_TYPE = 'pi-ultra-session-settings';
+const SESSION_DIAGNOSTIC_TYPE = 'pi-ultra-session-settings-diagnostic';
+
+function twoSharedSessions() {
+  const globals = { current: { kind: 'loaded' as const, settings: { ...ENABLED }, revision: 'revision-shared', path: '/tmp/pi-ultra.json' } };
+  const one = harness({ globals, session: { sessionId: 'session-one', sessionFile: '/tmp/session-one.jsonl' } });
+  const two = harness({ globals, session: { sessionId: 'session-two', sessionFile: '/tmp/session-two.jsonl' } });
+  return { globals, one, two };
+}
+
+async function applySessionPatch(h: ReturnType<typeof harness>, patch: Parameters<typeof appendSessionUltraOverrides>[1]): Promise<void> {
+  appendSessionUltraOverrides((customType, data) => h.pi.appendEntry(customType, data), patch);
+  await h.change();
+}
+
+function laneInput(laneCount: number): UltraDelegateInput {
+  const roles = ['scout', 'worker', 'reviewer'] as const;
+  return {
+    objective: 'Implement parser.',
+    lanes: Array.from({ length: laneCount }, (_unused, index) => ({
+      id: `lane-${index}`,
+      role: roles[index % roles.length]!,
+      task: `Task ${index} for parser.`,
+      deliverable: `Deliverable ${index}.`,
+      ...(roles[index % roles.length] === 'worker' ? { ownedPaths: [`src/module-${index}`] } : {}),
+    })),
+    acceptance: ['Run tests.'],
+  };
+}
+
+test('two fake sessions sharing global defaults diverge in enabled, model, and lane range', async () => {
+  const { globals, one, two } = twoSharedSessions();
+  await one.start();
+  await two.start();
+
+  // Session one patches every overridable field; session two stays on global defaults.
+  await applySessionPatch(one, { enabled: false, workerModel: 'openai/session-model', minLanes: 4, maxLanes: 8 });
+
+  assert.equal(one.pi.statuses.at(-1)?.value, 'Ultra: off');
+  assert.equal(two.pi.statuses.at(-1)?.value, 'Ultra: on');
+
+  const blocked = await one.pi.tool('ultra_delegate', laneInput(4)) as any;
+  assert.equal(blocked.isError, true);
+  assert.match(resultText(blocked), /Run \/ultra on first\./);
+
+  const oneTurn = await one.pi.inputToAgentStart('Work.');
+  assert.equal(oneTurn.systemPrompt, '');
+  const twoTurn = await two.pi.inputToAgentStart('Work.');
+  assert.match(twoTurn.systemPrompt ?? '', /active session model is the Ultra manager/i);
+  assert.match(twoTurn.systemPrompt ?? '', /openai\/test-model/);
+
+  const delegated = await two.pi.tool('ultra_delegate', delegateInput()) as any;
+  assert.equal(delegated.isError, undefined);
+  assert.deepEqual(
+    { workerModel: two.preparedInputs[0]?.settings.workerModel, minLanes: two.preparedInputs[0]?.settings.minLanes, maxLanes: two.preparedInputs[0]?.settings.maxLanes },
+    { workerModel: 'openai/test-model', minLanes: 2, maxLanes: 4 },
+  );
+
+  // The shared global baseline is untouched by either session.
+  assert.deepEqual(globals.current.settings, { ...ENABLED });
+  assert.equal(globals.current.revision, 'revision-shared');
+});
+
+test('off in session one appends only a local snapshot and leaves session two and globals intact', async () => {
+  const { globals, one, two } = twoSharedSessions();
+  await one.start();
+  await two.start();
+  await one.pi.command('ultra', 'off');
+  assert.equal(one.pi.statuses.at(-1)?.value, 'Ultra: off');
+  assert.equal(two.pi.statuses.at(-1)?.value, 'Ultra: on');
+
+  const snapshots = one.pi.entries.filter((entry) => entry.customType === SESSION_OVERRIDE_TYPE);
+  assert.equal(snapshots.length, 1);
+  assert.deepEqual((snapshots[0]?.data as any).patch, { enabled: false });
+  assert.equal(two.pi.entries.some((entry) => entry.customType === SESSION_OVERRIDE_TYPE), false);
+
+  const turn = await two.pi.inputToAgentStart('Work.');
+  assert.match(turn.systemPrompt ?? '', /openai\/test-model/);
+  assert.deepEqual(globals.current.settings, { ...ENABLED });
+  assert.equal(globals.current.revision, 'revision-shared');
+});
+
+test('a new FakePi built from a prior branch restores the session override state', async () => {
+  const first = harness({ session: { sessionId: 'restored', sessionFile: '/tmp/restored.jsonl' } });
+  await first.start();
+  await first.pi.command('ultra', 'off');
+  await applySessionPatch(first, { enabled: false, workerModel: 'openai/session-model', minLanes: 4, maxLanes: 8 });
+
+  const second = harness({
+    session: { sessionId: 'restored', sessionFile: '/tmp/restored.jsonl', branch: [...first.pi.entries] },
+  });
+  await second.start();
+  assert.equal(second.pi.statuses.at(-1)?.value, 'Ultra: off');
+  const turn = await second.pi.inputToAgentStart('Work.');
+  assert.equal(turn.systemPrompt, '');
+  const blocked = await second.pi.tool('ultra_delegate', laneInput(4)) as any;
+  assert.match(resultText(blocked), /Run \/ultra on first\./);
+
+  await second.pi.command('ultra', 'on');
+  assert.equal(second.pi.statuses.at(-1)?.value, 'Ultra: on');
+  const revived = await second.pi.tool('ultra_delegate', laneInput(4)) as any;
+  assert.equal(revived.isError, undefined);
+  assert.equal(second.preparedInputs[0]?.settings.workerModel, 'openai/session-model');
+  assert.equal(second.preparedInputs[0]?.settings.minLanes, 4);
+  assert.equal(second.preparedInputs[0]?.settings.maxLanes, 8);
+});
+
+test('ultra_delegate preflights with session-effective settings including 4-8 lane bounds', async () => {
+  const h = harness();
+  await h.start();
+  await applySessionPatch(h, { routingMode: 'uniform', workerModel: 'openai/session-model', minLanes: 4, maxLanes: 8 });
+
+  const result = await h.pi.tool('ultra_delegate', laneInput(4)) as any;
+  assert.equal(result.isError, undefined);
+  const sent = h.preparedInputs[0] as any;
+  assert.equal(sent.settings.routingMode, 'uniform');
+  assert.equal(sent.settings.workerModel, 'openai/session-model');
+  assert.equal(sent.settings.minLanes, 4);
+  assert.equal(sent.settings.maxLanes, 8);
+  assert.notEqual(sent.revision, 'revision-1');
+  assert.match(sent.revision, /^[a-f0-9]{64}$/u);
+  assert.equal((sent.input as UltraDelegateInput).lanes.length, 4);
+  assert.equal(h.launches.length, 1);
+
+  // Effective 4-lane minimum rejects a two-lane wave before launch.
+  const tooFew = await h.pi.tool('ultra_delegate', delegateInput()) as any;
+  assert.equal(tooFew.isError, true);
+  assert.match(resultText(tooFew), /between 4 and 8 entries/i);
+  assert.equal(h.launches.length, 1);
+});
+
+test('global watcher updates inherited fields while explicitly patched session fields persist', async () => {
+  const h = harness();
+  await h.start();
+  await applySessionPatch(h, { routingMode: 'role-defaults', minLanes: 4, maxLanes: 8 });
+
+  h.setLoaded({ kind: 'loaded', settings: { ...ENABLED, workerModel: 'openai/global-new' }, revision: 'global-rev-2', path: '/tmp/pi-ultra.json' });
+  await h.change();
+  await h.pi.tool('ultra_delegate', laneInput(4));
+  let sent = h.preparedInputs.at(-1) as any;
+  assert.equal(sent.settings.workerModel, 'openai/global-new', 'changed global inherited model must take effect');
+  assert.equal(sent.settings.minLanes, 4);
+  assert.equal(sent.settings.maxLanes, 8);
+
+  await applySessionPatch(h, { workerModel: 'openai/session-model' });
+  h.setLoaded({ kind: 'loaded', settings: { ...ENABLED, workerModel: 'openai/global-newer' }, revision: 'global-rev-3', path: '/tmp/pi-ultra.json' });
+  await h.change();
+  await h.pi.tool('ultra_delegate', delegateInput());
+  sent = h.preparedInputs.at(-1) as any;
+  assert.equal(sent.settings.workerModel, 'openai/session-model', 'explicitly patched session model must survive global changes');
+});
+
+test('invalid global configuration blocks a fully overridden session and ultra_delegate', async () => {
+  const h = harness();
+  await h.start();
+  await applySessionPatch(h, { workerModel: 'openai/session-model', minLanes: 4, maxLanes: 8 });
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on');
+
+  h.setLoaded({ kind: 'invalid', reason: 'rewritten badly', path: '/tmp/pi-ultra.json' });
+  await h.change();
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: blocked');
+  assert.equal(h.policyInstalls.at(-1), 'blocked');
+
+  const [direct] = await h.pi.emit('tool_call', { toolName: 'subagent', input: { agent: 'worker', task: 'bypass' } });
+  assert.equal((direct as any).block, true);
+
+  const delegated = await h.pi.tool('ultra_delegate', laneInput(4)) as any;
+  assert.equal(delegated.isError, true);
+  assert.match(resultText(delegated), /blocked/i);
+  assert.equal(h.launches.length, 0);
+});
+
+test('permit revision validation fails when the session patch or global revision changes', async () => {
+  const h = harness();
+  await h.start();
+  await applySessionPatch(h, { minLanes: 4, maxLanes: 8 });
+  const delegated = await h.pi.tool('ultra_delegate', laneInput(4)) as any;
+  assert.equal(delegated.isError, undefined);
+  const boundRevision = (h.preparedInputs[0] as any).revision;
+  const validate = h.revisionValidators.at(-1)!;
+  const signal = new AbortController().signal;
+
+  assert.equal(await validate(boundRevision, signal), true);
+
+  appendSessionUltraOverrides((customType, data) => h.pi.appendEntry(customType, data), { minLanes: 2, maxLanes: 4 });
+  await h.change();
+  assert.equal(await validate(boundRevision, signal), false, 'stale permit must not cross a session patch change');
+
+  await h.pi.tool('ultra_delegate', delegateInput());
+  const reboundRevision = (h.preparedInputs.at(-1) as any).revision;
+  assert.notEqual(reboundRevision, boundRevision);
+  assert.equal(await h.revisionValidators.at(-1)!(reboundRevision, signal), true);
+
+  h.setLoaded({ kind: 'loaded', settings: { ...ENABLED }, revision: 'global-rev-next', path: '/tmp/pi-ultra.json' });
+  assert.equal(await validate(reboundRevision, signal), false, 'stale permit must not cross a global revision change');
+});
+
+test('malformed restored overrides record at most one sanitized non-model diagnostic per distinct set', async () => {
+  const malformedBranch = [
+    { type: 'custom', customType: SESSION_OVERRIDE_TYPE, id: 'bad-1', data: { version: 1, patch: { enabled: 'yes' } } },
+    { type: 'custom', customType: SESSION_OVERRIDE_TYPE, id: 'bad-2', data: { version: 1, patch: { 'bad\u0007field': 1 } } },
+    { type: 'custom', customType: 'unrelated.entry', id: 'skip', data: {} },
+    { type: 'custom', customType: SESSION_OVERRIDE_TYPE, id: 'good', data: { version: 1, patch: { enabled: true } } },
+  ];
+  const h = harness({ session: { sessionId: 'diag', sessionFile: '/tmp/diag.jsonl', branch: malformedBranch } });
+  await h.start();
+  const diagnostics = h.pi.entries.filter((entry) => entry.customType === SESSION_DIAGNOSTIC_TYPE);
+  assert.equal(diagnostics.length, 1);
+  const serialized = JSON.stringify(diagnostics);
+  assert.doesNotMatch(serialized, /[\u0000-\u001f\u007f]/gu);
+  assert.match(serialized, /Unsupported session Ultra override field/);
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on', 'valid later snapshot still applies');
+
+  await h.change();
+  assert.equal(h.pi.entries.filter((entry) => entry.customType === SESSION_DIAGNOSTIC_TYPE).length, 1, 'no duplicate diagnostics for the same set');
 });

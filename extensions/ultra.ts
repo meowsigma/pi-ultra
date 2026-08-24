@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import {
   backupAndResetUltraSettings,
@@ -33,6 +33,13 @@ import {
   type UltraOperationLane,
   type UltraOutboxItem,
 } from './ultra-operations.js';
+import {
+  appendSessionUltraOverrides,
+  resolveEffectiveUltraSettings,
+  scanSessionUltraOverrides,
+  type SessionOverridesScanResult,
+  type UltraSessionOverrides,
+} from './ultra-session-settings.js';
 
 const ULTRA_COMMAND_DESCRIPTION = 'Configure Ultra or send an Ultra-managed task to the active session model';
 const MENU_REQUIRES_TUI = '/ultra menu requires TUI mode; use /ultra on, /ultra off, or /ultra toggle.';
@@ -50,6 +57,11 @@ const STRICT_TOOLS = ['read', 'grep', 'find', 'ls', 'bash', 'edit', 'write', 'co
 const MAX_COMPLETION_BUFFER = 32;
 const COMPLETION_BUFFER_TTL_MS = 60_000;
 const RECONCILE_DELAYS = [0, 250, 750, 1_500] as const;
+// Non-model-visible journal entry recording sanitized diagnostics for malformed
+// session override snapshots found during restore. At most one entry is appended
+// per distinct malformed set.
+const SESSION_OVERRIDE_DIAGNOSTIC_TYPE = 'pi-ultra-session-settings-diagnostic';
+const MAX_DIAGNOSTIC_TEXT = 512;
 
 export interface UltraPolicyRegistration {
   mode: 'blocked' | 'enabled';
@@ -89,6 +101,29 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function boundedMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return message.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, '').trim().slice(0, 1_024) || 'Unknown Ultra error.';
+}
+
+function sanitizeDiagnostic(text: string): string {
+  return text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, '').trim().slice(0, MAX_DIAGNOSTIC_TEXT);
+}
+
+/** Canonical (key-sorted) JSON digest so a session patch binds stably regardless of key order. */
+function stablePatchDigest(patch: UltraSessionOverrides): string {
+  const canonical = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value !== null && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([key, item]) => [key, canonical(item)]));
+    }
+    return value;
+  };
+  return createHash('sha256').update(JSON.stringify(canonical(patch))).digest('hex');
+}
+
+/** Permit revision binding both the global revision and the session patch digest. */
+function bindRevision(globalRevision: string, patchDigest: string): string {
+  return createHash('sha256').update(`v1:${globalRevision}:${patchDigest}`).digest('hex');
 }
 
 async function defaultCheckCapabilities(events: ExtensionAPI['events']): Promise<boolean> {
@@ -261,7 +296,10 @@ function toolError(message: string) {
 
 export function createUltraExtension(dependencies: UltraExtensionDependencies = DEFAULT_DEPENDENCIES): (pi: ExtensionAPI) => void {
   return (pi: ExtensionAPI): void => {
-    let current: LoadUltraSettingsResult | undefined;
+    let effective: UltraSettings | undefined;
+    let effectiveRevisionValue: string | undefined;
+    let sessionPatch: UltraSessionOverrides = {};
+    let reportedDiagnosticKey: string | undefined;
     let policy: UltraPolicyRegistration | undefined;
     let capabilityCompatible: boolean | undefined;
     let watcherFailed: string | undefined;
@@ -275,6 +313,35 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
 
     const operations = createUltraOperationStore({ append: (data) => pi.appendEntry(ULTRA_OPERATION_ENTRY, data) });
 
+    const appendSessionSnapshot = (patch: UltraSessionOverrides): void => {
+      appendSessionUltraOverrides((customType, data) => pi.appendEntry(customType, data), patch);
+    };
+
+    // At most one non-model-visible diagnostic entry per distinct malformed
+    // override set; text is sanitized before any UI/message consumer sees it.
+    const reportOverrideDiagnostics = (scan: SessionOverridesScanResult): void => {
+      if (scan.ignoredCount === 0) {
+        reportedDiagnosticKey = undefined;
+        return;
+      }
+      const key = JSON.stringify([scan.ignored.map((item) => `${sanitizeDiagnostic(item.id)}::${sanitizeDiagnostic(item.reason)}`), scan.ignoredCount]);
+      if (key === reportedDiagnosticKey) return;
+      reportedDiagnosticKey = key;
+      pi.appendEntry(SESSION_OVERRIDE_DIAGNOSTIC_TYPE, {
+        version: 1,
+        ignoredCount: scan.ignoredCount,
+        reasons: scan.ignored.map((item) => sanitizeDiagnostic(item.reason)),
+      });
+    };
+
+    // Rescans the Pi branch so appended snapshots and restored branches both
+    // feed the same latest-valid-wins patch.
+    const refreshSessionOverrides = (ctx: ExtensionContext): void => {
+      const scan = scanSessionUltraOverrides(ctx.sessionManager.getBranch());
+      sessionPatch = scan.patch;
+      reportOverrideDiagnostics(scan);
+    };
+
     const notify = (ctx: ExtensionContext, message: string, level: 'info' | 'warning' | 'error' = 'info') => {
       if (ctx.hasUI) ctx.ui.notify(message, level);
       else pi.sendMessage({ customType: 'ultra-diagnostic', content: message, display: false, details: { level } });
@@ -286,7 +353,13 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
 
     const validateRevision = async (revision: string, _signal: AbortSignal): Promise<boolean> => {
       const loaded = await dependencies.loadSettings();
-      return loaded.kind !== 'invalid' && loaded.settings.enabled && loaded.revision === revision;
+      if (loaded.kind === 'invalid') return false;
+      try {
+        if (!resolveEffectiveUltraSettings(loaded.settings, sessionPatch).enabled) return false;
+      } catch {
+        return false;
+      }
+      return bindRevision(loaded.revision, stablePatchDigest(sessionPatch)) === revision;
     };
 
     let syncTail: Promise<void> = Promise.resolve();
@@ -296,6 +369,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
         const generation = lifecycleGeneration;
         const stale = () => disposed || generation !== lifecycleGeneration;
         lastContext = ctx;
+        refreshSessionOverrides(ctx);
         let guard: UltraPolicyRegistration | undefined;
         let next: UltraPolicyRegistration | undefined;
         try {
@@ -304,24 +378,40 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
           if (watcherFailed) {
             policy?.dispose();
             policy = guard;
-            current = { kind: 'invalid', reason: watcherFailed, path: 'unknown' };
+            effective = undefined;
+            effectiveRevisionValue = undefined;
             status(ctx, 'blocked');
             return;
           }
           const loaded = await dependencies.loadSettings();
           if (stale()) { guard.dispose(); return; }
-          current = loaded;
           if (loaded.kind === 'invalid') {
             policy?.dispose();
             policy = guard;
+            effective = undefined;
+            effectiveRevisionValue = undefined;
             status(ctx, 'blocked');
             notify(ctx, `Ultra configuration is blocked: ${loaded.reason}`, 'error');
             return;
           }
-          if (!loaded.settings.enabled) {
+          let resolved: UltraSettings;
+          try {
+            resolved = resolveEffectiveUltraSettings(loaded.settings, sessionPatch);
+          } catch (error) {
+            policy?.dispose();
+            policy = guard;
+            effective = undefined;
+            effectiveRevisionValue = undefined;
+            status(ctx, 'blocked');
+            notify(ctx, `Ultra configuration is blocked: ${boundedMessage(error)}`, 'error');
+            return;
+          }
+          if (!resolved.enabled) {
             policy?.dispose();
             guard.dispose();
             policy = undefined;
+            effective = undefined;
+            effectiveRevisionValue = undefined;
             status(ctx, 'off');
             return;
           }
@@ -330,6 +420,8 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
           if (!capabilityCompatible) {
             policy?.dispose();
             policy = guard;
+            effective = undefined;
+            effectiveRevisionValue = undefined;
             status(ctx, 'blocked');
             notify(ctx, 'Ultra is blocked: installed pi-subagents lacks launch-authority v1. Install the pinned compatible fork and /reload.', 'error');
             return;
@@ -339,6 +431,8 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
           policy?.dispose();
           policy = next;
           guard.dispose();
+          effective = resolved;
+          effectiveRevisionValue = bindRevision(loaded.revision, stablePatchDigest(sessionPatch));
           status(ctx, 'on');
         } catch (error) {
           next?.dispose();
@@ -347,7 +441,8 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             policy?.dispose();
             policy = guard;
           }
-          current = { kind: 'invalid', reason: boundedMessage(error), path: 'unknown' };
+          effective = undefined;
+          effectiveRevisionValue = undefined;
           status(ctx, 'blocked');
           notify(ctx, `Ultra is blocked: ${boundedMessage(error)}`, 'error');
         }
@@ -420,26 +515,35 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
           // synchronization here so no delegation observes uninitialized state.
           await synchronize(ctx);
           if (stale()) throw new Error('Ultra extension reloaded before delegation initialized.');
+          refreshSessionOverrides(ctx);
           const loaded = await dependencies.loadSettings();
           if (stale()) throw new Error('Ultra extension reloaded before delegation completed.');
-          current = loaded;
           if (loaded.kind === 'invalid') return toolError(`Ultra configuration is blocked: ${loaded.reason}`);
-          if (!loaded.settings.enabled) return toolError(ENABLE_FIRST);
+          let resolved: UltraSettings;
+          try {
+            resolved = resolveEffectiveUltraSettings(loaded.settings, sessionPatch);
+          } catch (error) {
+            return toolError(boundedMessage(error));
+          }
+          if (!resolved.enabled) return toolError(ENABLE_FIRST);
           if (!policy?.operational || !policy.authority) return toolError('Ultra is blocked because compatible launch authority is unavailable. The main model must take over directly.');
           const input = params as UltraDelegateInput;
           if (input.repairOf) operations.assertRepairAllowed(input.repairOf);
+          const revision = bindRevision(loaded.revision, stablePatchDigest(sessionPatch));
           const prepared = await dependencies.prepareWave({
             input,
-            settings: loaded.settings,
+            settings: resolved,
             cwd: ctx.cwd,
             sessionId: sessionIdentity(ctx),
-            revision: loaded.revision,
+            revision,
             availableModels: ctx.modelRegistry.getAvailable().map((model) => ({ provider: model.provider, id: model.id, fullId: `${model.provider}/${model.id}`, reasoning: model.reasoning })),
             parentModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
             capabilityCeiling: policy.capabilityCeiling,
             events: pi.events,
           });
           if (stale()) throw new Error('Ultra extension reloaded during wave preflight.');
+          effective = resolved;
+          effectiveRevisionValue = revision;
           const operationId = dependencies.randomId();
           if (input.repairOf) {
             repairReservationId = `${operationId}.repair`;
@@ -492,19 +596,47 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             return;
           }
           try {
-            const state = await dependencies.loadSettings();
+            const loaded = await dependencies.loadSettings();
+            let state: LoadUltraSettingsResult;
+            if (loaded.kind === 'invalid') {
+              state = loaded;
+            } else {
+              try {
+                const resolved = resolveEffectiveUltraSettings(loaded.settings, sessionPatch);
+                state = {
+                  kind: 'loaded',
+                  settings: resolved,
+                  revision: bindRevision(loaded.revision, stablePatchDigest(sessionPatch)),
+                  path: loaded.path,
+                };
+              } catch (error) {
+                state = { kind: 'invalid', reason: boundedMessage(error), path: loaded.path };
+              }
+            }
             await dependencies.showMenu({
               ctx,
               state,
-              update: async (patch) => {
-                try {
-                  const committed = await dependencies.updateSettings(patch);
-                  await synchronize(ctx);
-                  return committed;
-                } catch (error) {
-                  if (error instanceof UltraSettingsCleanupError) await synchronize(ctx);
-                  throw error;
+              // Session-local update callback: menu edits append session
+              // overrides and never touch the global settings file.
+              update: async (patchInput) => {
+                const baseSettings = state.kind === 'invalid' ? undefined : state.settings;
+                const patch = typeof patchInput === 'function' && baseSettings
+                  ? patchInput(baseSettings)
+                  : patchInput;
+                const override: UltraSessionOverrides = { ...sessionPatch };
+                const record = isRecord(patch) ? patch : {};
+                if (record.enabled !== undefined) override.enabled = record.enabled === true;
+                if (record.routingMode !== undefined) override.routingMode = record.routingMode;
+                if (record.workerModel !== undefined) override.workerModel = typeof record.workerModel === 'string' && record.workerModel.trim() ? record.workerModel.trim() : null;
+                if (record.minLanes !== undefined || record.maxLanes !== undefined) {
+                  override.minLanes = record.minLanes ?? baseSettings?.minLanes;
+                  override.maxLanes = record.maxLanes ?? baseSettings?.maxLanes;
                 }
+                appendSessionSnapshot(override);
+                await synchronize(ctx);
+                if (!effective || effectiveRevisionValue === undefined) throw new Error('Ultra configuration is blocked; session settings were not applied.');
+                const path = loaded.kind === 'invalid' ? 'unknown' : loaded.path;
+                return { kind: 'loaded', settings: effective, revision: effectiveRevisionValue, path } satisfies ValidUltraSettingsResult;
               },
               recover: async () => {
                 try {
@@ -528,25 +660,30 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
         }
         if (keyword === 'on' || keyword === 'off' || keyword === 'toggle') {
           try {
-            await dependencies.updateSettings((settings) => ({ enabled: keyword === 'toggle' ? !settings.enabled : keyword === 'on' }));
+            // Session-scoped: only the active session override changes; the
+            // global settings file stays untouched.
+            const nextEnabled = keyword === 'toggle' ? !(effective?.enabled ?? false) : keyword === 'on';
+            appendSessionSnapshot({ ...sessionPatch, enabled: nextEnabled });
             await synchronize(ctx);
           } catch (error) {
-            if (error instanceof UltraSettingsCleanupError) {
-              await synchronize(ctx);
-              notify(ctx, error.message, 'warning');
-            } else {
-              notify(ctx, boundedMessage(error), 'error');
-            }
+            notify(ctx, boundedMessage(error), 'error');
           }
           return;
         }
+        refreshSessionOverrides(ctx);
         const loaded = await dependencies.loadSettings();
-        current = loaded;
         if (loaded.kind === 'invalid') {
           notify(ctx, `Ultra configuration is blocked: ${loaded.reason}`, 'error');
           return;
         }
-        if (!loaded.settings.enabled) {
+        let resolved: UltraSettings;
+        try {
+          resolved = resolveEffectiveUltraSettings(loaded.settings, sessionPatch);
+        } catch (error) {
+          notify(ctx, boundedMessage(error), 'error');
+          return;
+        }
+        if (!resolved.enabled) {
           notify(ctx, ENABLE_FIRST, 'error');
           return;
         }
@@ -555,13 +692,13 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
     });
 
     pi.on('before_agent_start', (event) => {
-      if (current?.kind === 'invalid' || !current?.settings.enabled || !policy?.operational) return;
-      return { systemPrompt: `${event.systemPrompt}\n\n${managerPolicy(current.settings)}` };
+      if (!effective?.enabled || !policy?.operational) return;
+      return { systemPrompt: `${event.systemPrompt}\n\n${managerPolicy(effective)}` };
     });
 
     pi.on('tool_call', (event) => {
       if (event.toolName !== 'subagent') return;
-      const governed = current?.kind === 'invalid' || current?.settings.enabled === true || policy?.mode === 'blocked';
+      const governed = !effective || effective.enabled === true || policy?.mode === 'blocked';
       if (!governed || isSafeSubagentCall(event.input)) return;
       return { block: true, reason: 'Ultra governs new subagent launches. Use ultra_delegate for one exact authorized wave, or let the main model take over directly.' };
     });
@@ -569,7 +706,10 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
     pi.on('session_start', async (_event, ctx) => {
       const generation = lifecycleGeneration;
       lastContext = ctx;
+      // Restore uses Pi branch order as supplied; scan the branch for the
+      // session override patch before the fail-closed synchronization.
       operations.restore(ctx.sessionManager.getBranch());
+      refreshSessionOverrides(ctx);
       await synchronize(ctx);
       if (disposed || generation !== lifecycleGeneration) return;
       deliverPendingOutbox();
