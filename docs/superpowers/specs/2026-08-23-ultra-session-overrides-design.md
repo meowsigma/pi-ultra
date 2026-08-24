@@ -22,7 +22,7 @@ No change is made to authority ownership, permits, lane admission, operation sto
 
 Each Pi session stores an Ultra-owned override snapshot as a non-model-visible Pi custom entry. The latest valid snapshot in that session’s branch is authoritative. The patch contains only fields explicitly changed in that session. It is schema-validated on write and restore. It is persisted with the Pi session, so it survives `/reload`, process restart, and opening the same session again.
 
-The patch must never contain partial lane bounds: `minLanes` and `maxLanes` are recorded and removed atomically. A uniform `workerModel` is validated as a provider-qualified ID; it is absent for Automatic. Unknown fields and invalid patch values are rejected rather than silently normalized.
+The patch must never contain partial lane bounds: `minLanes` and `maxLanes` are recorded and removed atomically. A session patch represents an Automatic uniform selection with the explicit JSON value `workerModel: null`; absence means the session inherits the global field. A non-null uniform `workerModel` is validated as a provider-qualified ID. Unknown fields and invalid patch values are rejected rather than silently normalized.
 
 ### Effective settings
 
