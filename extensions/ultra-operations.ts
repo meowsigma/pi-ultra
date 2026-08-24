@@ -93,6 +93,7 @@ export interface UltraOperation {
   writerBase?: { repositoryRoot: string; baseCommit: string };
   /** Durable evidence that a validated worker patch was materialized elsewhere. */
   handoffCandidate?: { manifestPath: string; candidatePath: string; createdAt: number };
+  review?: { state: 'reviewer-running' | 'awaiting-manager-disposition' | 'verified' | 'repair-queued' | 'taken-over'; reviewerRunId?: string; findings?: string; updatedAt: number };
   createdAt: number;
   updatedAt: number;
 }
@@ -316,6 +317,7 @@ function validSnapshot(value: unknown): value is UltraOperation {
   if (value.repairCount !== 0 && value.repairCount !== 1) return false;
   if (value.writerBase !== undefined && (!isRecord(value.writerBase) || typeof value.writerBase.repositoryRoot !== 'string' || typeof value.writerBase.baseCommit !== 'string')) return false;
   if (value.handoffCandidate !== undefined && (!isRecord(value.handoffCandidate) || typeof value.handoffCandidate.manifestPath !== 'string' || typeof value.handoffCandidate.candidatePath !== 'string' || !Number.isSafeInteger(value.handoffCandidate.createdAt))) return false;
+  if (value.review !== undefined && (!isRecord(value.review) || !['reviewer-running', 'awaiting-manager-disposition', 'verified', 'repair-queued', 'taken-over'].includes(String(value.review.state)) || !Number.isSafeInteger(value.review.updatedAt) || (value.review.reviewerRunId !== undefined && typeof value.review.reviewerRunId !== 'string') || (value.review.findings !== undefined && typeof value.review.findings !== 'string'))) return false;
   return true;
 }
 
@@ -581,6 +583,34 @@ export function createUltraOperationStore(options: {
       if (!operation.writerBase || !operation.lanes.some((lane) => lane.role === 'worker')) throw new Error('Only admitted writer operations may materialize a handoff candidate.');
       if (operation.handoffCandidate) throw new Error(`Ultra operation '${operationId}' already has a materialized handoff candidate.`);
       operation.handoffCandidate = { manifestPath: input.manifestPath.slice(0, 4_096), candidatePath: input.candidatePath.slice(0, 4_096), createdAt: now() };
+      operation.updatedAt = now();
+      return persist(operation);
+    },
+
+    beginReviewer(operationId: string, reviewerRunId: string): UltraOperation {
+      const operation = operations.get(operationId);
+      if (!operation?.handoffCandidate) throw new Error('Reviewer launch requires a materialized handoff candidate.');
+      if (operation.review) throw new Error(`Ultra operation '${operationId}' already has reviewer state.`);
+      if (!reviewerRunId.trim()) throw new Error('Reviewer launch requires a run ID.');
+      operation.review = { state: 'reviewer-running', reviewerRunId: reviewerRunId.slice(0, 256), updatedAt: now() };
+      operation.updatedAt = now();
+      return persist(operation);
+    },
+
+    recordReviewerFindings(operationId: string, findings: string): UltraOperation {
+      const operation = operations.get(operationId);
+      if (!operation?.review || operation.review.state !== 'reviewer-running') throw new Error('Reviewer findings require a running bound reviewer.');
+      const text = findings.trim();
+      if (!text) throw new Error('Reviewer findings must be non-empty.');
+      operation.review = { ...operation.review, state: 'awaiting-manager-disposition', findings: text.slice(0, MAX_FAILURE_REASON_CHARS), updatedAt: now() };
+      operation.updatedAt = now();
+      return persist(operation);
+    },
+
+    recordManagerDisposition(operationId: string, state: 'verified' | 'repair-queued' | 'taken-over'): UltraOperation {
+      const operation = operations.get(operationId);
+      if (!operation?.review || operation.review.state !== 'awaiting-manager-disposition') throw new Error('Manager disposition requires bound reviewer findings.');
+      operation.review = { ...operation.review, state, updatedAt: now() };
       operation.updatedAt = now();
       return persist(operation);
     },

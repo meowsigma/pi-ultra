@@ -115,6 +115,20 @@ test('records a validated handoff candidate once for an admitted completed write
   assert.throws(() => store.recordMaterializedHandoff('op-1', { manifestPath: '/other.json', candidatePath: '/other' }), /already/i);
 });
 
+test('enforces candidate-before-review and reviewer-findings-before-manager disposition', () => {
+  const store = createUltraOperationStore({ append: () => undefined });
+  store.recordLaunch({ operationId: 'op-1', runId: 'run-1', objective: 'Implement parser.', acceptance: ['Run tests.'], lanes: [lane()], receipt: {}, writerBase: { repositoryRoot: '/repo', baseCommit: 'a'.repeat(40) } });
+  assert.throws(() => store.beginReviewer('op-1', 'review-run'), /candidate/i);
+  store.applyCompletion({ runId: 'run-1', state: 'completed', results: [] });
+  store.recordMaterializedHandoff('op-1', { manifestPath: '/handoff.json', candidatePath: '/candidate' });
+  store.beginReviewer('op-1', 'review-run');
+  assert.throws(() => store.recordManagerDisposition('op-1', 'verified'), /findings/i);
+  store.recordReviewerFindings('op-1', 'Patch is correct and tests are sufficient.');
+  const final = store.recordManagerDisposition('op-1', 'verified');
+  assert.equal(final.review?.state, 'verified');
+  assert.throws(() => store.recordReviewerFindings('op-1', 'late'), /running/i);
+});
+
 test('retains a nested parallel handoff manifest path as durable completion evidence', () => {
   const store = createUltraOperationStore({ append: () => undefined });
   launch(store);
