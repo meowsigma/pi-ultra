@@ -33,6 +33,7 @@ import {
   ULTRA_OPERATION_ENTRY,
   createUltraOperationStore,
   type UltraOperation,
+  ultraLaunchIdempotencyKey,
   type UltraOperationLane,
   type UltraOutboxItem,
 } from './ultra-operations.js';
@@ -669,6 +670,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
         const stale = () => disposed || generation !== lifecycleGeneration;
         const signal = toolSignal ? AbortSignal.any([toolSignal, reconciliationAbort.signal]) : reconciliationAbort.signal;
         let repairReservationId: string | undefined;
+        let launchAttemptId: string | undefined;
         try {
           // RPC/model work can race session_start. Re-run the fail-closed policy
           // synchronization here so no delegation observes uninitialized state.
@@ -729,14 +731,27 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
           effective = resolved;
           effectiveRevisionValue = revision;
           const operationId = dependencies.randomId();
+          launchAttemptId = ultraLaunchIdempotencyKey({ operationId, attemptIndex: 0 });
+          operations.recordQueuedLaunch({
+            idempotencyKey: launchAttemptId,
+            operationId,
+            runId: `pending:${operationId}`,
+            lanes: operationLanes(prepared),
+            receipt: { state: 'queued-before-permit' },
+          });
           if (input.repairOf) {
             repairReservationId = `${operationId}.repair`;
             operations.reserveRepair(input.repairOf, repairReservationId);
           }
           let receipt: unknown;
           try {
+            // The admitted record is durable before the spawn RPC. On a crash,
+            // restore surfaces it as ambiguous and never blindly relaunches.
+            operations.markLaunchAdmitted(launchAttemptId);
             receipt = await dependencies.launchWave({ events: pi.events, authority: policy.authority, prepared, signal });
+            operations.markLaunched(launchAttemptId);
           } catch (error) {
+            if (launchAttemptId && !signal.aborted && !stale()) operations.markFailedPreSpawn(launchAttemptId, boundedMessage(error));
             if (repairReservationId && !signal.aborted && !stale()) operations.releaseRepair(repairReservationId);
             throw error;
           }

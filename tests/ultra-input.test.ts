@@ -182,7 +182,9 @@ test('ultra_delegate prepares one wave, records receipt evidence, and never clai
   assert.equal(h.launches.length, 1);
   assert.match(resultText(result), /operation op-1.*run run-1/i);
   assert.doesNotMatch(resultText(result), /accepted|successful/i);
-  assert.equal(h.pi.entries.some((entry) => entry.customType === 'ultra.operation.v1'), true);
+  const operationEntries = h.pi.entries.filter((entry) => entry.customType === 'ultra.operation.v1');
+  assert.deepEqual(operationEntries.map((entry: any) => entry.data.kind ?? 'operation'), ['launch-attempt', 'launch-attempt', 'launch-attempt', 'operation']);
+  assert.deepEqual(operationEntries.slice(0, 3).map((entry: any) => entry.data.state), ['queued', 'admitted', 'launched']);
 });
 
 test('writer admission denies before preflight or permit spending and keeps read-only authority intact', async () => {
@@ -381,7 +383,9 @@ test('shutdown fences delayed policy install, preflight, and spawn continuations
   await spawnHarness.pi.emit('session_shutdown', { type: 'session_shutdown' });
   const spawnResult = await spawning;
   assert.equal(spawnResult.isError, true);
-  assert.equal(spawnHarness.pi.entries.length, 0);
+  // Shutdown after durable admission retains the ambiguous attempt rather than
+  // erasing it and risking a blind relaunch after restore.
+  assert.deepEqual(spawnHarness.pi.entries.map((entry: any) => entry.data.state), ['queued', 'admitted']);
 });
 
 test('shutdown fences a reconciliation reply resolved immediately before shutdown', async () => {
