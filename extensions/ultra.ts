@@ -573,8 +573,14 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
         try {
           // RPC/model work can race session_start. Re-run the fail-closed policy
           // synchronization here so no delegation observes uninitialized state.
-          await synchronize(ctx);
+          const synced = await synchronize(ctx);
           if (stale()) throw new Error('Ultra extension reloaded before delegation initialized.');
+          // A blocked transition can retain a stale enabled registration whose
+          // operational authority still passes the gate below; blocked must
+          // deny every new launch outright before any preflight or wave action.
+          if (synced === 'blocked') {
+            return toolError('Ultra is blocked because launch authority could not be synchronized. The main model must take over directly.');
+          }
           refreshSessionOverrides(ctx);
           const loaded = await dependencies.loadSettings();
           if (stale()) throw new Error('Ultra extension reloaded before delegation completed.');

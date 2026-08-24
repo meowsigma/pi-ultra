@@ -268,6 +268,37 @@ test('settings watcher applies global off-to-on and invalid transitions in fail-
   assert.equal(h.policyInstalls.at(-1), 'blocked');
 });
 
+test('blocked synchronize denies ultra_delegate launches until a successful resync restores delegation', async () => {
+  const h = harness();
+  await h.start();
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on');
+
+  // Persistent installPolicy failure after a previous enabled policy exists:
+  // synchronize reports blocked but retains the stale enabled registration,
+  // so the tool gate alone must not decide launch authority.
+  const realInstall = h.deps.installPolicy.bind(h.deps);
+  h.deps.installPolicy = async () => { throw new Error('authority service down'); };
+  await h.change();
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: blocked');
+  const staleEnabled = h.registrations.filter((registration) => registration.mode === 'enabled').at(-1);
+  assert.equal(staleEnabled?.operational, true, 'precondition: stale enabled registration retains operational authority');
+
+  const blocked = await h.pi.tool('ultra_delegate', delegateInput()) as any;
+  assert.equal(blocked.isError, true);
+  assert.match(resultText(blocked), /blocked/i);
+  assert.equal(h.preparedInputs.length, 0, 'no preflight while policy is blocked');
+  assert.equal(h.launches.length, 0, 'no launch while policy is blocked');
+
+  // A subsequent successful watcher resync restores normal authorized delegation.
+  h.deps.installPolicy = realInstall;
+  await h.change();
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on');
+  const delegated = await h.pi.tool('ultra_delegate', delegateInput()) as any;
+  assert.equal(delegated.isError, undefined);
+  assert.equal(h.preparedInputs.length, 1);
+  assert.equal(h.launches.length, 1);
+});
+
 test('watcher failure remains blocked until a successful watcher change resynchronizes', async () => {
   const h = harness();
   await h.start();
