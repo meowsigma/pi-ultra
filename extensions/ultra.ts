@@ -35,6 +35,7 @@ import {
 } from './ultra-operations.js';
 import {
   appendSessionUltraOverrides,
+  clearSessionUltraOverrides,
   resolveEffectiveUltraSettings,
   scanSessionUltraOverrides,
   type SessionOverridesScanResult,
@@ -78,7 +79,14 @@ export interface UltraExtensionDependencies {
   showMenu(options: {
     ctx: ExtensionCommandContext;
     state: LoadUltraSettingsResult;
-    update(patch: UltraSettingsPatch | UltraSettingsMutator): Promise<ValidUltraSettingsResult>;
+    /** Whether the active session carries any explicit override snapshots. */
+    hasSessionOverrides: boolean;
+    /** Session-scope updater: appends current-session overrides only, never the global file. */
+    updateSession(patch: UltraSettingsPatch | UltraSettingsMutator): Promise<ValidUltraSettingsResult>;
+    /** Appends one explicit empty snapshot and returns the effective global defaults. */
+    resetSession(): Promise<ValidUltraSettingsResult>;
+    /** Global-scope updater: transactional pi-ultra.json write plus active-session resync. */
+    updateGlobal(patch: UltraSettingsPatch | UltraSettingsMutator): Promise<ValidUltraSettingsResult>;
     recover(): Promise<{ backupPath: string; committed: ValidUltraSettingsResult }>;
   }): Promise<unknown>;
   checkCapabilities(events: ExtensionAPI['events']): Promise<boolean>;
@@ -232,7 +240,8 @@ const DEFAULT_DEPENDENCIES: UltraExtensionDependencies = {
   loadSettings: () => loadUltraSettings(),
   updateSettings: (patch) => updateUltraSettings(patch),
   backupAndReset: () => backupAndResetUltraSettings(),
-  showMenu: ({ ctx, state, update, recover }) => showUltraMenu({ ctx, state, update, recover }),
+  showMenu: ({ ctx, state, hasSessionOverrides, updateSession, resetSession, updateGlobal, recover }) =>
+    showUltraMenu({ ctx, state, hasSessionOverrides, updateSession, resetSession, updateGlobal, recover }),
   checkCapabilities: defaultCheckCapabilities,
   installPolicy: defaultInstallPolicy,
   watchSettings: (onChange, onError) => watchUltraSettings(onChange, undefined, onError),
@@ -616,9 +625,10 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             await dependencies.showMenu({
               ctx,
               state,
-              // Session-local update callback: menu edits append session
-              // overrides and never touch the global settings file.
-              update: async (patchInput) => {
+              hasSessionOverrides: Object.keys(sessionPatch).length > 0,
+              // Session-scope updater: menu edits append session overrides and
+              // never touch the global settings file.
+              updateSession: async (patchInput) => {
                 const baseSettings = state.kind === 'invalid' ? undefined : state.settings;
                 const patch = typeof patchInput === 'function' && baseSettings
                   ? patchInput(baseSettings)
@@ -660,6 +670,37 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
                   revision: bindRevision(refreshed.revision, stablePatchDigest(sessionPatch)),
                   path: refreshed.path,
                 } satisfies ValidUltraSettingsResult;
+              },
+              // Reset: one explicit empty session snapshot clears every
+              // override; the global file stays untouched and the reported
+              // state is the effective global defaults.
+              resetSession: async () => {
+                clearSessionUltraOverrides((customType, data) => pi.appendEntry(customType, data));
+                await synchronize(ctx);
+                const refreshed = await dependencies.loadSettings();
+                if (refreshed.kind === 'invalid') {
+                  throw new Error(`Ultra configuration is blocked: ${refreshed.reason}`);
+                }
+                let applied: UltraSettings;
+                try {
+                  applied = resolveEffectiveUltraSettings(refreshed.settings, sessionPatch);
+                } catch (error) {
+                  throw new Error(boundedMessage(error));
+                }
+                return {
+                  kind: 'loaded',
+                  settings: applied,
+                  revision: bindRevision(refreshed.revision, stablePatchDigest(sessionPatch)),
+                  path: refreshed.path,
+                } satisfies ValidUltraSettingsResult;
+              },
+              // Global-scope updater: the existing transactional locked write,
+              // then resync this session; inheriting sessions observe the same
+              // change through the settings watcher without losing patched fields.
+              updateGlobal: async (patchInput) => {
+                const committed = await dependencies.updateSettings(patchInput);
+                await synchronize(ctx);
+                return committed;
               },
               recover: async () => {
                 try {

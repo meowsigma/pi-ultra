@@ -358,8 +358,8 @@ test('committed cleanup errors still resynchronize menu recovery; menu updates s
     menu.setLoaded(off);
     throw new UltraSettingsCleanupError('committed cleanup warning', off);
   };
-  let menuUpdate!: ShowMenuOptions['update'];
-  menu.deps.showMenu = async (options) => { menuUpdate = options.update; return {}; };
+  let menuUpdate!: ShowMenuOptions['updateSession'];
+  menu.deps.showMenu = async (options) => { menuUpdate = options.updateSession; return {}; };
   await menu.pi.command('ultra');
   const disabled = await menuUpdate({ enabled: false });
   assert.equal(disabled.kind, 'loaded');
@@ -388,9 +388,11 @@ test('committed cleanup errors still resynchronize menu recovery; menu updates s
 test('menu disable resolves a bound off result without touching globals and rejects on invalid globals', async () => {
   const h = harness();
   await h.start();
-  let update!: ShowMenuOptions['update'];
-  h.deps.showMenu = async (options) => { update = options.update; return {}; };
+  let update!: ShowMenuOptions['updateSession'];
+  let hasOverridesAtOpen: boolean | undefined;
+  h.deps.showMenu = async (options) => { update = options.updateSession; hasOverridesAtOpen = options.hasSessionOverrides; return {}; };
   await h.pi.command('ultra');
+  assert.equal(hasOverridesAtOpen, false, 'fresh session reports no overrides on the main screen');
 
   const disabled = await update({ enabled: false });
   assert.equal(disabled.kind, 'loaded');
@@ -412,8 +414,8 @@ test('menu Automatic maps an explicit clear to workerModel null and restores acr
   await first.start();
   // A selected session model must first be overridable by Automatic.
   await applySessionPatch(first, { routingMode: 'uniform', workerModel: 'openai/session-model' });
-  let update!: ShowMenuOptions['update'];
-  first.deps.showMenu = async (options) => { update = options.update; return {}; };
+  let update!: ShowMenuOptions['updateSession'];
+  first.deps.showMenu = async (options) => { update = options.updateSession; return {}; };
   await first.pi.command('ultra');
 
   const automatic = await update({ workerModel: undefined });
@@ -440,6 +442,55 @@ test('menu Automatic maps an explicit clear to workerModel null and restores acr
   assert.equal(delegated.isError, undefined);
   assert.equal('workerModel' in second.preparedInputs[0]!.settings, false, 'restored branch keeps explicit Automatic');
   assert.equal(second.preparedInputs[0]!.settings.routingMode, 'uniform');
+});
+
+test('menu global updater writes pi-ultra.json transactionally while reset only appends an empty snapshot', async () => {
+  const h = harness();
+  await h.start();
+  await applySessionPatch(h, { minLanes: 4, maxLanes: 8 });
+
+  let opts!: ShowMenuOptions;
+  h.deps.showMenu = async (options) => { opts = options; return {}; };
+  await h.pi.command('ultra');
+  assert.equal(opts.hasSessionOverrides, true);
+
+  const globalWrites: unknown[] = [];
+  const innerUpdateSettings = h.deps.updateSettings;
+  h.deps.updateSettings = async (patch) => {
+    globalWrites.push(patch);
+    return innerUpdateSettings(patch);
+  };
+
+  const committed = await opts.updateGlobal({ enabled: false });
+  assert.equal(committed.kind, 'loaded');
+  assert.deepEqual(globalWrites, [{ enabled: false }], 'only the explicit global updater writes the global file');
+  assert.equal(committed.settings.enabled, false);
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: off', 'active session resynchronizes after the global write');
+
+  // The session updater keeps writing only local snapshots.
+  await opts.updateSession({ enabled: true });
+  assert.deepEqual(globalWrites, [{ enabled: false }]);
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on');
+
+  // Reset appends exactly one empty snapshot and returns effective global defaults.
+  const before = h.pi.entries.filter((entry) => entry.customType === SESSION_OVERRIDE_TYPE).length;
+  const reset = await opts.resetSession();
+  assert.equal(reset.kind, 'loaded');
+  assert.deepEqual(
+    reset.settings,
+    { version: 1, enabled: false, routingMode: 'uniform', workerModel: 'openai/test-model', minLanes: 2, maxLanes: 4 },
+    'reset reports the effective global defaults, not the prior session patch',
+  );
+  const snapshots = h.pi.entries.filter((entry) => entry.customType === SESSION_OVERRIDE_TYPE);
+  assert.equal(snapshots.length, before + 1);
+  assert.deepEqual((snapshots.at(-1)?.data as any).patch, {}, 'reset appends one explicit empty snapshot');
+  assert.deepEqual(globalWrites, [{ enabled: false }], 'reset never writes the global file');
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: off');
+
+  let reopened!: ShowMenuOptions;
+  h.deps.showMenu = async (options) => { reopened = options; return {}; };
+  await h.pi.command('ultra');
+  assert.equal(reopened.hasSessionOverrides, false, 'a cleared session reports no overrides');
 });
 
 test('shutdown disposes policy, watcher, completion listeners, and prevents stale delivery', async () => {
