@@ -10,7 +10,7 @@ import {
 import type { UltraDelegateInput, UltraPreparedWave } from '../extensions/ultra-protocol.js';
 import { validateUltraDelegateInput } from '../extensions/ultra-protocol.js';
 import { buildSettingsScreen } from '../extensions/ultra-menu.js';
-import { appendSessionUltraOverrides } from '../extensions/ultra-session-settings.js';
+import { appendSessionUltraOverrides, CommittedSessionUpdateError } from '../extensions/ultra-session-settings.js';
 import { FakePi, type FakePiOptions } from './fixtures/fake-pi.js';
 
 const ENABLED: UltraSettings = {
@@ -408,6 +408,80 @@ test('menu disable resolves a bound off result without touching globals and reje
   h.setLoaded({ kind: 'invalid', reason: 'rewritten badly', path: '/tmp/pi-ultra.json' });
   await assert.rejects(() => update({ enabled: true }), /rewritten badly/);
   assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: blocked');
+});
+
+test('post-append resync failure rejects as a committed session update and keeps truthful provenance', async () => {
+  const h = harness();
+  await h.start();
+  let update!: ShowMenuOptions['updateSession'];
+  let opts!: ShowMenuOptions;
+  h.deps.showMenu = async (options) => { opts = options; update = options.updateSession; return {}; };
+  await h.pi.command('ultra');
+
+  const globalWrites: unknown[] = [];
+  const innerUpdateSettings = h.deps.updateSettings;
+  h.deps.updateSettings = async (patch) => { globalWrites.push(patch); return innerUpdateSettings(patch); };
+  const innerLoad = h.deps.loadSettings;
+  h.deps.loadSettings = async () => { throw new Error('load exploded'); };
+
+  await assert.rejects(() => update({ enabled: false }), (error: unknown) =>
+    error instanceof CommittedSessionUpdateError &&
+    error.committed === true &&
+    error.cause instanceof Error &&
+    /load exploded/.test(error.cause.message), 'a durable append followed by a failed resync must surface as a committed outcome');
+
+  // Enforcement stays fail-closed after the failed post-commit refresh.
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: blocked');
+  // The snapshot durably committed exactly once and the global file was never written.
+  const snapshots = h.pi.entries.filter((entry) => entry.customType === SESSION_OVERRIDE_TYPE);
+  assert.equal(snapshots.length, 1);
+  assert.deepEqual((snapshots[0]?.data as any).patch, { enabled: false });
+  assert.deepEqual(globalWrites, []);
+
+  // Provenance is truthful on reopen: an override snapshot exists.
+  h.deps.loadSettings = innerLoad;
+  await h.pi.command('ultra');
+  assert.equal(opts.hasSessionOverrides, true);
+});
+
+test('reset that clears but fails post-clear resync rejects as a committed outcome and provenance becomes None', async () => {
+  const h = harness();
+  await h.start();
+  await applySessionPatch(h, { minLanes: 4, maxLanes: 8 });
+
+  let opts!: ShowMenuOptions;
+  h.deps.showMenu = async (options) => { opts = options; return {}; };
+  await h.pi.command('ultra');
+  assert.equal(opts.hasSessionOverrides, true);
+
+  const innerLoad = h.deps.loadSettings;
+  h.deps.loadSettings = async () => { throw new Error('load exploded'); };
+
+  await assert.rejects(() => opts.resetSession(), (error: unknown) =>
+    error instanceof CommittedSessionUpdateError && error.committed === true,
+  'a durable clear followed by a failed resync must surface as a committed outcome');
+
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: blocked');
+  const snapshots = h.pi.entries.filter((entry) => entry.customType === SESSION_OVERRIDE_TYPE);
+  assert.deepEqual((snapshots.at(-1)?.data as any).patch, {}, 'the explicit empty clear snapshot committed');
+
+  h.deps.loadSettings = innerLoad;
+  // The reopened menu captures fresh options; provenance must truthfully report the committed clear.
+  await h.pi.command('ultra');
+  assert.equal(opts.hasSessionOverrides, false);
+});
+
+test('pre-append validation failure stays an ordinary rejection and appends nothing', async () => {
+  const h = harness();
+  await h.start();
+  let update!: ShowMenuOptions['updateSession'];
+  h.deps.showMenu = async (options) => { update = options.updateSession; return {}; };
+  await h.pi.command('ultra');
+
+  await assert.rejects(() => update({ workerModel: 'missing-provider-separator' }), (error: unknown) =>
+    !(error instanceof CommittedSessionUpdateError));
+  assert.equal(h.pi.entries.some((entry) => entry.customType === SESSION_OVERRIDE_TYPE), false, 'nothing was durably appended before validation failed');
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on', 'failed-before-append updates do not disturb effective enforcement');
 });
 
 test('menu Automatic maps an explicit clear to workerModel null and restores across a new FakePi branch', async () => {

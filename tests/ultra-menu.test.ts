@@ -16,6 +16,7 @@ import {
   type UltraMenuContext,
 } from '../extensions/ultra-menu.js';
 import { UltraSettingsCleanupError } from '../extensions/ultra-config.js';
+import { CommittedSessionUpdateError } from '../extensions/ultra-session-settings.js';
 import type { LoadUltraSettingsResult, UltraSettings, UltraSettingsPatch, ValidUltraSettingsResult } from '../extensions/ultra-config.js';
 
 /** Session-flavored effective state (as if a session override had been applied). */
@@ -341,7 +342,7 @@ test('unsuccessful session update keeps provenance truthful (None)', async () =>
     { kind: 'select', response: 'Disable Ultra' },
     { kind: 'select', response: 'Close' },
   ]);
-  const { ctx } = rpcContext(rpc);
+  const { ctx, notifications } = rpcContext(rpc);
   const updates = updaters();
   await showUltraMenu({
     ctx,
@@ -351,6 +352,8 @@ test('unsuccessful session update keeps provenance truthful (None)', async () =>
   });
   rpc.assertConsumed();
   assert.match(JSON.stringify(rpc.dialogs.at(-1)), /Session overrides: None/);
+  assert.deepEqual(notifications, ['Menu action failed: session commit failed'],
+    'a rejected pre-append failure gets only the framework rejection notice, never a committed-outcome warning');
 });
 
 test('committed cleanup error still reports Active provenance because the snapshot committed', async () => {
@@ -369,6 +372,51 @@ test('committed cleanup error still reports Active provenance because the snapsh
   });
   rpc.assertConsumed();
   assert.match(JSON.stringify(rpc.dialogs.at(-1)), /Session overrides: Active/);
+});
+
+test('post-append refresh failure surfaces as a committed outcome: Active provenance, conservative settings, warning', async () => {
+  const rpc = createRpcHarness([
+    { kind: 'select', response: 'Disable Ultra' },
+    { kind: 'select', response: 'Close' },
+  ]);
+  const { ctx, notifications } = rpcContext(rpc);
+  const updates = updaters();
+  await showUltraMenu({
+    ctx,
+    ...menuOptions(updates, {
+      updateSession: async (patch) => {
+        await updates.updateSession(patch); // the durable append commits
+        throw new CommittedSessionUpdateError('Session settings were saved, but the refreshed state could not be verified.');
+      },
+    }),
+  });
+  rpc.assertConsumed();
+  const main = JSON.stringify(rpc.dialogs.at(-1));
+  assert.match(main, /Session overrides: Active/, 'provenance follows the committed append, not a rolled-back display');
+  assert.match(main, /Ultra: Enabled/, 'displayed settings stay conservative when the refreshed state cannot be verified');
+  assert.match(notifications[0] ?? '', /could not be verified/i, 'a warning surfaces instead of a silent rollback');
+});
+
+test('post-clear refresh failure surfaces as a committed outcome: None provenance and a warning', async () => {
+  const rpc = createRpcHarness([
+    { kind: 'select', response: 'Reset this session to global defaults' },
+    { kind: 'select', response: 'Close' },
+  ]);
+  const { ctx, notifications } = rpcContext(rpc);
+  const updates = updaters();
+  await showUltraMenu({
+    ctx,
+    ...menuOptions(updates, {
+      resetSession: async () => {
+        throw new CommittedSessionUpdateError('Session overrides were cleared, but the refreshed state could not be verified.');
+      },
+    }),
+  });
+  rpc.assertConsumed();
+  const main = JSON.stringify(rpc.dialogs.at(-1));
+  assert.match(main, /Session overrides: None/, 'provenance follows the committed clear');
+  assert.match(main, /openai\/model-a/, 'displayed settings stay conservative when the refreshed state cannot be verified');
+  assert.match(notifications[0] ?? '', /could not be verified/i);
 });
 
 test('set-model Automatic sends an explicit workerModel key so presence-based merges see the clear', async () => {

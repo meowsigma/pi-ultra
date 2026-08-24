@@ -36,6 +36,7 @@ import {
 import {
   appendSessionUltraOverrides,
   clearSessionUltraOverrides,
+  CommittedSessionUpdateError,
   resolveEffectiveUltraSettings,
   scanSessionUltraOverrides,
   type SessionOverridesScanResult,
@@ -356,6 +357,42 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
       else pi.sendMessage({ customType: 'ultra-diagnostic', content: message, display: false, details: { level } });
     };
 
+    // Post-durable-write refresh shared by the session update/reset menu
+    // callbacks. Everything after the snapshot append/clear counts as a
+    // committed outcome, so any refresh failure surfaces as a
+    // CommittedSessionUpdateError instead of an ordinary rollback-shaped
+    // rejection; failures before any durable write are never wrapped.
+    // Disabled sessions intentionally leave `effective` undefined, so the
+    // reported state is rebuilt from freshly loaded globals plus the
+    // independently resolved session patch instead of the synchronization
+    // cache.
+    const refreshAfterCommittedSnapshot = async (ctx: ExtensionContext): Promise<ValidUltraSettingsResult> => {
+      try {
+        await synchronize(ctx);
+        const refreshed = await dependencies.loadSettings();
+        if (refreshed.kind === 'invalid') {
+          throw new Error(`Ultra configuration is blocked: ${refreshed.reason}`);
+        }
+        let applied: UltraSettings;
+        try {
+          applied = resolveEffectiveUltraSettings(refreshed.settings, sessionPatch);
+        } catch (error) {
+          throw new Error(boundedMessage(error));
+        }
+        return {
+          kind: 'loaded',
+          settings: applied,
+          revision: bindRevision(refreshed.revision, stablePatchDigest(sessionPatch)),
+          path: refreshed.path,
+        } satisfies ValidUltraSettingsResult;
+      } catch (error) {
+        throw new CommittedSessionUpdateError(
+          `Session settings were saved, but the refreshed state could not be verified (${boundedMessage(error)}); Ultra stays fail-closed until a successful resync.`,
+          { cause: error },
+        );
+      }
+    };
+
     const status = (ctx: ExtensionContext, value: 'on' | 'off' | 'blocked') => {
       if (ctx.hasUI) ctx.ui.setStatus('ultra', `Ultra: ${value}`);
     };
@@ -649,50 +686,19 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
                   override.maxLanes = record.maxLanes ?? baseSettings?.maxLanes;
                 }
                 appendSessionSnapshot(override);
-                await synchronize(ctx);
-                // Disabled sessions intentionally leave `effective`
-                // undefined, so rebuild the reported state from freshly
-                // loaded globals plus the independently resolved session
-                // patch instead of the synchronization cache.
-                const refreshed = await dependencies.loadSettings();
-                if (refreshed.kind === 'invalid') {
-                  throw new Error(`Ultra configuration is blocked: ${refreshed.reason}`);
-                }
-                let applied: UltraSettings;
-                try {
-                  applied = resolveEffectiveUltraSettings(refreshed.settings, sessionPatch);
-                } catch (error) {
-                  throw new Error(boundedMessage(error));
-                }
-                return {
-                  kind: 'loaded',
-                  settings: applied,
-                  revision: bindRevision(refreshed.revision, stablePatchDigest(sessionPatch)),
-                  path: refreshed.path,
-                } satisfies ValidUltraSettingsResult;
+                // The snapshot is durable from here on; refresh failures are
+                // committed outcomes and must not roll the display back.
+                return refreshAfterCommittedSnapshot(ctx);
               },
               // Reset: one explicit empty session snapshot clears every
               // override; the global file stays untouched and the reported
               // state is the effective global defaults.
               resetSession: async () => {
                 clearSessionUltraOverrides((customType, data) => pi.appendEntry(customType, data));
-                await synchronize(ctx);
-                const refreshed = await dependencies.loadSettings();
-                if (refreshed.kind === 'invalid') {
-                  throw new Error(`Ultra configuration is blocked: ${refreshed.reason}`);
-                }
-                let applied: UltraSettings;
-                try {
-                  applied = resolveEffectiveUltraSettings(refreshed.settings, sessionPatch);
-                } catch (error) {
-                  throw new Error(boundedMessage(error));
-                }
-                return {
-                  kind: 'loaded',
-                  settings: applied,
-                  revision: bindRevision(refreshed.revision, stablePatchDigest(sessionPatch)),
-                  path: refreshed.path,
-                } satisfies ValidUltraSettingsResult;
+                // Symmetric with updateSession: the empty clear snapshot is
+                // durable from here on; refresh failures are committed
+                // outcomes and must not roll provenance back to Active.
+                return refreshAfterCommittedSnapshot(ctx);
               },
               // Global-scope updater: the existing transactional locked write,
               // then resync this session; inheriting sessions observe the same

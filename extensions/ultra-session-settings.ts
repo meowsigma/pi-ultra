@@ -40,6 +40,23 @@ export interface SessionUltraJournalEntry {
   patch: UltraSessionOverrides;
 }
 
+/**
+ * Thrown when a session override snapshot was durably appended or cleared but
+ * a later post-commit step (synchronize, load, or resolve) failed. Carries
+ * whether the snapshot committed so callers can surface committed provenance
+ * instead of rolling the display back; failures before any durable write use
+ * ordinary errors and are never marked committed.
+ */
+export class CommittedSessionUpdateError extends Error {
+  readonly committed: boolean;
+
+  constructor(message: string, options?: ErrorOptions & { committed?: boolean }) {
+    super(message, options);
+    this.name = 'CommittedSessionUpdateError';
+    this.committed = options?.committed ?? true;
+  }
+}
+
 export interface SessionOverrideDiagnostic {
   id: string;
   reason: string;

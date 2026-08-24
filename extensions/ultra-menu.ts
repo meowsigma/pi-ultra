@@ -20,6 +20,7 @@ import type {
   UltraSettingsMutator,
   ValidUltraSettingsResult,
 } from './ultra-config.js';
+import { CommittedSessionUpdateError } from './ultra-session-settings.js';
 
 /** Which settings surface an edit targets: this session's overrides or all-session global defaults. */
 export type UltraMenuScope = 'session' | 'global';
@@ -342,8 +343,10 @@ export async function showUltraMenu(options: ShowUltraMenuOptions): Promise<RunM
 
   // Commits any updater result into the displayed state; committed cleanup
   // errors keep the committed value visible instead of rolling back.
-  // onCommitted runs in both committed branches (clean success and committed
-  // cleanup error) but never on a rejected update.
+  // Committed session-update errors carry no verified refreshed result, so
+  // displayed settings stay conservative while provenance still follows the
+  // durable append/clear. onCommitted runs in every committed branch but
+  // never on a rejected update.
   const commitUpdaterResult = async (
     pending: Promise<ValidUltraSettingsResult>,
     onCommitted?: () => void,
@@ -355,6 +358,11 @@ export async function showUltraMenu(options: ShowUltraMenuOptions): Promise<RunM
     } catch (error) {
       if (error instanceof UltraSettingsCleanupError) {
         current = error.committed;
+        onCommitted?.();
+        options.ctx.ui.notify(error.message, 'warning');
+        return { kind: 'stay' as const };
+      }
+      if (error instanceof CommittedSessionUpdateError && error.committed) {
         onCommitted?.();
         options.ctx.ui.notify(error.message, 'warning');
         return { kind: 'stay' as const };
@@ -394,10 +402,7 @@ export async function showUltraMenu(options: ShowUltraMenuOptions): Promise<RunM
     'set-routing-global': globalActions['set-routing'],
     'set-model-global': globalActions['set-model'],
     'set-lane-range-global': globalActions['set-lane-range'],
-    'reset-session': () => commitUpdaterResult(options.resetSession().then((result) => {
-      sessionOverridesPresent = false;
-      return result;
-    })),
+    'reset-session': () => commitUpdaterResult(options.resetSession(), () => { sessionOverridesPresent = false; }),
     'recover-config': async () => {
       const confirmed = await options.ctx.ui.confirm('Recover Ultra configuration?', 'The exact invalid file will be backed up, then Ultra will reset to disabled defaults.');
       if (!confirmed) return { kind: 'stay' };
