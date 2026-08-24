@@ -335,6 +335,13 @@ export interface PrepareUltraWaveInput {
 
 export async function prepareUltraWave(input: PrepareUltraWaveInput): Promise<UltraPreparedWave> {
   const validated = validateUltraDelegateInput(input.input, { minLanes: input.settings.minLanes, maxLanes: input.settings.maxLanes });
+  // A reviewer must inspect the materialized candidate produced by a prior
+  // writer wave, never race it in the same Manager-mode runs.all call.
+  if (input.settings.orchestrationMode === 'manager'
+    && validated.lanes.some((lane) => lane.role === 'worker')
+    && validated.lanes.some((lane) => lane.role === 'reviewer')) {
+    throw new Error('Manager-mode writer waves cannot include reviewer lanes; materialize the durable handoff and launch reviewers sequentially.');
+  }
   let uniformModel: string | undefined;
   if (input.settings.routingMode === 'uniform') {
     if (input.settings.workerModel) uniformModel = input.settings.workerModel;

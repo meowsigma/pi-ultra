@@ -171,6 +171,20 @@ test('preflights fixed uniform, automatic, and role-default model contracts exac
   assert.equal(calls.every((call) => call.model === undefined), true);
 });
 
+test('manager mode rejects mixed writer/reviewer waves before preflight', async () => {
+  let calls = 0;
+  await assert.rejects(() => prepareUltraWave({
+    input: input([
+      { id: 'writer', role: 'worker', task: 'Write a patch.', deliverable: 'Patch.', ownedPaths: ['src'] },
+      { id: 'reviewer', role: 'reviewer', task: 'Review a patch.', deliverable: 'Findings.' },
+    ]),
+    settings: { ...FIXED, orchestrationMode: 'manager' }, cwd: '/repo', sessionId: 'session', revision: 'revision',
+    availableModels: [{ provider: 'openai', id: 'test-model' }], parentModel: { provider: 'openai', id: 'manager' },
+    resolveContract: async () => { calls += 1; throw new Error('must not preflight'); },
+  }), /cannot include reviewer lanes/i);
+  assert.equal(calls, 0);
+});
+
 test('uses active pi-subagents RPC preflight when no test resolver is supplied', async () => {
   const events = new FakeEventBus();
   events.on('subagents:rpc:v1:request', (request: any) => {
