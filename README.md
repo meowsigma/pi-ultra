@@ -16,16 +16,16 @@ pi remove npm:pi-subagents
 pi install git:github.com/meowsigma/pi-subagents@089ae7e2aa2a6acb4e8e17dce79bda9b721b4167
 
 # Install Ultra (pin the release in production).
-pi install git:github.com/meowsigma/pi-ultra@v0.2.8
+pi install git:github.com/meowsigma/pi-ultra@v0.3.0
 ```
 
 Ultra bundles the same fork commit from its immutable HTTPS archive as a runtime API dependency because Pi packages have separate module roots. The separately installed fork is the active `subagent` extension; both copies share a versioned process registry. If the active extension does not advertise launch-authority v1, Ultra shows **blocked** and denies new subagent execution instead of partially enforcing policy.
 
 After installation, run `/reload` or start a fresh Pi session. Use `pi list` to verify that exactly one `pi-subagents` identity and one `pi-ultra` identity are enabled.
 
-## Global settings
+## Settings
 
-Settings persist globally at `~/.pi/agent/pi-ultra.json`:
+The global JSON file is the **baseline** configuration that every Pi session starts from:
 
 ```json
 {
@@ -42,14 +42,24 @@ Lane bounds are inclusive and limited to `1–8`. Changes use lock-scoped read/m
 
 A missing file uses validated defaults. A malformed, unreadable, or invalid file does **not** expose executable defaults: Ultra enters `Ultra: blocked`, preserves the exact bytes, and installs an empty-agent capability ceiling. The TUI recovery action asks for confirmation, writes an exact timestamped backup, then resets to disabled defaults.
 
-Every live session watches the global file, including atomic replacement. On/off, malformed replacement, and recovery transitions update session policy in fail-closed order.
+Every live session watches the global file, including atomic replacement. Malformed replacement and recovery transitions update policy in fail-closed order.
+
+### Session overrides
+
+Ordinary edits are **session-scoped**: opening `/ultra` and using `/ultra on`, `/ultra off`, or `/ultra toggle` changes only the current Pi session and never writes the global file. Each edit appends an immutable, non-model-visible snapshot to the session journal, so session overrides persist in that Pi session across reload/resume; the latest valid snapshot wins on restore.
+
+- The menu's **Global defaults** screens are explicit for global edits: only they write `~/.pi/agent/pi-ultra.json` for every inheriting session.
+- **Reset this session to global defaults** removes the override with one explicit empty snapshot, after which the session follows the global file again.
+- Independent sessions can differ in enabled state, routing mode, worker model, and lane range.
+- An invalid global config blocks all sessions, even overridden ones: effective settings always resolve against a valid global baseline.
+- If a session change commits but post-commit verification fails, Ultra stays fail-closed and surfaces a warning instead of claiming the settings applied.
 
 ## Commands
 
-- `/ultra` — open the TUI control menu.
-- `/ultra on` — enable global Ultra policy.
-- `/ultra off` — disable Ultra and restore ordinary pi-subagents behavior.
-- `/ultra toggle` — toggle under the settings lock.
+- `/ultra` — open the TUI control menu (session scope).
+- `/ultra on` — enable Ultra in this session only; the global file stays untouched.
+- `/ultra off` — disable Ultra in this session and restore ordinary pi-subagents behavior there.
+- `/ultra toggle` — toggle this session under the settings lock.
 - `/ultra help` — show ownership, routing, escalation, and recovery guidance.
 - `/ultra <task>` — send an explicit Ultra-managed task to the active main model.
 
