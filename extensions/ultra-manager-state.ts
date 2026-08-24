@@ -18,6 +18,7 @@ export interface UltraManagerEvent {
   policyRevision: string;
   createdAt: number;
   reason?: UltraTakeoverReason;
+  explanation?: string;
   evidence?: UltraManagerEvidence;
 }
 
@@ -32,7 +33,7 @@ export interface UltraManagerState {
   openScope(input: UltraManagerBinding & { createdAt: number }): void;
   closeScope(input: UltraManagerBinding & { createdAt: number }): void;
   recordEvidence(input: UltraManagerBinding & { evidence: UltraManagerEvidence; createdAt: number }): void;
-  recordTakeover(input: UltraManagerBinding & { reason: UltraTakeoverReason; createdAt: number }): void;
+  recordTakeover(input: UltraManagerBinding & { reason: UltraTakeoverReason; explanation: string; createdAt: number }): void;
   allowsMutation(binding: UltraManagerBinding): boolean;
   hasActiveScope(binding: UltraManagerBinding): boolean;
 }
@@ -60,11 +61,12 @@ function parseEvent(value: unknown): UltraManagerEvent | undefined {
     || !Number.isSafeInteger(value.createdAt)) return undefined;
   if (value.kind !== 'scope-opened' && value.kind !== 'scope-closed' && value.kind !== 'evidence' && value.kind !== 'takeover') return undefined;
   if (value.kind === 'evidence' && !isEvidence(value.evidence)) return undefined;
-  if (value.kind === 'takeover' && !isReason(value.reason)) return undefined;
+  if (value.kind === 'takeover' && (!isReason(value.reason) || !validText(value.explanation))) return undefined;
   return {
     version: 1, id: value.id, scopeId: value.scopeId, rootId: value.rootId, kind: value.kind,
     policyRevision: value.policyRevision, createdAt: value.createdAt,
     ...(isReason(value.reason) ? { reason: value.reason } : {}),
+    ...(value.kind === 'takeover' && validText(value.explanation) ? { explanation: value.explanation } : {}),
     ...(isEvidence(value.evidence) ? { evidence: value.evidence } : {}),
   };
 }
@@ -111,6 +113,7 @@ export function createUltraManagerState(input: { append(event: UltraManagerEvent
     },
     recordTakeover(inputValue) {
       if (!active(inputValue)) throw new Error('Manager takeover requires an active matching scope.');
+      if (!validText(inputValue.explanation)) throw new Error('Manager takeover requires a bounded explanation.');
       const requiredEvidence: UltraManagerEvidence | undefined = inputValue.reason === 'dirty-worktree' || inputValue.reason === 'repair-exhausted' || inputValue.reason === 'worker-capability-failure'
         ? inputValue.reason
         : undefined;

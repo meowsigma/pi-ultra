@@ -370,13 +370,13 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
 
     const operations = createUltraOperationStore({ append: (data) => pi.appendEntry(ULTRA_OPERATION_ENTRY, data) });
     const managerState = createUltraManagerState({ append: (data) => pi.appendEntry(ULTRA_MANAGER_ENTRY, data) });
-    // Runtime identity fences restored decisions. Journal history remains inspectable
-    // after reload, but no parent-mutation grant crosses an extension lifetime.
-    let managerTurnNonce = randomUUID();
+    // Scope binding must survive leaf changes caused by compaction and reload.
+    // A scope ID is still explicitly re-established per agent turn below, so
+    // durable history cannot silently grant a newly started turn authority.
     let currentManagerScopeId: string | undefined;
     const managerBinding = (ctx: ExtensionContext, scopeId: string): UltraManagerBinding | undefined => {
       if (!effective || effective.orchestrationMode !== 'manager' || !effectiveRevisionValue) return undefined;
-      return { scopeId, rootId: `${ctx.sessionManager.getLeafId()}:${managerTurnNonce}`, policyRevision: effectiveRevisionValue };
+      return { scopeId, rootId: sessionIdentity(ctx), policyRevision: effectiveRevisionValue };
     };
 
     const appendSessionSnapshot = (patch: UltraSessionOverrides): void => {
@@ -650,7 +650,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
         const binding = scopeId ? managerBinding(ctx, scopeId) : undefined;
         if (!binding || !reason || !explanation) return toolError('Ultra Manager takeover requires an active synchronized scope, valid reason, and explanation.');
         try {
-          managerState.recordTakeover({ ...binding, reason, createdAt: Date.now() });
+          managerState.recordTakeover({ ...binding, reason, explanation: explanation.slice(0, 512), createdAt: Date.now() });
           return { content: [{ type: 'text' as const, text: `Ultra Manager takeover recorded for scope ${scopeId}: ${reason}. Parent mutation is now limited to this scope and policy revision.` }], details: { kind: 'manager-takeover', scopeId, reason } };
         } catch (error) {
           return toolError(boundedMessage(error));
@@ -931,7 +931,6 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
     pi.on('before_agent_start', (event, ctx) => {
       // Each turn gets a fresh fence. A restored/replayed scope is durable
       // evidence, never an inherited authority grant for a new turn.
-      managerTurnNonce = randomUUID();
       currentManagerScopeId = undefined;
       if (!effective?.enabled || !policy?.operational) return;
       return { systemPrompt: `${event.systemPrompt}\n\n${managerPolicy(effective)}` };

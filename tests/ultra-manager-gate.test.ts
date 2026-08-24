@@ -46,6 +46,8 @@ test('manager mode denies parent mutation until an urgent scoped takeover is dur
   assert.equal((scope as any).isError, undefined);
   const takeover = await pi.tool('ultra_takeover', { scopeId: 'scope-1', reason: 'urgent-user-directed', explanation: 'The user requires a direct urgent fix.' });
   assert.equal((takeover as any).isError, undefined);
+  const takeoverEntry = pi.entries.find((entry: any) => entry.customType === 'ultra.manager.v1' && entry.data.kind === 'takeover') as any;
+  assert.equal(takeoverEntry.data.explanation, 'The user requires a direct urgent fix.');
 
   const [after] = await pi.emit('tool_call', { toolName: 'write', input: { path: 'a', content: 'b' } });
   assert.equal(after, undefined);
