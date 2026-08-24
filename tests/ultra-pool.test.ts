@@ -39,10 +39,11 @@ test('resume permits are durable, exact-bound, idempotent, and one-use', () => {
   const pool = createUltraPool({ append: (data) => entries.push({ type: 'custom', customType: ULTRA_POOL_ENTRY, data }), now: () => now });
   pool.enqueue(job('job'));
   pool.admitNext({ leaseId: 'lease', expiresAt: 100 });
-  const intent = { id: 'permit', jobId: 'job', leaseId: 'lease', targetRunId: 'run', requestDigest: 'a'.repeat(64), expiresAt: 50 };
+  const intent = { id: 'permit', jobId: 'job', leaseId: 'lease', targetRunId: 'run', requestDigest: 'a'.repeat(64), worker: { key: 'worker', agent: 'ultra-worker', modelCandidates: ['openai/model'], launchContractDigest: 'b'.repeat(64), workspaceBase: 'c'.repeat(40), promptDigest: 'd'.repeat(64) }, expiresAt: 50 };
   assert.equal(pool.issueResumePermit(intent).state, 'issued');
   assert.equal(pool.issueResumePermit(intent).state, 'issued');
   assert.throws(() => pool.consumeResumePermit({ ...intent, targetRunId: 'other' }), /exact/i);
+  assert.throws(() => pool.consumeResumePermit({ ...intent, worker: { ...intent.worker, promptDigest: 'e'.repeat(64) } }), /exact/i);
   assert.equal(pool.consumeResumePermit(intent).state, 'consumed');
   assert.throws(() => pool.consumeResumePermit(intent), /consumed/i);
   const restored = createUltraPool({ append: () => assert.fail('no append'), now: () => now });
