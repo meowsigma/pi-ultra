@@ -53,6 +53,7 @@ function harness(options: {
   capabilities?: boolean;
   launchReceipt?: unknown;
   queryResult?: unknown;
+  writerAdmission?: { admitted: boolean; checkedGit: boolean; reason: any; diagnostics: readonly string[] };
   /** Shared global-settings box so multiple sessions observe the same file. */
   globals?: { current: LoadUltraSettingsResult };
   /** Distinct FakePi session identity and seeded branch entries. */
@@ -104,7 +105,7 @@ function harness(options: {
     },
     launchWave: async (value) => { launches.push(value); return options.launchReceipt ?? { text: 'Async workflow', details: { runId: 'run-1', asyncDir: '/tmp/run-1' } }; },
     queryStatus: async () => options.queryResult,
-    admitWriterWave: async () => ({ admitted: true, checkedGit: true, reason: 'admitted', diagnostics: [] }),
+    admitWriterWave: async () => options.writerAdmission ?? ({ admitted: true, checkedGit: true, reason: 'admitted', diagnostics: [] }),
     randomId: () => `op-${++uuid}`,
   };
   const pi = new FakePi('tui', '/repo', options.session);
@@ -182,6 +183,16 @@ test('ultra_delegate prepares one wave, records receipt evidence, and never clai
   assert.match(resultText(result), /operation op-1.*run run-1/i);
   assert.doesNotMatch(resultText(result), /accepted|successful/i);
   assert.equal(h.pi.entries.some((entry) => entry.customType === 'ultra.operation.v1'), true);
+});
+
+test('writer admission denies before preflight or permit spending and keeps read-only authority intact', async () => {
+  const h = harness({ writerAdmission: { admitted: false, checkedGit: true, reason: 'dirty-worktree', diagnostics: ['Repository has uncommitted changes.'] } });
+  await h.start();
+  const result = await h.pi.tool('ultra_delegate', delegateInput()) as any;
+  assert.equal(result.isError, true);
+  assert.match(resultText(result), /writer admission denied.*dirty-worktree/i);
+  assert.equal(h.preparedInputs.length, 0);
+  assert.equal(h.launches.length, 0);
 });
 
 test('direct subagent spawn is blocked while enabled but proven non-spawning management remains available', async () => {
