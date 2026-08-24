@@ -729,7 +729,18 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             capabilityCeiling: policy.capabilityCeiling, events: pi.events,
           });
           if (prepared.lanes.some((lane) => lane.lane.role !== 'reviewer')) return toolError('Candidate review permits reviewer lanes only.');
-          const receipt = await dependencies.launchWave({ events: pi.events, authority: policy.authority, prepared, signal: toolSignal });
+          const reviewOperationId = `${operation.operationId}.review`;
+          const reviewAttemptId = ultraLaunchIdempotencyKey({ operationId: reviewOperationId, attemptIndex: 0 });
+          operations.recordQueuedLaunch({ idempotencyKey: reviewAttemptId, operationId: reviewOperationId, runId: `pending:${reviewOperationId}`, lanes: operationLanes(prepared), receipt: { state: 'queued-before-permit', reviewOf: operation.operationId } });
+          let receipt: unknown;
+          try {
+            operations.markLaunchAdmitted(reviewAttemptId);
+            receipt = await dependencies.launchWave({ events: pi.events, authority: policy.authority, prepared, signal: toolSignal });
+            operations.markLaunched(reviewAttemptId);
+          } catch (error) {
+            operations.markFailedPreSpawn(reviewAttemptId, boundedMessage(error));
+            throw error;
+          }
           const reviewerRunId = receiptRunId(receipt);
           if (!reviewerRunId) return toolError('Reviewer launch receipt could not be correlated. Do not relaunch; inspect subagent status.');
           operations.beginReviewer(operation.operationId, reviewerRunId);
