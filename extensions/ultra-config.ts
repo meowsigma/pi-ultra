@@ -13,10 +13,12 @@ export const ULTRA_SETTINGS_FILE = 'pi-ultra.json';
 const LOCK_TIMEOUT_MS = 2_000;
 const LOCK_RETRY_MS = 50;
 const STALE_LOCK_MS = 30_000;
-const MAX_MODEL_BYTES = 256;
+export const MAX_MODEL_BYTES = 256;
 const MAX_REASON_LENGTH = 512;
 const ULTRA_FIELDS = new Set(['version', 'enabled', 'routingMode', 'workerModel', 'minLanes', 'maxLanes']);
-const MODEL_ID = /^[^\s\u0000-\u001f\u007f/]+\/[^\s\u0000-\u001f\u007f]+$/u;
+// Provider-qualified model id: 'provider/model' with no whitespace or control chars.
+// Exported so session-override validation accepts identical ids.
+export const MODEL_ID = /^[^\s\u0000-\u001f\u007f/]+\/[^\s\u0000-\u001f\u007f]+$/u;
 
 export type RoutingMode = 'uniform' | 'role-defaults';
 export type UltraRole = (typeof ULTRA_ROLE_NAMES)[number];

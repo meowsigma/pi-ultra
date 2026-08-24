@@ -86,6 +86,15 @@ export interface FakePiContext {
   };
 }
 
+export interface FakePiOptions {
+  /** Distinct session id; defaults to 'fake-session'. */
+  sessionId?: string;
+  /** Distinct session file path; defaults to '/tmp/fake-session.jsonl'. */
+  sessionFile?: string;
+  /** Seeded branch entries restored from a prior session, returned before appended entries. */
+  branch?: unknown[];
+}
+
 export class FakePi {
   readonly events = new FakeEventBus();
   readonly commands = new Map<string, FakeCommand>();
@@ -97,10 +106,12 @@ export class FakePi {
   readonly statuses: Array<{ key: string; value: string | undefined }> = [];
   readonly notifications: FakeNotification[] = [];
   readonly availableModels: unknown[] = [];
+  readonly seededBranch: unknown[];
 
   readonly context: FakePiContext;
 
-  constructor(mode: FakePiContext['mode'] = 'tui', cwd = '/repo') {
+  constructor(mode: FakePiContext['mode'] = 'tui', cwd = '/repo', options: FakePiOptions = {}) {
+    this.seededBranch = options.branch ? [...options.branch] : [];
     this.context = {
       mode,
       hasUI: mode === 'tui' || mode === 'rpc',
@@ -116,10 +127,11 @@ export class FakePi {
       model: undefined,
       modelRegistry: { getAvailable: () => this.availableModels },
       sessionManager: {
-        getSessionId: () => 'fake-session',
-        getSessionFile: () => '/tmp/fake-session.jsonl',
-        getLeafId: () => 'fake-leaf',
-        getBranch: () => this.entries,
+        getSessionId: () => options.sessionId ?? 'fake-session',
+        getSessionFile: () => options.sessionFile ?? '/tmp/fake-session.jsonl',
+        getLeafId: () => options.sessionId ? `${options.sessionId}-leaf` : 'fake-leaf',
+        // Pi branch order as supplied: seeded entries first, then appends.
+        getBranch: () => [...this.seededBranch, ...this.entries],
       },
     };
   }

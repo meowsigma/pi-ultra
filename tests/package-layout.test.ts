@@ -14,6 +14,7 @@ const requiredPackedFiles = [
   'package/extensions/index.ts',
   'package/extensions/ultra.ts',
   'package/extensions/ultra-protocol.ts',
+  'package/extensions/ultra-session-settings.ts',
   'package/agents/ultra-scout.md',
   'package/agents/ultra-worker.md',
   'package/agents/ultra-reviewer.md',
@@ -48,6 +49,13 @@ test('package exposes exactly one Pi extension and the Ultra subagent layout', (
 
   const ultraSource = readFileSync(resolve(root, 'extensions/ultra.ts'), 'utf8');
   assert.equal([...ultraSource.matchAll(/\bregisterCommand\s*\(\s*(['"`])ultra\1/g)].length, 1);
+  // Session-scoped settings ship in the packed release and the extension
+  // actually imports/loads them at runtime, not just as an unused asset.
+  assert.match(
+    ultraSource,
+    /from ['"]\.\/ultra-session-settings\.js['"]/,
+    'extensions/ultra.ts must load extensions/ultra-session-settings.ts',
+  );
 });
 
 test('npm pack dry-run includes the required Ultra release files', () => {
