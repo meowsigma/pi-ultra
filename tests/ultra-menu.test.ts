@@ -319,6 +319,58 @@ test('RPC adapter receives deterministic unfiltered all-registry model choices a
   assert.deepEqual(updates.sessionPatches, [{ workerModel: 'anthropic/model-b' }]);
 });
 
+test('successful ordinary session edit flips provenance to Active in the same open menu', async () => {
+  const rpc = createRpcHarness([
+    { kind: 'select', response: 'Settings…' },
+    { kind: 'select', response: 'Routing mode (One model for every lane)' },
+    { kind: 'select', response: 'Back' },
+    { kind: 'select', response: 'Close' },
+  ]);
+  const { ctx } = rpcContext(rpc);
+  const updates = updaters();
+  await showUltraMenu({ ctx, ...menuOptions(updates, { hasSessionOverrides: false }) });
+  rpc.assertConsumed();
+  assert.deepEqual(updates.sessionPatches, [{ routingMode: 'role-defaults' }]);
+  // The rebuilt main screen in the same open menu must report live provenance.
+  const mainAgain = JSON.stringify(rpc.dialogs.at(-1));
+  assert.match(mainAgain, /Session overrides: Active/);
+});
+
+test('unsuccessful session update keeps provenance truthful (None)', async () => {
+  const rpc = createRpcHarness([
+    { kind: 'select', response: 'Disable Ultra' },
+    { kind: 'select', response: 'Close' },
+  ]);
+  const { ctx } = rpcContext(rpc);
+  const updates = updaters();
+  await showUltraMenu({
+    ctx,
+    ...menuOptions(updates, {
+      updateSession: async () => { throw new Error('session commit failed'); },
+    }),
+  });
+  rpc.assertConsumed();
+  assert.match(JSON.stringify(rpc.dialogs.at(-1)), /Session overrides: None/);
+});
+
+test('committed cleanup error still reports Active provenance because the snapshot committed', async () => {
+  const rpc = createRpcHarness([
+    { kind: 'select', response: 'Disable Ultra' },
+    { kind: 'select', response: 'Close' },
+  ]);
+  const { ctx } = rpcContext(rpc);
+  const committed = { kind: 'loaded' as const, settings: { ...SETTINGS, enabled: false }, revision: 'r2', path: '/tmp/pi-ultra.json' };
+  const updates = updaters();
+  await showUltraMenu({
+    ctx,
+    ...menuOptions(updates, {
+      updateSession: async () => { throw new UltraSettingsCleanupError('committed but cleanup failed', committed); },
+    }),
+  });
+  rpc.assertConsumed();
+  assert.match(JSON.stringify(rpc.dialogs.at(-1)), /Session overrides: Active/);
+});
+
 test('set-model Automatic sends an explicit workerModel key so presence-based merges see the clear', async () => {
   const rpc = createRpcHarness([
     { kind: 'select', response: 'Settings…' },

@@ -342,13 +342,20 @@ export async function showUltraMenu(options: ShowUltraMenuOptions): Promise<RunM
 
   // Commits any updater result into the displayed state; committed cleanup
   // errors keep the committed value visible instead of rolling back.
-  const commitUpdaterResult = async (pending: Promise<ValidUltraSettingsResult>): Promise<MenuActionResult<UltraScreenId>> => {
+  // onCommitted runs in both committed branches (clean success and committed
+  // cleanup error) but never on a rejected update.
+  const commitUpdaterResult = async (
+    pending: Promise<ValidUltraSettingsResult>,
+    onCommitted?: () => void,
+  ): Promise<MenuActionResult<UltraScreenId>> => {
     try {
       current = await pending;
+      onCommitted?.();
       return { kind: 'stay' as const };
     } catch (error) {
       if (error instanceof UltraSettingsCleanupError) {
         current = error.committed;
+        onCommitted?.();
         options.ctx.ui.notify(error.message, 'warning');
         return { kind: 'stay' as const };
       }
@@ -358,6 +365,10 @@ export async function showUltraMenu(options: ShowUltraMenuOptions): Promise<RunM
 
   const applySession: ScopedUpdater = (patch) => options.updateSession(patch);
   const applyGlobal: ScopedUpdater = (patch) => options.updateGlobal(patch);
+
+  // Provenance flips to Active only once a session update has actually
+  // committed; rejected updates leave it untouched.
+  const commitSessionUpdate: ScopedApply = (patch) => commitUpdaterResult(applySession(patch), () => { sessionOverridesPresent = true; });
 
   const screens: Record<UltraScreenId, MenuScreenFactory<UltraMenuState, UltraScreenId, UltraActionId>> = {
     main: () => isValidState(current)
@@ -372,13 +383,13 @@ export async function showUltraMenu(options: ShowUltraMenuOptions): Promise<RunM
     'global-lane-range': () => buildLaneRangeScreen(requireSettings(), 'global'),
   };
 
-  const sessionActions = scopedSettingActions(SESSION_TARGETS, (patch) => commitUpdaterResult(applySession(patch)));
+  const sessionActions = scopedSettingActions(SESSION_TARGETS, commitSessionUpdate);
   const globalActions = scopedSettingActions(GLOBAL_TARGETS, (patch) => commitUpdaterResult(applyGlobal(patch)));
 
   const actions: Record<UltraActionId, MenuActionHandler<UltraMenuState, UltraScreenId, UltraMenuContext>> = {
     ...sessionActions,
-    'enable-ultra': () => commitUpdaterResult(applySession({ enabled: true })),
-    'disable-ultra': () => commitUpdaterResult(applySession({ enabled: false })),
+    'enable-ultra': () => commitSessionUpdate({ enabled: true }),
+    'disable-ultra': () => commitSessionUpdate({ enabled: false }),
     'set-ultra-global': globalActions['set-ultra'],
     'set-routing-global': globalActions['set-routing'],
     'set-model-global': globalActions['set-model'],
