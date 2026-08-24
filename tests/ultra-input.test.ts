@@ -811,6 +811,68 @@ test('permit revision validation fails when the session patch or global revision
   assert.equal(await validate(reboundRevision, signal), false, 'stale permit must not cross a global revision change');
 });
 
+test('a blocked synchronize transition never yields a verified-looking session update result', async () => {
+  const h = harness();
+  await h.start();
+  let update!: ShowMenuOptions['updateSession'];
+  h.deps.showMenu = async (options) => { update = options.updateSession; return {}; };
+  await h.pi.command('ultra');
+
+  // Internal synchronize failure: the blocked guard installs (or the previous
+  // policy stays), but the post-commit load would still succeed and must not
+  // be reported as a verified operational result.
+  const innerInstall = h.deps.installPolicy;
+  h.deps.installPolicy = async (input) => {
+    throw new Error('policy install exploded');
+  };
+
+  await assert.rejects(() => update({ enabled: true }), (error: unknown) =>
+    error instanceof CommittedSessionUpdateError &&
+    error.committed === true &&
+    /could not be verified/.test(error.message),
+  'a committed snapshot followed by a blocked resync must stay committed-but-unverified, never verified-looking');
+
+  // Enforcement is fail-closed and the snapshot committed exactly once.
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: blocked');
+  const snapshots = h.pi.entries.filter((entry) => entry.customType === SESSION_OVERRIDE_TYPE);
+  assert.equal(snapshots.length, 1);
+  assert.deepEqual((snapshots[0]?.data as any).patch, { enabled: true });
+
+  // A later successful watcher change restores the on-state with the patch applied.
+  h.deps.installPolicy = innerInstall;
+  await h.change();
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on');
+});
+
+test('a blocked synchronize transition never yields a verified-looking global update result', async () => {
+  const h = harness();
+  await h.start();
+  await applySessionPatch(h, { minLanes: 4, maxLanes: 8 });
+
+  let opts!: ShowMenuOptions;
+  h.deps.showMenu = async (options) => { opts = options; return {}; };
+  await h.pi.command('ultra');
+
+  const globalWrites: unknown[] = [];
+  const innerUpdateSettings = h.deps.updateSettings;
+  h.deps.updateSettings = async (patch) => { globalWrites.push(patch); return innerUpdateSettings(patch); };
+  const innerInstall = h.deps.installPolicy;
+  h.deps.installPolicy = async () => { throw new Error('policy install exploded'); };
+
+  // The global write commits before synchronize runs, so even a blocked
+  // transition must surface as committed-but-unverified rather than either an
+  // optimistic verified result or an ordinary rollback-shaped rejection.
+  await assert.rejects(() => opts.updateGlobal({ enabled: true }), (error: unknown) =>
+    error instanceof CommittedSessionUpdateError && error.committed === true,
+  'the durable global write followed by a blocked resync must surface as a committed outcome');
+  assert.deepEqual(globalWrites, [{ enabled: true }], 'the global edit durably committed exactly once');
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: blocked');
+
+  h.deps.installPolicy = innerInstall;
+  await h.change();
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: on');
+});
+
 test('malformed restored overrides record at most one sanitized non-model diagnostic per distinct set', async () => {
   const malformedBranch = [
     { type: 'custom', customType: SESSION_OVERRIDE_TYPE, id: 'bad-1', data: { version: 1, patch: { enabled: 'yes' } } },

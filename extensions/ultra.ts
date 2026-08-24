@@ -365,26 +365,36 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
     // Disabled sessions intentionally leave `effective` undefined, so the
     // reported state is rebuilt from freshly loaded globals plus the
     // independently resolved session patch instead of the synchronization
-    // cache.
+    // cache. A synchronize transition that ended blocked or stale can never
+    // yield a verified result: even when a later load succeeds, policy
+    // enforcement was not confirmed, so this throws and the caller surfaces a
+    // committed-but-unverified outcome instead of an optimistic one.
+    const verifiedPostCommitState = async (ctx: ExtensionContext): Promise<ValidUltraSettingsResult> => {
+      const synced = await synchronize(ctx);
+      const refreshed = await dependencies.loadSettings();
+      if (refreshed.kind === 'invalid') {
+        throw new Error(`Ultra configuration is blocked: ${refreshed.reason}`);
+      }
+      let applied: UltraSettings;
+      try {
+        applied = resolveEffectiveUltraSettings(refreshed.settings, sessionPatch);
+      } catch (error) {
+        throw new Error(boundedMessage(error));
+      }
+      if (applied.enabled ? synced !== 'on' : synced !== 'off') {
+        throw new Error(`synchronize ended '${synced ?? 'stale'}' while computing ${applied.enabled ? 'enabled' : 'disabled'} state; refusing a verified result.`);
+      }
+      return {
+        kind: 'loaded',
+        settings: applied,
+        revision: bindRevision(refreshed.revision, stablePatchDigest(sessionPatch)),
+        path: refreshed.path,
+      } satisfies ValidUltraSettingsResult;
+    };
+
     const refreshAfterCommittedSnapshot = async (ctx: ExtensionContext): Promise<ValidUltraSettingsResult> => {
       try {
-        await synchronize(ctx);
-        const refreshed = await dependencies.loadSettings();
-        if (refreshed.kind === 'invalid') {
-          throw new Error(`Ultra configuration is blocked: ${refreshed.reason}`);
-        }
-        let applied: UltraSettings;
-        try {
-          applied = resolveEffectiveUltraSettings(refreshed.settings, sessionPatch);
-        } catch (error) {
-          throw new Error(boundedMessage(error));
-        }
-        return {
-          kind: 'loaded',
-          settings: applied,
-          revision: bindRevision(refreshed.revision, stablePatchDigest(sessionPatch)),
-          path: refreshed.path,
-        } satisfies ValidUltraSettingsResult;
+        return await verifiedPostCommitState(ctx);
       } catch (error) {
         throw new CommittedSessionUpdateError(
           `Session settings were saved, but the refreshed state could not be verified (${boundedMessage(error)}); Ultra stays fail-closed until a successful resync.`,
@@ -408,10 +418,12 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
       return bindRevision(loaded.revision, stablePatchDigest(sessionPatch)) === revision;
     };
 
-    let syncTail: Promise<void> = Promise.resolve();
-    const synchronize = (ctx: ExtensionContext): Promise<void> => {
-      const run = async () => {
-        if (disposed) return;
+    /** Final state of one synchronize transition; undefined when fenced stale/disposed. */
+    type SynchronizeOutcome = 'on' | 'off' | 'blocked' | undefined;
+    let syncTail: Promise<SynchronizeOutcome> = Promise.resolve(undefined);
+    const synchronize = (ctx: ExtensionContext): Promise<SynchronizeOutcome> => {
+      const run = async (): Promise<SynchronizeOutcome> => {
+        if (disposed) return undefined;
         const generation = lifecycleGeneration;
         const stale = () => disposed || generation !== lifecycleGeneration;
         lastContext = ctx;
@@ -420,17 +432,17 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
         let next: UltraPolicyRegistration | undefined;
         try {
           guard = await dependencies.installPolicy({ sessionId: sessionIdentity(ctx), mode: 'blocked', validateRevision });
-          if (stale()) { guard.dispose(); return; }
+          if (stale()) { guard.dispose(); return undefined; }
           if (watcherFailed) {
             policy?.dispose();
             policy = guard;
             effective = undefined;
             effectiveRevisionValue = undefined;
             status(ctx, 'blocked');
-            return;
+            return 'blocked';
           }
           const loaded = await dependencies.loadSettings();
-          if (stale()) { guard.dispose(); return; }
+          if (stale()) { guard.dispose(); return undefined; }
           if (loaded.kind === 'invalid') {
             policy?.dispose();
             policy = guard;
@@ -438,7 +450,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             effectiveRevisionValue = undefined;
             status(ctx, 'blocked');
             notify(ctx, `Ultra configuration is blocked: ${loaded.reason}`, 'error');
-            return;
+            return 'blocked';
           }
           let resolved: UltraSettings;
           try {
@@ -450,7 +462,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             effectiveRevisionValue = undefined;
             status(ctx, 'blocked');
             notify(ctx, `Ultra configuration is blocked: ${boundedMessage(error)}`, 'error');
-            return;
+            return 'blocked';
           }
           if (!resolved.enabled) {
             policy?.dispose();
@@ -459,10 +471,10 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             effective = undefined;
             effectiveRevisionValue = undefined;
             status(ctx, 'off');
-            return;
+            return 'off';
           }
           capabilityCompatible ??= await dependencies.checkCapabilities(pi.events);
-          if (stale()) { guard.dispose(); return; }
+          if (stale()) { guard.dispose(); return undefined; }
           if (!capabilityCompatible) {
             policy?.dispose();
             policy = guard;
@@ -470,19 +482,20 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             effectiveRevisionValue = undefined;
             status(ctx, 'blocked');
             notify(ctx, 'Ultra is blocked: installed pi-subagents lacks launch-authority v1. Install the pinned compatible fork and /reload.', 'error');
-            return;
+            return 'blocked';
           }
           next = await dependencies.installPolicy({ sessionId: sessionIdentity(ctx), mode: 'enabled', validateRevision });
-          if (stale()) { next.dispose(); guard.dispose(); return; }
+          if (stale()) { next.dispose(); guard.dispose(); return undefined; }
           policy?.dispose();
           policy = next;
           guard.dispose();
           effective = resolved;
           effectiveRevisionValue = bindRevision(loaded.revision, stablePatchDigest(sessionPatch));
           status(ctx, 'on');
+          return 'on';
         } catch (error) {
           next?.dispose();
-          if (stale()) { guard?.dispose(); return; }
+          if (stale()) { guard?.dispose(); return undefined; }
           if (guard) {
             policy?.dispose();
             policy = guard;
@@ -491,6 +504,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
           effectiveRevisionValue = undefined;
           status(ctx, 'blocked');
           notify(ctx, `Ultra is blocked: ${boundedMessage(error)}`, 'error');
+          return 'blocked';
         }
       };
       syncTail = syncTail.then(run, run);
@@ -708,23 +722,18 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
               // values under "This session" while overrides are active.
               updateGlobal: async (patchInput) => {
                 await dependencies.updateSettings(patchInput);
-                await synchronize(ctx);
-                const refreshed = await dependencies.loadSettings();
-                if (refreshed.kind === 'invalid') {
-                  throw new Error(`Ultra configuration is blocked: ${refreshed.reason}`);
-                }
-                let applied: UltraSettings;
+                // The global write is durable here; any post-write failure is
+                // a committed outcome, never an ordinary rollback-shaped
+                // rejection or an optimistic verified result while the
+                // synchronize transition ended blocked/stale.
                 try {
-                  applied = resolveEffectiveUltraSettings(refreshed.settings, sessionPatch);
+                  return await verifiedPostCommitState(ctx);
                 } catch (error) {
-                  throw new Error(boundedMessage(error));
+                  throw new CommittedSessionUpdateError(
+                    `Global settings were saved, but the refreshed session state could not be verified (${boundedMessage(error)}); Ultra stays fail-closed until a successful resync.`,
+                    { cause: error },
+                  );
                 }
-                return {
-                  kind: 'loaded',
-                  settings: applied,
-                  revision: bindRevision(refreshed.revision, stablePatchDigest(sessionPatch)),
-                  path: refreshed.path,
-                } satisfies ValidUltraSettingsResult;
               },
               recover: async () => {
                 try {
@@ -806,7 +815,9 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
       disposeWatcher = dependencies.watchSettings(
         () => {
           watcherFailed = undefined;
-          return lastContext ? synchronize(lastContext) : undefined;
+          // The watcher only needs the transition side effect; the outcome
+          // value is consumed by post-commit updaters, not here.
+          return lastContext ? synchronize(lastContext).then(() => undefined) : undefined;
         },
         async (error) => {
           if (!lastContext || disposed) return;
