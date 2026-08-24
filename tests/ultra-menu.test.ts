@@ -160,6 +160,24 @@ test('RPC adapter receives deterministic unfiltered all-registry model choices a
   assert.deepEqual(updates.patches, [{ workerModel: 'anthropic/model-b' }]);
 });
 
+test('set-model Automatic sends an explicit workerModel key so presence-based merges see the clear', async () => {
+  const rpc = createRpcHarness([
+    { kind: 'select', response: 'Settings…' },
+    { kind: 'select', response: 'Worker model (openai/model-a)' },
+    { kind: 'select', response: 'Automatic' },
+    { kind: 'select', response: 'Back' },
+    { kind: 'select', response: 'Back' },
+    { kind: 'select', response: 'Close' },
+  ]);
+  const { ctx } = rpcContext(rpc, [model('openai', 'model-a')]);
+  const updates = updater();
+  await showUltraMenu({ ctx, state: VALID, update: updates.update, recover: async () => assert.fail('not blocked') });
+  rpc.assertConsumed();
+  assert.equal(updates.patches.length, 1);
+  assert.equal('workerModel' in updates.patches[0], true, 'Automatic must not drop the workerModel key');
+  assert.equal(updates.patches[0].workerModel, undefined);
+});
+
 test('preset selection performs one paired update transaction', async () => {
   const rpc = createRpcHarness([
     { kind: 'select', response: 'Settings…' },

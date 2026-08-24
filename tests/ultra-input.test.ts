@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { UltraSettingsCleanupError } from '../extensions/ultra-config.js';
+import { UltraSettingsCleanupError, effectiveUniformModel } from '../extensions/ultra-config.js';
 import type { UltraSettings, LoadUltraSettingsResult } from '../extensions/ultra-config.js';
 import {
   createUltraExtension,
@@ -43,6 +43,9 @@ function prepared(settings: UltraSettings, revision = 'revision-1'): UltraPrepar
 function resultText(result: any): string {
   return result.content?.map((item: any) => item.text ?? '').join('\n') ?? '';
 }
+
+/** showMenu dependency options, so tests can capture menu callbacks directly. */
+type ShowMenuOptions = Parameters<UltraExtensionDependencies['showMenu']>[0];
 
 function harness(options: {
   loaded?: LoadUltraSettingsResult;
@@ -337,7 +340,7 @@ test('shutdown fences a reconciliation reply resolved immediately before shutdow
   assert.equal(h.pi.entries.filter((entry) => (entry.data as any)?.status === 'completed').length, 0);
 });
 
-test('committed cleanup errors still resynchronize menu updates and recovery; slash commands never write globals', async () => {
+test('committed cleanup errors still resynchronize menu recovery; menu updates stay session-local', async () => {
   const direct = harness();
   await direct.start();
   direct.deps.updateSettings = async () => { throw new Error('global writes must not happen from slash commands'); };
@@ -347,31 +350,96 @@ test('committed cleanup errors still resynchronize menu updates and recovery; sl
 
   const off = { kind: 'loaded' as const, settings: { ...DISABLED }, revision: 'off-cleanup', path: '/tmp/pi-ultra.json' };
 
+  // Invoke the captured update callback directly; asserting through the /ultra
+  // command handler would swallow errors via its catch-and-notify wrapper.
   const menu = harness();
   await menu.start();
   menu.deps.updateSettings = async () => {
     menu.setLoaded(off);
     throw new UltraSettingsCleanupError('committed cleanup warning', off);
   };
-  menu.deps.showMenu = async ({ update }) => {
-    await assert.rejects(() => update({ enabled: false }), UltraSettingsCleanupError);
-    return {};
-  };
+  let menuUpdate!: ShowMenuOptions['update'];
+  menu.deps.showMenu = async (options) => { menuUpdate = options.update; return {}; };
   await menu.pi.command('ultra');
+  const disabled = await menuUpdate({ enabled: false });
+  assert.equal(disabled.kind, 'loaded');
+  assert.equal(disabled.settings.enabled, false);
+  assert.match(disabled.revision, /^[a-f0-9]{64}$/u);
   assert.equal(menu.pi.statuses.at(-1)?.value, 'Ultra: off');
 
+  // Recovery cleanup errors keep their exact shape and still resynchronize.
   const recovery = harness({ loaded: { kind: 'invalid', reason: 'bad', path: '/tmp/pi-ultra.json' } });
   await recovery.start();
   recovery.deps.backupAndReset = async () => {
     recovery.setLoaded(off);
     throw new UltraSettingsCleanupError('recovery cleanup warning', off, { backupPath: '/tmp/backup.bak' });
   };
-  recovery.deps.showMenu = async ({ recover }) => {
-    await assert.rejects(() => recover(), UltraSettingsCleanupError);
-    return {};
-  };
+  let menuRecover!: ShowMenuOptions['recover'];
+  recovery.deps.showMenu = async (options) => { menuRecover = options.recover; return {}; };
   await recovery.pi.command('ultra');
+  await assert.rejects(() => menuRecover(), (error: unknown) =>
+    error instanceof UltraSettingsCleanupError &&
+    error.message === 'recovery cleanup warning' &&
+    error.backupPath === '/tmp/backup.bak' &&
+    error.committed === off);
   assert.equal(recovery.pi.statuses.at(-1)?.value, 'Ultra: off');
+});
+
+test('menu disable resolves a bound off result without touching globals and rejects on invalid globals', async () => {
+  const h = harness();
+  await h.start();
+  let update!: ShowMenuOptions['update'];
+  h.deps.showMenu = async (options) => { update = options.update; return {}; };
+  await h.pi.command('ultra');
+
+  const disabled = await update({ enabled: false });
+  assert.equal(disabled.kind, 'loaded');
+  assert.deepEqual(disabled.settings, { ...ENABLED, enabled: false }, 'absent fields inherit global defaults');
+  assert.match(disabled.revision, /^[a-f0-9]{64}$/u, 'revision binds global revision and session patch digest');
+  assert.equal(disabled.path, '/tmp/pi-ultra.json');
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: off');
+  const snapshots = h.pi.entries.filter((entry) => entry.customType === SESSION_OVERRIDE_TYPE);
+  assert.equal(snapshots.length, 1);
+  assert.deepEqual((snapshots[0]?.data as any).patch, { enabled: false });
+
+  h.setLoaded({ kind: 'invalid', reason: 'rewritten badly', path: '/tmp/pi-ultra.json' });
+  await assert.rejects(() => update({ enabled: true }), /rewritten badly/);
+  assert.equal(h.pi.statuses.at(-1)?.value, 'Ultra: blocked');
+});
+
+test('menu Automatic maps an explicit clear to workerModel null and restores across a new FakePi branch', async () => {
+  const first = harness({ session: { sessionId: 'auto-model', sessionFile: '/tmp/auto-model.jsonl' } });
+  await first.start();
+  // A selected session model must first be overridable by Automatic.
+  await applySessionPatch(first, { routingMode: 'uniform', workerModel: 'openai/session-model' });
+  let update!: ShowMenuOptions['update'];
+  first.deps.showMenu = async (options) => { update = options.update; return {}; };
+  await first.pi.command('ultra');
+
+  const automatic = await update({ workerModel: undefined });
+  assert.equal(automatic.kind, 'loaded');
+  assert.equal('workerModel' in automatic.settings, false, 'Automatic removes the effective worker model');
+  assert.equal(automatic.settings.routingMode, 'uniform');
+  assert.equal(effectiveUniformModel(automatic.settings), 'automatic');
+  assert.equal(first.pi.statuses.at(-1)?.value, 'Ultra: on');
+  let snapshots = first.pi.entries.filter((entry) => entry.customType === SESSION_OVERRIDE_TYPE);
+  assert.deepEqual((snapshots.at(-1)?.data as any).patch, { routingMode: 'uniform', workerModel: null });
+
+  // Blank models are also explicit Automatic intent.
+  const blank = await update({ workerModel: '   ' });
+  assert.equal('workerModel' in blank.settings, false);
+  snapshots = first.pi.entries.filter((entry) => entry.customType === SESSION_OVERRIDE_TYPE);
+  assert.deepEqual((snapshots.at(-1)?.data as any).patch, { routingMode: 'uniform', workerModel: null });
+
+  const second = harness({
+    session: { sessionId: 'auto-model', sessionFile: '/tmp/auto-model.jsonl', branch: [...first.pi.entries] },
+  });
+  await second.start();
+  assert.equal(second.pi.statuses.at(-1)?.value, 'Ultra: on');
+  const delegated = await second.pi.tool('ultra_delegate', delegateInput()) as any;
+  assert.equal(delegated.isError, undefined);
+  assert.equal('workerModel' in second.preparedInputs[0]!.settings, false, 'restored branch keeps explicit Automatic');
+  assert.equal(second.preparedInputs[0]!.settings.routingMode, 'uniform');
 });
 
 test('shutdown disposes policy, watcher, completion listeners, and prevents stale delivery', async () => {

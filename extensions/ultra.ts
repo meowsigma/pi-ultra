@@ -627,16 +627,39 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
                 const record = isRecord(patch) ? patch : {};
                 if (record.enabled !== undefined) override.enabled = record.enabled === true;
                 if (record.routingMode !== undefined) override.routingMode = record.routingMode;
-                if (record.workerModel !== undefined) override.workerModel = typeof record.workerModel === 'string' && record.workerModel.trim() ? record.workerModel.trim() : null;
+                // Key presence, not value: an explicit undefined (menu
+                // Automatic) must override any inherited model, while an
+                // absent field keeps inheriting.
+                if ('workerModel' in record) {
+                  const model = record.workerModel;
+                  override.workerModel = typeof model === 'string' && model.trim() ? model.trim() : null;
+                }
                 if (record.minLanes !== undefined || record.maxLanes !== undefined) {
                   override.minLanes = record.minLanes ?? baseSettings?.minLanes;
                   override.maxLanes = record.maxLanes ?? baseSettings?.maxLanes;
                 }
                 appendSessionSnapshot(override);
                 await synchronize(ctx);
-                if (!effective || effectiveRevisionValue === undefined) throw new Error('Ultra configuration is blocked; session settings were not applied.');
-                const path = loaded.kind === 'invalid' ? 'unknown' : loaded.path;
-                return { kind: 'loaded', settings: effective, revision: effectiveRevisionValue, path } satisfies ValidUltraSettingsResult;
+                // Disabled sessions intentionally leave `effective`
+                // undefined, so rebuild the reported state from freshly
+                // loaded globals plus the independently resolved session
+                // patch instead of the synchronization cache.
+                const refreshed = await dependencies.loadSettings();
+                if (refreshed.kind === 'invalid') {
+                  throw new Error(`Ultra configuration is blocked: ${refreshed.reason}`);
+                }
+                let applied: UltraSettings;
+                try {
+                  applied = resolveEffectiveUltraSettings(refreshed.settings, sessionPatch);
+                } catch (error) {
+                  throw new Error(boundedMessage(error));
+                }
+                return {
+                  kind: 'loaded',
+                  settings: applied,
+                  revision: bindRevision(refreshed.revision, stablePatchDigest(sessionPatch)),
+                  path: refreshed.path,
+                } satisfies ValidUltraSettingsResult;
               },
               recover: async () => {
                 try {
