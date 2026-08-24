@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { Type } from 'typebox';
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import {
   backupAndResetUltraSettings,
@@ -34,6 +35,12 @@ import {
   type UltraOutboxItem,
 } from './ultra-operations.js';
 import {
+  createUltraManagerState,
+  ULTRA_MANAGER_ENTRY,
+  type UltraManagerBinding,
+  type UltraTakeoverReason,
+} from './ultra-manager-state.js';
+import {
   appendSessionUltraOverrides,
   clearSessionUltraOverrides,
   CommittedSessionUpdateError,
@@ -64,6 +71,18 @@ const RECONCILE_DELAYS = [0, 250, 750, 1_500] as const;
 // per distinct malformed set.
 const SESSION_OVERRIDE_DIAGNOSTIC_TYPE = 'pi-ultra-session-settings-diagnostic';
 const MAX_DIAGNOSTIC_TEXT = 512;
+const MANAGER_SCOPE_SCHEMA = Type.Object({
+  scopeId: Type.String({ minLength: 1, maxLength: 128 }),
+}, { additionalProperties: false });
+const MANAGER_TAKEOVER_SCHEMA = Type.Object({
+  scopeId: Type.String({ minLength: 1, maxLength: 128 }),
+  reason: Type.Union([
+    Type.Literal('inseparable-work'), Type.Literal('dirty-worktree'), Type.Literal('repair-exhausted'),
+    Type.Literal('worker-capability-failure'), Type.Literal('urgent-user-directed'),
+  ]),
+  explanation: Type.String({ minLength: 1, maxLength: 512 }),
+}, { additionalProperties: false });
+const MANAGER_READ_ONLY_TOOLS = new Set(['read', 'grep', 'find', 'ls']);
 
 export interface UltraPolicyRegistration {
   mode: 'blocked' | 'enabled';
@@ -322,6 +341,15 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
     const completionBuffer = new Map<string, { payload: unknown; expiresAt: number }>();
 
     const operations = createUltraOperationStore({ append: (data) => pi.appendEntry(ULTRA_OPERATION_ENTRY, data) });
+    const managerState = createUltraManagerState({ append: (data) => pi.appendEntry(ULTRA_MANAGER_ENTRY, data) });
+    // Runtime identity fences restored decisions. Journal history remains inspectable
+    // after reload, but no parent-mutation grant crosses an extension lifetime.
+    let managerTurnNonce = randomUUID();
+    let currentManagerScopeId: string | undefined;
+    const managerBinding = (ctx: ExtensionContext, scopeId: string): UltraManagerBinding | undefined => {
+      if (!effective || effective.orchestrationMode !== 'manager' || !effectiveRevisionValue) return undefined;
+      return { scopeId, rootId: `${ctx.sessionManager.getLeafId()}:${managerTurnNonce}`, policyRevision: effectiveRevisionValue };
+    };
 
     const appendSessionSnapshot = (patch: UltraSessionOverrides): void => {
       appendSessionUltraOverrides((customType, data) => pi.appendEntry(customType, data), patch);
@@ -560,6 +588,49 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
     };
 
     pi.registerTool({
+      name: 'ultra_begin_scope',
+      label: 'Ultra Begin Manager Scope',
+      description: 'Open one durable Manager-mode decision scope for the current turn. This never grants parent mutation.',
+      promptSnippet: 'Open a Manager-mode scope before choosing governed dispatch or explicit takeover.',
+      executionMode: 'sequential',
+      parameters: MANAGER_SCOPE_SCHEMA,
+      async execute(_toolCallId, params, _toolSignal, _onUpdate, ctx) {
+        const scopeId = isRecord(params) && typeof params.scopeId === 'string' ? params.scopeId : undefined;
+        const binding = scopeId ? managerBinding(ctx, scopeId) : undefined;
+        if (!binding) return toolError('Ultra Manager mode is not active and synchronized.');
+        try {
+          managerState.openScope({ ...binding, createdAt: Date.now() });
+          currentManagerScopeId = scopeId;
+          return { content: [{ type: 'text' as const, text: `Ultra Manager scope ${scopeId} opened. Choose governed dispatch or an eligible explicit takeover.` }], details: { kind: 'manager-scope', scopeId } };
+        } catch (error) {
+          return toolError(boundedMessage(error));
+        }
+      },
+    });
+
+    pi.registerTool({
+      name: 'ultra_takeover',
+      label: 'Ultra Manager Takeover',
+      description: 'Grant bounded parent mutation for an active Manager-mode scope when the recorded reason is eligible.',
+      promptSnippet: 'Record an accountable, evidence-bound Manager-mode takeover before mutating the project directly.',
+      executionMode: 'sequential',
+      parameters: MANAGER_TAKEOVER_SCHEMA,
+      async execute(_toolCallId, params, _toolSignal, _onUpdate, ctx) {
+        const scopeId = isRecord(params) && typeof params.scopeId === 'string' ? params.scopeId : undefined;
+        const reason = isRecord(params) && typeof params.reason === 'string' ? params.reason as UltraTakeoverReason : undefined;
+        const explanation = isRecord(params) && typeof params.explanation === 'string' ? params.explanation.trim() : '';
+        const binding = scopeId ? managerBinding(ctx, scopeId) : undefined;
+        if (!binding || !reason || !explanation) return toolError('Ultra Manager takeover requires an active synchronized scope, valid reason, and explanation.');
+        try {
+          managerState.recordTakeover({ ...binding, reason, createdAt: Date.now() });
+          return { content: [{ type: 'text' as const, text: `Ultra Manager takeover recorded for scope ${scopeId}: ${reason}. Parent mutation is now limited to this scope and policy revision.` }], details: { kind: 'manager-takeover', scopeId, reason } };
+        } catch (error) {
+          return toolError(boundedMessage(error));
+        }
+      },
+    });
+
+    pi.registerTool({
       name: 'ultra_delegate',
       label: 'Ultra Delegate',
       description: 'Launch one exact, preflighted Ultra worker wave. Use only for genuinely independent lanes; completion is evidence, not acceptance.',
@@ -796,16 +867,28 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
       },
     });
 
-    pi.on('before_agent_start', (event) => {
+    pi.on('before_agent_start', (event, ctx) => {
+      // Each turn gets a fresh fence. A restored/replayed scope is durable
+      // evidence, never an inherited authority grant for a new turn.
+      managerTurnNonce = randomUUID();
+      currentManagerScopeId = undefined;
       if (!effective?.enabled || !policy?.operational) return;
       return { systemPrompt: `${event.systemPrompt}\n\n${managerPolicy(effective)}` };
     });
 
-    pi.on('tool_call', (event) => {
-      if (event.toolName !== 'subagent') return;
+    pi.on('tool_call', (event, ctx) => {
       const governed = !effective || effective.enabled === true || policy?.mode === 'blocked';
-      if (!governed || isSafeSubagentCall(event.input)) return;
-      return { block: true, reason: 'Ultra governs new subagent launches. Use ultra_delegate for one exact authorized wave, or let the main model take over directly.' };
+      if (event.toolName === 'subagent') {
+        if (!governed || isSafeSubagentCall(event.input)) return;
+        return { block: true, reason: 'Ultra governs new subagent launches. Use ultra_delegate for one exact authorized wave, or let the main model take over directly.' };
+      }
+      if (!effective?.enabled || effective.orchestrationMode !== 'manager' || !policy?.operational) return;
+      if (event.toolName === 'ultra_begin_scope' || event.toolName === 'ultra_takeover' || event.toolName === 'ultra_delegate' || MANAGER_READ_ONLY_TOOLS.has(event.toolName)) return;
+      // There is no sound heuristic for shell/custom-tool mutability. Unknown
+      // tools are therefore denied until a durable takeover matches this turn.
+      const scopeId = currentManagerScopeId;
+      const permitted = scopeId ? managerState.allowsMutation(managerBinding(ctx, scopeId) ?? { scopeId: '', rootId: '', policyRevision: '' }) : false;
+      if (!permitted) return { block: true, reason: 'Ultra Manager mode blocks parent mutation and unknown tools until an active scoped takeover is recorded.' };
     });
 
     pi.on('session_start', async (_event, ctx) => {
@@ -814,6 +897,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
       // Restore uses Pi branch order as supplied; scan the branch for the
       // session override patch before the fail-closed synchronization.
       operations.restore(ctx.sessionManager.getBranch());
+      managerState.restore(ctx.sessionManager.getBranch());
       refreshSessionOverrides(ctx);
       await synchronize(ctx);
       if (disposed || generation !== lifecycleGeneration) return;

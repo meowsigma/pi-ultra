@@ -126,7 +126,7 @@ test('registers one command/tool, removes passive input interception, and append
   const h = harness();
   await h.start();
   assert.deepEqual([...h.pi.commands.keys()], ['ultra']);
-  assert.deepEqual([...h.pi.tools.keys()], ['ultra_delegate']);
+  assert.deepEqual([...h.pi.tools.keys()], ['ultra_begin_scope', 'ultra_takeover', 'ultra_delegate']);
   assert.equal(h.pi.handlerCount('input'), 0);
   const turn = await h.pi.inputToAgentStart('Implement the parser.');
   assert.equal(turn.prompt, 'Implement the parser.');
