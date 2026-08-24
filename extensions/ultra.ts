@@ -664,6 +664,13 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
             return toolError(boundedMessage(error));
           }
           if (!resolved.enabled) return toolError(ENABLE_FIRST);
+          if (resolved.orchestrationMode === 'manager') {
+            const scopeId = currentManagerScopeId;
+            const binding = scopeId ? managerBinding(ctx, scopeId) : undefined;
+            if (!binding || !managerState.hasActiveScope(binding)) {
+              return toolError('Ultra Manager mode requires an active durable scope before dispatch. Call ultra_begin_scope, then dispatch one exact independent wave or record an eligible takeover.');
+            }
+          }
           if (!policy?.operational || !policy.authority) return toolError('Ultra is blocked because compatible launch authority is unavailable. The main model must take over directly.');
           const input = params as UltraDelegateInput;
           if (input.repairOf) operations.assertRepairAllowed(input.repairOf);

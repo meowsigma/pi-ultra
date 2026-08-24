@@ -50,6 +50,21 @@ test('manager mode denies parent mutation until an urgent scoped takeover is dur
   assert.equal(after, undefined);
 });
 
+test('manager mode requires a durable scope before dispatching an Ultra wave', async () => {
+  const pi = harness();
+  await pi.emit('session_start', { type: 'session_start' });
+  const result = await pi.tool('ultra_delegate', {
+    objective: 'Independent review.',
+    lanes: [
+      { id: 'scout', role: 'scout', task: 'Inspect.', deliverable: 'Evidence.' },
+      { id: 'worker', role: 'worker', task: 'Patch.', deliverable: 'Patch.', ownedPaths: ['src'] },
+    ],
+    acceptance: ['Report results.'],
+  }) as any;
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /scope/i);
+});
+
 test('manager mode dispatch never authorizes bash or unknown custom tools', async () => {
   const pi = harness();
   await pi.emit('session_start', { type: 'session_start' });
