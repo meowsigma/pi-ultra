@@ -91,6 +91,7 @@ const execFile = promisify(execFileCallback);
 const MANAGER_SCOPE_SCHEMA = Type.Object({
   scopeId: Type.String({ minLength: 1, maxLength: 128 }),
 }, { additionalProperties: false });
+const POOL_CANCEL_SCHEMA = Type.Object({ jobId: Type.String({ minLength: 1, maxLength: 128 }) }, { additionalProperties: false });
 const ISSUE_RESUME_PERMIT_SCHEMA = Type.Object({
   operationId: Type.String({ minLength: 1, maxLength: 128 }),
   message: Type.String({ minLength: 1, maxLength: 16_384 }),
@@ -784,6 +785,11 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
     });
 
     pi.registerTool({
+      name: 'ultra_pool_cancel', label: 'Ultra Cancel Queued Pool Job', description: 'Cancel only a durable queued Active Pool job.', promptSnippet: 'Cancel a queued pool job without affecting active leases.', executionMode: 'sequential', parameters: POOL_CANCEL_SCHEMA,
+      async execute(_id, params) { try { const jobId = isRecord(params) && typeof params.jobId === 'string' ? params.jobId : ''; const job = pool.cancel(jobId); return { content: [{ type: 'text' as const, text: `Cancelled queued Ultra pool job ${job.id}.` }], details: { kind: 'pool-cancelled', jobId: job.id } }; } catch (error) { return toolError(`Pool cancellation failed closed: ${boundedMessage(error)}`); } },
+    });
+
+    pi.registerTool({
       name: 'ultra_pool_status',
       label: 'Ultra Active Pool Status',
       description: 'Show durable Active Pool queue, lease, cancellation, and repair counts.',
@@ -1247,7 +1253,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
         return { block: true, reason: 'Ultra governs new subagent launches. Use ultra_delegate for one exact authorized wave, or let the main model take over directly.' };
       }
       if (!effective?.enabled || effective.orchestrationMode !== 'manager' || !policy?.operational) return;
-      if (event.toolName === 'ultra_begin_scope' || event.toolName === 'ultra_takeover' || event.toolName === 'ultra_delegate' || event.toolName === 'ultra_pool_status' || event.toolName === 'ultra_issue_resume_permit' || event.toolName === 'ultra_resume_worker' || event.toolName === 'ultra_materialize_handoff' || event.toolName === 'ultra_review_candidate' || event.toolName === 'ultra_record_review_findings' || event.toolName === 'ultra_dispose_handoff' || MANAGER_READ_ONLY_TOOLS.has(event.toolName)) return;
+      if (event.toolName === 'ultra_begin_scope' || event.toolName === 'ultra_takeover' || event.toolName === 'ultra_delegate' || event.toolName === 'ultra_pool_status' || event.toolName === 'ultra_pool_cancel' || event.toolName === 'ultra_issue_resume_permit' || event.toolName === 'ultra_resume_worker' || event.toolName === 'ultra_materialize_handoff' || event.toolName === 'ultra_review_candidate' || event.toolName === 'ultra_record_review_findings' || event.toolName === 'ultra_dispose_handoff' || MANAGER_READ_ONLY_TOOLS.has(event.toolName)) return;
       // There is no sound heuristic for shell/custom-tool mutability. Unknown
       // tools are therefore denied until a durable takeover matches this turn.
       const scopeId = currentManagerScopeId;
