@@ -55,6 +55,7 @@ import {
 import { validateUltraParallelHandoff, type UltraValidatedParallelHandoff } from './ultra-handoff.js';
 import { materializeUltraCandidate } from './ultra-candidate.js';
 import { buildControlledResumeRequest } from './ultra-resume.js';
+import { selectUltraRepairRoute, type UltraRepairFailureClass } from './ultra-repair.js';
 import {
   appendSessionUltraOverrides,
   clearSessionUltraOverrides,
@@ -93,6 +94,8 @@ const MANAGER_SCOPE_SCHEMA = Type.Object({
 const CONTROLLED_RESUME_SCHEMA = Type.Object({
   permitId: Type.String({ minLength: 1, maxLength: 128 }),
   message: Type.String({ minLength: 1, maxLength: 16_384 }),
+  operationId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+  failureClass: Type.Optional(Type.Union([Type.Literal('provider'), Type.Literal('timeout'), Type.Literal('workspace'), Type.Literal('reviewer')])),
 }, { additionalProperties: false });
 const MANAGER_REVIEW_FINDINGS_SCHEMA = Type.Object({
   operationId: Type.String({ minLength: 1, maxLength: 128 }),
@@ -730,7 +733,18 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
           pool.consumeResumePermit(durable);
           const receipt = await requestControlledResume(pi.events, { id: durable.targetRunId, message: message.trim() }, token);
           return { content: [{ type: 'text' as const, text: `Controlled resume requested for retained run ${durable.targetRunId}. Receipt is evidence only.` }], details: { kind: 'controlled-resume', permitId: durable.id, runId: durable.targetRunId, receipt } };
-        } catch (error) { return toolError(`Controlled resume failed closed: ${boundedMessage(error)}`); }
+        } catch (error) {
+          const operationId = isRecord(params) && typeof params.operationId === 'string' ? params.operationId : undefined;
+          const failure = isRecord(params) && ['provider', 'timeout', 'workspace', 'reviewer'].includes(String(params.failureClass)) ? params.failureClass as UltraRepairFailureClass : undefined;
+          if (operationId && failure) {
+            try {
+              const operation = operations.get(operationId);
+              const route = selectUltraRepairRoute({ failure, repairAlreadyUsed: operation?.repairCount === 1, retainedPermitUsable: false });
+              operations.recordRepairFailure(operationId, { kind: failure, route: route.kind, recordedAt: Date.now() });
+            } catch { /* original resume failure remains authoritative */ }
+          }
+          return toolError(`Controlled resume failed closed: ${boundedMessage(error)}`);
+        }
       },
     });
 
