@@ -104,8 +104,19 @@ export default function probe(pi) {
     for (const role of ['scout','worker','reviewer']) {
       contracts[role] = await preflight.resolveSubagentLaunchContract({ agent: 'ultra-' + role, cwd: ctx.cwd, task: 'Smoke ' + role, context: 'fresh' });
     }
+    const authority = await import(pathToFileURL(process.env.ULTRA_SMOKE_AUTHORITY).href);
+    const resumeSessionId = 'packed-resume-authority';
+    const resumeParams = { id: 'retained-run', message: 'continue exact retained work' };
+    const lane = { key: 'worker', agent: 'ultra-worker', modelCandidates: ['openai-codex/gpt-5.6-sol'], launchContractDigest: 'a'.repeat(64) };
+    const resumeAuthority = authority.registerSubagentLaunchAuthority({ sessionId: resumeSessionId, source: 'packed-resume-probe', defaultNewSpawnDecision: 'deny', validateConfigRevision: () => true });
+    const resumeToken = resumeAuthority.issueOnce({ configRevision: 'packed-resume', expiresInMs: 5_000, requestDigest: authority.digestSubagentLaunchRequest(resumeParams, 'rpc.resume'), minLanes: 1, maxLanes: 1, lanes: [lane] });
+    const resumeAdmission = await authority.authorizeSubagentLaunch({ sessionId: resumeSessionId, params: resumeParams, permits: [resumeToken], domain: 'rpc.resume' });
+    const resumeCommitted = resumeAdmission.ok ? await resumeAdmission.commit([lane]) : resumeAdmission;
+    const replay = await authority.authorizeSubagentLaunch({ sessionId: resumeSessionId, params: resumeParams, permits: [resumeToken], domain: 'rpc.resume' });
+    resumeAuthority.dispose();
     writeFileSync(process.env.ULTRA_SMOKE_RESULT, JSON.stringify({
       tools: pi.getAllTools().map((tool) => ({ name: tool.name, source: tool.source, path: tool.path })),
+      resumeAuthority: { admitted: resumeAdmission.ok, committed: resumeCommitted.ok, replayAccepted: replay.ok }, 
       commands: pi.getCommands().map((command) => ({ name: command.name, source: command.source, path: command.path })),
       spawnReply,
       contracts,
@@ -123,6 +134,7 @@ export default function probe(pi) {
       PI_OFFLINE: '1',
       ULTRA_SMOKE_RESULT: resultPath,
       ULTRA_SMOKE_PREFLIGHT: join(subagentsRoot, 'src', 'api', 'preflight.ts'),
+      ULTRA_SMOKE_AUTHORITY: join(subagentsRoot, 'src', 'runs', 'shared', 'launch-authority.ts'),
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -145,6 +157,9 @@ export default function probe(pi) {
   }
 
   const result = JSON.parse(readFileSync(resultPath, 'utf8'));
+  assert.equal(result.resumeAuthority.admitted, true, JSON.stringify(result.resumeAuthority));
+  assert.equal(result.resumeAuthority.committed, true, JSON.stringify(result.resumeAuthority));
+  assert.equal(result.resumeAuthority.replayAccepted, false, JSON.stringify(result.resumeAuthority));
   assert.equal(result.tools.filter((tool) => tool.name === 'ultra_delegate').length, 1);
   for (const toolName of ['ultra_begin_scope', 'ultra_takeover', 'ultra_materialize_handoff', 'ultra_review_candidate', 'ultra_record_review_findings', 'ultra_dispose_handoff']) {
     assert.equal(result.tools.filter((tool) => tool.name === toolName).length, 1, `missing Manager-mode tool ${toolName}`);
@@ -176,6 +191,7 @@ export default function probe(pi) {
     commandCount: result.commands.length,
     directLaunchBlocked: true,
     managerModeToolsRegistered: true,
+    bundledResumeAuthorityProved: true,
   }));
 }
 
