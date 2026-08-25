@@ -91,6 +91,11 @@ const execFile = promisify(execFileCallback);
 const MANAGER_SCOPE_SCHEMA = Type.Object({
   scopeId: Type.String({ minLength: 1, maxLength: 128 }),
 }, { additionalProperties: false });
+const ISSUE_RESUME_PERMIT_SCHEMA = Type.Object({
+  operationId: Type.String({ minLength: 1, maxLength: 128 }),
+  message: Type.String({ minLength: 1, maxLength: 16_384 }),
+  workerKey: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+}, { additionalProperties: false });
 const CONTROLLED_RESUME_SCHEMA = Type.Object({
   permitId: Type.String({ minLength: 1, maxLength: 128 }),
   message: Type.String({ minLength: 1, maxLength: 16_384 }),
@@ -709,6 +714,29 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
     };
 
     pi.registerTool({
+      name: 'ultra_issue_resume_permit',
+      label: 'Ultra Issue Retained Resume Permit',
+      description: 'Create one short-lived, exact-bound permit for a leased retained worker.',
+      promptSnippet: 'Issue a controlled-resume permit only from the retained operation and its active pool lease.',
+      executionMode: 'sequential', parameters: ISSUE_RESUME_PERMIT_SCHEMA,
+      async execute(_id, params, _signal, _update, ctx) {
+        const operationId = isRecord(params) && typeof params.operationId === 'string' ? params.operationId : undefined;
+        const message = isRecord(params) && typeof params.message === 'string' ? params.message.trim() : '';
+        const requestedKey = isRecord(params) && typeof params.workerKey === 'string' ? params.workerKey : undefined;
+        if (!operationId || !message) return toolError('Resume permit requires an operation ID and non-empty continuation message.');
+        try {
+          const operation = operations.get(operationId);
+          if (!operation || !['running', 'paused'].includes(operation.status)) return toolError('Resume permits require a retained running or paused operation.');
+          const worker = operation.lanes.find((lane) => lane.role === 'worker' && (!requestedKey || lane.id === requestedKey));
+          if (!worker) return toolError('No exact retained worker lane matches this operation.');
+          const digest = await controlledResumeDigest({ id: operation.runId, message });
+          const permit = pool.issueResumePermit({ id: dependencies.randomId(), jobId: operationId, leaseId: `${operationId}.lease`, targetRunId: operation.runId, requestDigest: digest, worker: { key: worker.id, agent: worker.agent, modelCandidates: worker.modelCandidates, launchContractDigest: worker.launchContractDigest, workspaceBase: operation.writerBase?.repositoryRoot ?? ctx.cwd, promptDigest: createHash('sha256').update(operation.objective).digest('hex') }, expiresAt: Date.now() + 5 * 60_000 });
+          return { content: [{ type: 'text' as const, text: `Issued one controlled-resume permit ${permit.id} for retained run ${operation.runId}.` }], details: { kind: 'resume-permit', permitId: permit.id, operationId, runId: operation.runId, expiresAt: permit.expiresAt } };
+        } catch (error) { return toolError(`Resume permit issuance failed closed: ${boundedMessage(error)}`); }
+      },
+    });
+
+    pi.registerTool({
       name: 'ultra_resume_worker',
       label: 'Ultra Resume Retained Worker',
       description: 'Consume one durable, exact-bound lease permit to resume a retained worker through controlled RPC.',
@@ -1219,7 +1247,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
         return { block: true, reason: 'Ultra governs new subagent launches. Use ultra_delegate for one exact authorized wave, or let the main model take over directly.' };
       }
       if (!effective?.enabled || effective.orchestrationMode !== 'manager' || !policy?.operational) return;
-      if (event.toolName === 'ultra_begin_scope' || event.toolName === 'ultra_takeover' || event.toolName === 'ultra_delegate' || event.toolName === 'ultra_pool_status' || event.toolName === 'ultra_resume_worker' || event.toolName === 'ultra_materialize_handoff' || event.toolName === 'ultra_review_candidate' || event.toolName === 'ultra_record_review_findings' || event.toolName === 'ultra_dispose_handoff' || MANAGER_READ_ONLY_TOOLS.has(event.toolName)) return;
+      if (event.toolName === 'ultra_begin_scope' || event.toolName === 'ultra_takeover' || event.toolName === 'ultra_delegate' || event.toolName === 'ultra_pool_status' || event.toolName === 'ultra_issue_resume_permit' || event.toolName === 'ultra_resume_worker' || event.toolName === 'ultra_materialize_handoff' || event.toolName === 'ultra_review_candidate' || event.toolName === 'ultra_record_review_findings' || event.toolName === 'ultra_dispose_handoff' || MANAGER_READ_ONLY_TOOLS.has(event.toolName)) return;
       // There is no sound heuristic for shell/custom-tool mutability. Unknown
       // tools are therefore denied until a durable takeover matches this turn.
       const scopeId = currentManagerScopeId;
