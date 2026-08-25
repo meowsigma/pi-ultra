@@ -1,6 +1,6 @@
 {
   "name": "pi-ultra",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "Session-wide, permit-governed Pi worker waves with the active model as manager and final reviewer.",
   "keywords": [
     "pi-package",
