@@ -131,6 +131,16 @@ export function createUltraPool(input: { append(data: UltraPoolEntry): void; now
       const lease = persistLease({ version: 1, kind: 'lease', leaseId: inputLease.leaseId, jobId: job.id, slotId: idleSlot.id, expiresAt: inputLease.expiresAt, state: 'active', createdAt: timestamp, updatedAt: timestamp });
       return { job: clone(job), lease };
     },
+    /**
+     * Reserve capacity only for this exact head-of-queue job. Runtime callers
+     * must use this rather than admitNext: leasing somebody else's durable job
+     * without its prepared launch contract would strand it after a retry.
+     */
+    admitExact(jobId: string, inputLease: { leaseId: string; expiresAt: number; maxActive?: number }) {
+      const queued = [...jobs.values()].filter((job) => job.state === 'queued').sort((a, b) => Number(Boolean(b.repairOf)) - Number(Boolean(a.repairOf)) || a.createdAt - b.createdAt);
+      if (queued[0]?.id !== jobId) return undefined;
+      return this.admitNext(inputLease);
+    },
     cancel(jobId: string) { const job = jobs.get(jobId); if (!job || job.state !== 'queued') throw new Error('Only queued pool jobs may be cancelled.'); job.state = 'cancelled'; job.updatedAt = now(); return persistJob(job); },
     complete(jobId: string) { const job = jobs.get(jobId); if (!job || job.state !== 'leased') throw new Error('Only leased pool jobs may complete.'); const timestamp = now(); job.state = 'completed'; job.updatedAt = timestamp; persistJob(job); for (const lease of leases.values()) if (lease.jobId === jobId && lease.state === 'active') { lease.state = 'completed'; lease.updatedAt = timestamp; persistLease(lease); releaseSlot(lease, timestamp); } return clone(job); },
     expireLeases() { const expired: UltraPoolLease[] = []; for (const lease of leases.values()) if (lease.state === 'active' && lease.expiresAt <= now()) { const timestamp = now(); lease.state = 'expired'; lease.updatedAt = timestamp; persistLease(lease); releaseSlot(lease, timestamp); const job = jobs.get(lease.jobId); if (job?.state === 'leased') { job.state = 'queued'; job.updatedAt = now(); persistJob(job); } expired.push(clone(lease)); } return expired; },

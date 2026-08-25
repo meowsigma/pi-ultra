@@ -59,6 +59,16 @@ test('resume permits are durable, exact-bound, idempotent, and one-use', () => {
   assert.throws(() => restored.consumeResumePermit(intent), /consumed/i);
 });
 
+test('exact admission never leases an earlier job without its bound dispatch contract', () => {
+  const pool = createUltraPool({ append() {}, now: () => 1 });
+  pool.enqueue(job('earlier'));
+  pool.enqueue(job('later'));
+  assert.equal(pool.admitExact('later', { leaseId: 'later-lease', expiresAt: 10, maxActive: 1 }), undefined);
+  assert.equal(pool.get('earlier')?.state, 'queued');
+  assert.equal(pool.get('later')?.state, 'queued');
+  assert.equal(pool.admitExact('earlier', { leaseId: 'earlier-lease', expiresAt: 10, maxActive: 1 })?.job.id, 'earlier');
+});
+
 test('a later lower capacity does not reuse higher-numbered durable slots', () => {
   const pool = createUltraPool({ append() {}, now: () => 1 });
   pool.enqueue(job('first'));

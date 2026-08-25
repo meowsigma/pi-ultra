@@ -1039,8 +1039,8 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
           const operationId = dependencies.randomId();
           const poolKind = input.lanes.some((lane) => lane.role === 'worker') ? 'writer' : 'read-only';
           pool.enqueue({ id: operationId, kind: poolKind, objective: input.objective, ownedPaths: input.lanes.flatMap((lane) => lane.ownedPaths ?? []) , ...(input.repairOf ? { repairOf: input.repairOf } : {}) });
-          const poolLease = pool.admitNext({ leaseId: `${operationId}.lease`, expiresAt: Date.now() + 30 * 60_000, maxActive: resolved.poolMaxActive ?? 4 });
-          if (!poolLease || poolLease.job.id !== operationId) return toolError('Ultra pool queued this wave behind an earlier lease; inspect ultra_pool_status and retry only through the manager.');
+          const poolLease = pool.admitExact(operationId, { leaseId: `${operationId}.lease`, expiresAt: Date.now() + 30 * 60_000, maxActive: resolved.poolMaxActive ?? 4 });
+          if (!poolLease) return toolError('Ultra pool queued this wave behind an earlier lease; inspect ultra_pool_status. The queue remains unleased until its bound dispatch contract is available.');
           launchAttemptId = ultraLaunchIdempotencyKey({ operationId, attemptIndex: 0 });
           operations.recordQueuedLaunch({
             idempotencyKey: launchAttemptId,
