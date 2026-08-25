@@ -10,6 +10,7 @@ import {
 import type { UltraDelegateInput, UltraPreparedWave } from '../extensions/ultra-protocol.js';
 import { validateUltraDelegateInput, SUBAGENT_RPC_REQUEST, subagentRpcReply } from '../extensions/ultra-protocol.js';
 import { ULTRA_POOL_ENTRY } from '../extensions/ultra-pool.js';
+import { ULTRA_OPERATION_ENTRY } from '../extensions/ultra-operations.js';
 import { buildSettingsScreen } from '../extensions/ultra-menu.js';
 import { appendSessionUltraOverrides, CommittedSessionUpdateError } from '../extensions/ultra-session-settings.js';
 import { FakePi, type FakePiOptions } from './fixtures/fake-pi.js';
@@ -165,6 +166,28 @@ test('controlled resume consumes one exact active-lease permit and emits only au
   assert.match((h.authorityIssueInputs[0] as any).configRevision, /^[a-f0-9]{64}$/);
   const replay: any = await h.pi.tool('ultra_resume_worker', { permitId: 'resume', message });
   assert.match(resultText(replay), /failed closed/i);
+  assert.equal(h.authorityIssueInputs.length, 1);
+});
+
+test('failed controlled resume persists its classified fallback route without authorizing a replay', async () => {
+  const message = 'Continue focused repair.';
+  const authorityModule = 'pi-subagents/launch-authority';
+  const { digestSubagentLaunchRequest } = await import(authorityModule) as { digestSubagentLaunchRequest(value: Record<string, unknown>, domain?: string): string };
+  const digest = digestSubagentLaunchRequest({ id: 'retained-run', message }, 'rpc.resume');
+  const worker = { key: 'repair-worker', agent: 'ultra-worker', modelCandidates: ['openai/test-model'], launchContractDigest: 'b'.repeat(64), workspaceBase: 'c'.repeat(40), promptDigest: 'd'.repeat(64) };
+  const operation = { version: 1, operationId: 'op', rootOperationId: 'op', repairCount: 0, runId: 'run', objective: 'repair', acceptance: [], lanes: [{ id: 'worker', role: 'worker', agent: 'ultra-worker', modelCandidates: ['openai/test-model'], launchContractDigest: 'b'.repeat(64) }], receipt: {}, status: 'failed', outbox: 'none', createdAt: 1, updatedAt: 1 };
+  const h = harness({ session: { branch: [
+    { type: 'custom', customType: ULTRA_OPERATION_ENTRY, data: operation },
+    { type: 'custom', customType: ULTRA_POOL_ENTRY, data: { version: 1, kind: 'job', id: 'job', jobKind: 'read-only', state: 'leased', objective: 'repair', ownedPaths: [], createdAt: 1, updatedAt: 1 } },
+    { type: 'custom', customType: ULTRA_POOL_ENTRY, data: { version: 1, kind: 'lease', leaseId: 'lease', jobId: 'job', expiresAt: Date.now() + 60_000, state: 'active', createdAt: 1, updatedAt: 1 } },
+    { type: 'custom', customType: ULTRA_POOL_ENTRY, data: { version: 1, kind: 'resume-permit', id: 'resume', jobId: 'job', leaseId: 'lease', targetRunId: 'retained-run', requestDigest: digest, worker, expiresAt: Date.now() + 60_000, state: 'issued', createdAt: 1, updatedAt: 1 } },
+  ] } });
+  h.pi.events.on(SUBAGENT_RPC_REQUEST, (request: any) => h.pi.events.emit(subagentRpcReply(request.requestId), { requestId: request.requestId, success: false, error: { message: 'provider failed' } }));
+  await h.start();
+  const result: any = await h.pi.tool('ultra_resume_worker', { permitId: 'resume', message, operationId: 'op', failureClass: 'provider' });
+  assert.match(resultText(result), /failed closed/i);
+  const failure = h.pi.entries.find((entry) => entry.customType === ULTRA_OPERATION_ENTRY && (entry.data as any).repairFailure)?.data as any;
+  assert.deepEqual(failure.repairFailure, { kind: 'provider', route: 'fallback-same-role', recordedAt: failure.repairFailure.recordedAt });
   assert.equal(h.authorityIssueInputs.length, 1);
 });
 
