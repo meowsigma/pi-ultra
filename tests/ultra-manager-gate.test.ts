@@ -34,7 +34,7 @@ function harness() {
   return pi;
 }
 
-test('manager mode denies parent mutation until an urgent scoped takeover is durable', async () => {
+test('manager mode denies parent mutation when unsupported urgent evidence is only tool input', async () => {
   const pi = harness();
   await pi.emit('session_start', { type: 'session_start' });
   const [before] = await pi.emit('tool_call', { toolName: 'write', input: { path: 'a', content: 'b' } });
@@ -45,12 +45,10 @@ test('manager mode denies parent mutation until an urgent scoped takeover is dur
   const scope = await pi.tool('ultra_begin_scope', { scopeId: 'scope-1' });
   assert.equal((scope as any).isError, undefined);
   const takeover = await pi.tool('ultra_takeover', { scopeId: 'scope-1', reason: 'urgent-user-directed', explanation: 'The user requires a direct urgent fix.' });
-  assert.equal((takeover as any).isError, undefined);
-  const takeoverEntry = pi.entries.find((entry: any) => entry.customType === 'ultra.manager.v1' && entry.data.kind === 'takeover') as any;
-  assert.equal(takeoverEntry.data.explanation, 'The user requires a direct urgent fix.');
-
+  assert.equal((takeover as any).isError, true);
+  assert.match((takeover as any).content[0].text, /external durable evidence/i);
   const [after] = await pi.emit('tool_call', { toolName: 'write', input: { path: 'a', content: 'b' } });
-  assert.equal(after, undefined);
+  assert.equal((after as any).block, true);
 });
 
 test('manager handoff materialization fails closed without an admitted completed writer operation', async () => {

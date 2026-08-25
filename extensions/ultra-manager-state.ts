@@ -114,9 +114,10 @@ export function createUltraManagerState(input: { append(event: UltraManagerEvent
     recordTakeover(inputValue) {
       if (!active(inputValue)) throw new Error('Manager takeover requires an active matching scope.');
       if (!validText(inputValue.explanation)) throw new Error('Manager takeover requires a bounded explanation.');
-      const requiredEvidence: UltraManagerEvidence | undefined = inputValue.reason === 'dirty-worktree' || inputValue.reason === 'repair-exhausted' || inputValue.reason === 'worker-capability-failure'
-        ? inputValue.reason
-        : undefined;
+      // These claims cannot be proven from a tool call alone. Deny instead of
+      // treating model-supplied prose as user/decomposition evidence.
+      if (inputValue.reason === 'inseparable-work' || inputValue.reason === 'urgent-user-directed') throw new Error(`Manager takeover '${inputValue.reason}' requires external durable evidence and is unavailable through this tool.`);
+      const requiredEvidence: UltraManagerEvidence | undefined = inputValue.reason;
       if (requiredEvidence && !evidenceFor(inputValue, requiredEvidence)) throw new Error(`Manager takeover '${inputValue.reason}' requires persisted state evidence.`);
       append({ ...inputValue, kind: 'takeover' });
     },

@@ -28,11 +28,12 @@ test('manager state requires an active matching takeover before parent mutation'
   state.openScope({ scopeId: 'scope-1', rootId: 'leaf-1', policyRevision: 'revision-1', createdAt: 1 });
   assert.equal(state.allowsMutation({ scopeId: 'scope-1', rootId: 'leaf-1', policyRevision: 'revision-1' }), false);
 
-  state.recordTakeover({ scopeId: 'scope-1', rootId: 'leaf-1', policyRevision: 'revision-1', reason: 'urgent-user-directed', explanation: 'User explicitly requested urgent direct work.', createdAt: 2 });
+  state.recordEvidence({ scopeId: 'scope-1', rootId: 'leaf-1', policyRevision: 'revision-1', evidence: 'worker-capability-failure', createdAt: 2 });
+  state.recordTakeover({ scopeId: 'scope-1', rootId: 'leaf-1', policyRevision: 'revision-1', reason: 'worker-capability-failure', explanation: 'Durable worker-capability evidence requires direct work.', createdAt: 3 });
   assert.equal(state.allowsMutation({ scopeId: 'scope-1', rootId: 'leaf-1', policyRevision: 'revision-1' }), true);
   assert.equal(state.allowsMutation({ scopeId: 'scope-1', rootId: 'leaf-2', policyRevision: 'revision-1' }), false);
   assert.equal(state.allowsMutation({ scopeId: 'scope-1', rootId: 'leaf-1', policyRevision: 'revision-2' }), false);
-  assert.deepEqual(persisted.map((entry) => entry.kind), ['scope-opened', 'takeover']);
+  assert.deepEqual(persisted.map((entry) => entry.kind), ['scope-opened', 'evidence', 'takeover']);
 });
 
 test('manager state accepts only persisted evidence eligible takeover reasons', () => {
