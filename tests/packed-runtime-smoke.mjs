@@ -81,11 +81,15 @@ import { pathToFileURL } from 'node:url';
 export default function probe(pi) {
   pi.on('session_start', (_event, ctx) => {
     setTimeout(async () => {
+    // Ultra installs a fail-closed ceiling asynchronously during session start.
+    // Give the package lifecycle a bounded chance to finish before asserting the
+    // live active/bundled authority registry behavior.
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
     const requestId = 'smoke-denied';
     const replyEvent = 'subagents:rpc:v1:reply:' + requestId;
     const reply = new Promise((resolve) => {
       const dispose = pi.events.on(replyEvent, (payload) => { if (payload?.requestId === requestId) { dispose?.(); resolve(payload); } });
-      setTimeout(() => { dispose?.(); resolve({ timeout: true }); }, 3000).unref?.();
+      setTimeout(() => { dispose?.(); resolve({ timeout: true }); }, 3000);
     });
     pi.events.emit('subagents:rpc:v1:request', {
       version: 1,
