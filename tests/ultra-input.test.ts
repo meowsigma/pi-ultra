@@ -186,6 +186,7 @@ test('failed controlled resume persists its classified fallback route without au
   await h.start();
   const result: any = await h.pi.tool('ultra_resume_worker', { permitId: 'resume', message, operationId: 'op', failureClass: 'provider' });
   assert.match(resultText(result), /failed closed/i);
+  assert.match(resultText(result), /same-role fallback/i);
   const failure = h.pi.entries.find((entry) => entry.customType === ULTRA_OPERATION_ENTRY && (entry.data as any).repairFailure)?.data as any;
   assert.deepEqual(failure.repairFailure, { kind: 'provider', route: 'fallback-same-role', recordedAt: failure.repairFailure.recordedAt });
   assert.equal(h.authorityIssueInputs.length, 1);

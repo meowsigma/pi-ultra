@@ -734,6 +734,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
           const receipt = await requestControlledResume(pi.events, { id: durable.targetRunId, message: message.trim() }, token);
           return { content: [{ type: 'text' as const, text: `Controlled resume requested for retained run ${durable.targetRunId}. Receipt is evidence only.` }], details: { kind: 'controlled-resume', permitId: durable.id, runId: durable.targetRunId, receipt } };
         } catch (error) {
+          let repairGuidance = '';
           const operationId = isRecord(params) && typeof params.operationId === 'string' ? params.operationId : undefined;
           const failure = isRecord(params) && ['provider', 'timeout', 'workspace', 'reviewer'].includes(String(params.failureClass)) ? params.failureClass as UltraRepairFailureClass : undefined;
           if (operationId && failure) {
@@ -741,9 +742,14 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
               const operation = operations.get(operationId);
               const route = selectUltraRepairRoute({ failure, repairAlreadyUsed: operation?.repairCount === 1, retainedPermitUsable: false });
               operations.recordRepairFailure(operationId, { kind: failure, route: route.kind, recordedAt: Date.now() });
+              repairGuidance = route.kind === 'fallback-same-role'
+                ? ' Recorded repair route: same-role fallback; launch exactly one bound repair wave.'
+                : route.kind === 'manager-takeover'
+                  ? ' Recorded repair route: Manager takeover is required.'
+                  : ' Recorded repair route: retained worker may be resumed only with a new exact permit.';
             } catch { /* original resume failure remains authoritative */ }
           }
-          return toolError(`Controlled resume failed closed: ${boundedMessage(error)}`);
+          return toolError(`Controlled resume failed closed: ${boundedMessage(error)}${repairGuidance}`);
         }
       },
     });
