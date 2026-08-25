@@ -97,5 +97,8 @@ test('restore fails closed for malformed entries and exposes dashboard state', (
   pool.admitNext({ leaseId: 'lease-1', expiresAt: 20 });
   const restored = createUltraPool({ append: () => assert.fail('restore must not append'), now: () => 2 });
   restored.restore([...entries, { type: 'custom', customType: ULTRA_POOL_ENTRY, data: { nope: true } }]);
-  assert.deepEqual(restored.dashboard(), { queued: 0, active: 1, cancelled: 0, completed: 0, repairsQueued: 0, capacity: 1, slots: { idle: 0, leased: 1 }, leases: { active: 1, expired: 0, completed: 0 } });
+  const dashboard = restored.dashboard();
+  assert.deepEqual({ queued: dashboard.queued, active: dashboard.active, cancelled: dashboard.cancelled, completed: dashboard.completed, repairsQueued: dashboard.repairsQueued, capacity: dashboard.capacity, slots: dashboard.slots, leases: dashboard.leases }, { queued: 0, active: 1, cancelled: 0, completed: 0, repairsQueued: 0, capacity: 1, slots: { idle: 0, leased: 1 }, leases: { active: 1, expired: 0, completed: 0 } });
+  assert.deepEqual(dashboard.jobDetails, [{ id: 'one', kind: 'read-only', state: 'leased', repairOf: undefined, updatedAt: 1 }]);
+  assert.deepEqual(dashboard.leaseDetails, [{ leaseId: 'lease-1', jobId: 'one', slotId: 'slot-1', state: 'active', expiresAt: 20, updatedAt: 1 }]);
 });

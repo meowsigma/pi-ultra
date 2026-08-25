@@ -167,7 +167,14 @@ export function createUltraPool(input: { append(data: UltraPoolEntry): void; now
     },
     getResumePermit(id: string) { const permit = resumePermits.get(id); return permit ? clone(permit) : undefined; },
     get(id: string) { const job = jobs.get(id); return job ? clone(job) : undefined; },  
-    dashboard() { const values = [...jobs.values()]; const slotValues = [...slots.values()]; const leaseValues = [...leases.values()]; return { queued: values.filter((job) => job.state === 'queued').length, active: values.filter((job) => job.state === 'leased').length, cancelled: values.filter((job) => job.state === 'cancelled').length, completed: values.filter((job) => job.state === 'completed').length, repairsQueued: values.filter((job) => job.state === 'queued' && job.repairOf).length, capacity: slotValues.length, slots: { idle: slotValues.filter((slot) => slot.state === 'idle').length, leased: slotValues.filter((slot) => slot.state === 'leased').length }, leases: { active: leaseValues.filter((lease) => lease.state === 'active').length, expired: leaseValues.filter((lease) => lease.state === 'expired').length, completed: leaseValues.filter((lease) => lease.state === 'completed').length } }; },
+    dashboard() {
+      const values = [...jobs.values()]; const slotValues = [...slots.values()]; const leaseValues = [...leases.values()];
+      // Bounded operational evidence: enough to cancel/diagnose a job without
+      // leaking the queued objective into model-visible dashboard text.
+      const jobDetails = values.sort((a, b) => a.createdAt - b.createdAt).slice(0, 100).map((job) => ({ id: job.id, kind: job.jobKind, state: job.state, repairOf: job.repairOf, updatedAt: job.updatedAt }));
+      const leaseDetails = leaseValues.sort((a, b) => a.createdAt - b.createdAt).slice(0, 100).map((lease) => ({ leaseId: lease.leaseId, jobId: lease.jobId, slotId: lease.slotId, state: lease.state, expiresAt: lease.expiresAt, updatedAt: lease.updatedAt }));
+      return { queued: values.filter((job) => job.state === 'queued').length, active: values.filter((job) => job.state === 'leased').length, cancelled: values.filter((job) => job.state === 'cancelled').length, completed: values.filter((job) => job.state === 'completed').length, repairsQueued: values.filter((job) => job.state === 'queued' && job.repairOf).length, capacity: slotValues.length, slots: { idle: slotValues.filter((slot) => slot.state === 'idle').length, leased: slotValues.filter((slot) => slot.state === 'leased').length }, leases: { active: leaseValues.filter((lease) => lease.state === 'active').length, expired: leaseValues.filter((lease) => lease.state === 'expired').length, completed: leaseValues.filter((lease) => lease.state === 'completed').length }, jobDetails, leaseDetails };
+    },
   };
   return api;
 }
