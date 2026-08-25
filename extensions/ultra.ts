@@ -153,6 +153,7 @@ export interface UltraExtensionDependencies {
     state: LoadUltraSettingsResult;
     /** Whether the active session carries any explicit override snapshots. */
     hasSessionOverrides: boolean;
+    pool?: { queued: number; active: number; cancelled: number; repairsQueued: number; capacity: number; slots: { leased: number } };
     /** Session-scope updater: appends current-session overrides only, never the global file. */
     updateSession(patch: UltraSettingsPatch | UltraSettingsMutator): Promise<ValidUltraSettingsResult>;
     /** Appends one explicit empty snapshot and returns the effective global defaults. */
@@ -383,8 +384,8 @@ const DEFAULT_DEPENDENCIES: UltraExtensionDependencies = {
   loadSettings: () => loadUltraSettings(),
   updateSettings: (patch) => updateUltraSettings(patch),
   backupAndReset: () => backupAndResetUltraSettings(),
-  showMenu: ({ ctx, state, hasSessionOverrides, updateSession, resetSession, updateGlobal, recover }) =>
-    showUltraMenu({ ctx, state, hasSessionOverrides, updateSession, resetSession, updateGlobal, recover }),
+  showMenu: ({ ctx, state, hasSessionOverrides, pool, updateSession, resetSession, updateGlobal, recover }) =>
+    showUltraMenu({ ctx, state, hasSessionOverrides, pool, updateSession, resetSession, updateGlobal, recover }),
   checkCapabilities: defaultCheckCapabilities,
   installPolicy: defaultInstallPolicy,
   watchSettings: (onChange, onError) => watchUltraSettings(onChange, undefined, onError),
@@ -1187,6 +1188,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
               ctx,
               state,
               hasSessionOverrides: Object.keys(sessionPatch).length > 0,
+              pool: pool.dashboard(),
               // Session-scope updater: menu edits append session overrides and
               // never touch the global settings file.
               updateSession: async (patchInput) => {

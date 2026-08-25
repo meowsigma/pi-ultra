@@ -141,6 +141,11 @@ test('main screen proves session override provenance and scopes both settings ti
   assert.equal(laneRangeLabel({ ...SETTINGS, minLanes: 3, maxLanes: 6 }), 'Custom · 3–6');
 });
 
+test('main screen renders durable Active Pool dashboard counts', () => {
+  const screen = buildMainMenu(SETTINGS, { hasSessionOverrides: false, pool: { active: 2, capacity: 4, queued: 3, cancelled: 1, repairsQueued: 1, slots: { leased: 2 } } });
+  assert.match(screen.lines.join('\n'), /Active Pool: 2\/4 active · 3 queued · 2 slots leased · 1 repairs · 1 cancelled/);
+});
+
 test('global settings screen renders disabled, Automatic, and small range with global-only action ids', () => {
   const screen = buildSettingsScreen({ ...GLOBAL_SETTINGS, enabled: false }, [], 'global');
   assert.equal(screen.title, 'Ultra Global Defaults — All sessions');

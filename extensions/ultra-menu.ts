@@ -50,6 +50,8 @@ export interface UltraMenuContext extends Pick<ExtensionCommandContext, 'mode' |
 export interface UltraMainMenuOptions {
   /** Whether the active session carries any explicit override snapshots. */
   hasSessionOverrides?: boolean;
+  /** Durable Active Pool dashboard summary supplied by the runtime. */
+  pool?: { queued: number; active: number; cancelled: number; repairsQueued: number; capacity: number; slots: { leased: number } };
 }
 
 export interface ShowUltraMenuOptions {
@@ -57,6 +59,8 @@ export interface ShowUltraMenuOptions {
   /** Effective state for the active session (globals overlaid with its patch). */
   state: LoadUltraSettingsResult;
   hasSessionOverrides: boolean;
+  /** Durable Active Pool dashboard summary shown in the user-facing control menu. */
+  pool?: UltraMainMenuOptions['pool'];
   /** Session-scope updater: appends a current-session override snapshot only. */
   updateSession(patch: UltraSettingsPatch | UltraSettingsMutator): Promise<ValidUltraSettingsResult>;
   /** Clears every session override via one explicit empty snapshot and returns the effective global defaults. */
@@ -127,6 +131,7 @@ export function buildMainMenu(settings: UltraSettings, options: UltraMainMenuOpt
       `Model: ${model}`,
       `Lane range: ${laneRangeLabel(settings)}`,
       sessionOverridesLine(options.hasSessionOverrides === true),
+      ...(options.pool ? [`Active Pool: ${options.pool.active}/${options.pool.capacity} active · ${options.pool.queued} queued · ${options.pool.slots.leased} slots leased · ${options.pool.repairsQueued} repairs · ${options.pool.cancelled} cancelled`] : []),
     ],
     items: [
       settings.enabled
@@ -392,7 +397,7 @@ export async function showUltraMenu(options: ShowUltraMenuOptions): Promise<RunM
 
   const screens: Record<UltraScreenId, MenuScreenFactory<UltraMenuState, UltraScreenId, UltraActionId>> = {
     main: () => isValidState(current)
-      ? buildMainMenu(current.settings, { hasSessionOverrides: sessionOverridesPresent })
+      ? buildMainMenu(current.settings, { hasSessionOverrides: sessionOverridesPresent, pool: options.pool })
       : buildBlockedMenu(current),
     settings: () => buildSettingsScreen(requireSettings(), availableIds, 'session'),
     'global-settings': () => buildSettingsScreen(requireSettings(), availableIds, 'global'),
