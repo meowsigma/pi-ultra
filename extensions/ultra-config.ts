@@ -15,7 +15,7 @@ const LOCK_RETRY_MS = 50;
 const STALE_LOCK_MS = 30_000;
 export const MAX_MODEL_BYTES = 256;
 const MAX_REASON_LENGTH = 512;
-const ULTRA_FIELDS = new Set(['version', 'enabled', 'orchestrationMode', 'routingMode', 'workerModel', 'minLanes', 'maxLanes']);
+const ULTRA_FIELDS = new Set(['version', 'enabled', 'orchestrationMode', 'routingMode', 'workerModel', 'minLanes', 'maxLanes', 'poolMaxActive']);
 // Provider-qualified model id: 'provider/model' with no whitespace or control chars.
 // Exported so session-override validation accepts identical ids.
 export const MODEL_ID = /^[^\s\u0000-\u001f\u007f/]+\/[^\s\u0000-\u001f\u007f]+$/u;
@@ -33,6 +33,8 @@ export interface UltraSettings {
   workerModel?: string;
   minLanes: number;
   maxLanes: number;
+  /** Independent logical Active Pool concurrency ceiling. */
+  poolMaxActive?: number;
 }
 
 export const DEFAULT_ULTRA_SETTINGS: UltraSettings = {
@@ -42,6 +44,7 @@ export const DEFAULT_ULTRA_SETTINGS: UltraSettings = {
   orchestrationMode: 'collaborator',
   minLanes: 2,
   maxLanes: 4,
+  poolMaxActive: 4,
 };
 
 export interface ValidUltraSettingsResult {
@@ -147,6 +150,10 @@ export function normalizeUltraSettings(value: unknown): UltraSettings | undefine
     const lane = value[field];
     if (typeof lane !== 'number' || !Number.isSafeInteger(lane) || lane < ULTRA_MIN_LANES || lane > ULTRA_MAX_LANES) return undefined;
     out[field] = lane;
+  }
+  if (value.poolMaxActive !== undefined) {
+    if (typeof value.poolMaxActive !== 'number' || !Number.isSafeInteger(value.poolMaxActive) || value.poolMaxActive < 1 || value.poolMaxActive > ULTRA_MAX_LANES) return undefined;
+    out.poolMaxActive = value.poolMaxActive;
   }
   if (out.minLanes > out.maxLanes) return undefined;
   return out;
@@ -272,6 +279,7 @@ function mergeOutput(existing: Record<string, unknown>, settings: UltraSettings)
   if (settings.workerModel !== undefined) output.workerModel = settings.workerModel;
   output.minLanes = settings.minLanes;
   output.maxLanes = settings.maxLanes;
+  output.poolMaxActive = settings.poolMaxActive;
   return output;
 }
 

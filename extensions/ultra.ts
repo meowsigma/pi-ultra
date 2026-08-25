@@ -1030,7 +1030,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
           const operationId = dependencies.randomId();
           const poolKind = input.lanes.some((lane) => lane.role === 'worker') ? 'writer' : 'read-only';
           pool.enqueue({ id: operationId, kind: poolKind, objective: input.objective, ownedPaths: input.lanes.flatMap((lane) => lane.ownedPaths ?? []) , ...(input.repairOf ? { repairOf: input.repairOf } : {}) });
-          const poolLease = pool.admitNext({ leaseId: `${operationId}.lease`, expiresAt: Date.now() + 30 * 60_000, maxActive: resolved.maxLanes });
+          const poolLease = pool.admitNext({ leaseId: `${operationId}.lease`, expiresAt: Date.now() + 30 * 60_000, maxActive: resolved.poolMaxActive ?? 4 });
           if (!poolLease || poolLease.job.id !== operationId) return toolError('Ultra pool queued this wave behind an earlier lease; inspect ultra_pool_status and retry only through the manager.');
           launchAttemptId = ultraLaunchIdempotencyKey({ operationId, attemptIndex: 0 });
           operations.recordQueuedLaunch({
