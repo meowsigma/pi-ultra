@@ -45,7 +45,7 @@ import {
   admitUltraWave,
   type UltraWriterAdmissionResult,
 } from './ultra-writer-admission.js';
-import { ULTRA_POOL_ENTRY, createUltraPool } from './ultra-pool.js';
+import { ULTRA_POOL_ENTRY, createUltraPool, type UltraPoolDispatch } from './ultra-pool.js';
 import {
   createUltraManagerState,
   ULTRA_MANAGER_ENTRY,
@@ -92,6 +92,7 @@ const MANAGER_SCOPE_SCHEMA = Type.Object({
   scopeId: Type.String({ minLength: 1, maxLength: 128 }),
 }, { additionalProperties: false });
 const POOL_CANCEL_SCHEMA = Type.Object({ jobId: Type.String({ minLength: 1, maxLength: 128 }) }, { additionalProperties: false });
+const POOL_DISPATCH_SCHEMA = Type.Object({}, { additionalProperties: false });
 const ISSUE_RESUME_PERMIT_SCHEMA = Type.Object({
   operationId: Type.String({ minLength: 1, maxLength: 128 }),
   message: Type.String({ minLength: 1, maxLength: 16_384 }),
@@ -714,6 +715,48 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
       timers.add(timer);
     };
 
+    /** Dispatch the durable FIFO head only after a new Manager-scope scheduling tick. */
+    const dispatchQueuedHead = async (ctx: ExtensionContext, signal: AbortSignal): Promise<{ operationId?: string; runId?: string; queued?: boolean }> => {
+      const queued = pool.nextQueued();
+      if (!queued) return {};
+      const dispatch = queued.dispatch;
+      if (!dispatch) throw new Error(`Queued pool job '${queued.id}' has no durable dispatch contract; cancel it explicitly rather than guessing a launch.`);
+      if (!effective || !effective.enabled || !effectiveRevisionValue || !policy?.operational || !policy.authority) throw new Error('Ultra is not synchronized for queued dispatch.');
+      if (effective.orchestrationMode === 'manager') {
+        const binding = currentManagerScopeId ? managerBinding(ctx, currentManagerScopeId) : undefined;
+        if (!binding || !managerState.hasActiveScope(binding)) throw new Error('Queued dispatch requires an active durable Manager scope.');
+      }
+      const input = { objective: dispatch.objective, lanes: dispatch.lanes, acceptance: dispatch.acceptance, ...(dispatch.repairOf ? { repairOf: dispatch.repairOf } : {}) } as UltraDelegateInput;
+      const admission = await dependencies.admitWriterWave({ lanes: input.lanes.map((lane) => ({ id: lane.id, role: lane.role })), cwd: dispatch.cwd });
+      if (!admission.admitted) throw new Error(`Queued dispatch writer admission denied (${admission.reason}): ${admission.diagnostics.join(' ') || 'repository safety could not be verified.'}`);
+      if (input.repairOf) operations.assertRepairAllowed(input.repairOf);
+      const prepared = await dependencies.prepareWave({ input, settings: effective, cwd: dispatch.cwd, sessionId: sessionIdentity(ctx), revision: effectiveRevisionValue, availableModels: ctx.modelRegistry.getAvailable().map((model) => ({ provider: model.provider, id: model.id, fullId: `${model.provider}/${model.id}`, reasoning: model.reasoning })), parentModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined, capabilityCeiling: policy.capabilityCeiling, events: pi.events });
+      const lease = pool.admitExact(queued.id, { leaseId: `${queued.id}.lease`, expiresAt: Date.now() + 30 * 60_000, maxActive: effective.poolMaxActive ?? 4 });
+      if (!lease) return { queued: true };
+      const attemptIndex = operations.listLaunchAttempts().filter((attempt) => attempt.operationId === queued.id).length;
+      const attemptId = ultraLaunchIdempotencyKey({ operationId: queued.id, attemptIndex });
+      operations.recordQueuedLaunch({ idempotencyKey: attemptId, operationId: queued.id, runId: `pending:${queued.id}`, lanes: operationLanes(prepared), receipt: { state: 'queued-before-permit' } });
+      let reservationId: string | undefined;
+      if (input.repairOf) { reservationId = `${queued.id}.repair.${attemptIndex}`; operations.reserveRepair(input.repairOf, reservationId); }
+      let receipt: unknown;
+      try {
+        operations.markLaunchAdmitted(attemptId);
+        receipt = await dependencies.launchWave({ events: pi.events, authority: policy.authority, prepared, signal });
+        operations.markLaunched(attemptId);
+      } catch (error) {
+        operations.markFailedPreSpawn(attemptId, boundedMessage(error));
+        if (reservationId) operations.releaseRepair(reservationId);
+        pool.release(queued.id);
+        throw error;
+      }
+      const runId = receiptRunId(receipt);
+      if (!runId) { pool.release(queued.id); throw new Error('Queued launch receipt could not be correlated.'); }
+      const operation = operations.recordLaunch({ operationId: queued.id, runId, objective: prepared.objective, acceptance: prepared.acceptance, lanes: operationLanes(prepared), receipt, ...(admission.evidence?.repositoryRoot && admission.evidence.headCommit ? { writerBase: { repositoryRoot: admission.evidence.repositoryRoot, baseCommit: admission.evidence.headCommit } } : {}), ...(input.repairOf ? { repairOf: input.repairOf, repairReservationId: reservationId } : {}) });
+      const buffered = completionBuffer.get(runId);
+      if (buffered) { completionBuffer.delete(runId); applyCompletion(buffered.payload); } else scheduleReconciliation(operation);
+      return { operationId: queued.id, runId };
+    };
+
     pi.registerTool({
       name: 'ultra_issue_resume_permit',
       label: 'Ultra Issue Retained Resume Permit',
@@ -787,6 +830,20 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
     pi.registerTool({
       name: 'ultra_pool_cancel', label: 'Ultra Cancel Queued Pool Job', description: 'Cancel only a durable queued Active Pool job.', promptSnippet: 'Cancel a queued pool job without affecting active leases.', executionMode: 'sequential', parameters: POOL_CANCEL_SCHEMA,
       async execute(_id, params) { try { const jobId = isRecord(params) && typeof params.jobId === 'string' ? params.jobId : ''; const job = pool.cancel(jobId); return { content: [{ type: 'text' as const, text: `Cancelled queued Ultra pool job ${job.id}.` }], details: { kind: 'pool-cancelled', jobId: job.id } }; } catch (error) { return toolError(`Pool cancellation failed closed: ${boundedMessage(error)}`); } },
+    });
+
+    pi.registerTool({
+      name: 'ultra_pool_dispatch', label: 'Ultra Dispatch Queued Pool Job', description: 'Run one durable FIFO pool head after fresh admission and preflight.', promptSnippet: 'Dispatch only the next durable queued pool job under the current Manager scope.', executionMode: 'sequential', parameters: POOL_DISPATCH_SCHEMA,
+      async execute(_id, _params, signal, _update, ctx) {
+        try {
+          const synced = await synchronize(ctx);
+          if (synced !== 'on') return toolError('Queued dispatch is unavailable because Ultra is not synchronized.');
+          pool.expireLeases();
+          const result = await dispatchQueuedHead(ctx, signal ?? reconciliationAbort.signal);
+          if (!result.operationId) return { content: [{ type: 'text' as const, text: result.queued ? 'Ultra pool head remains queued because capacity is unavailable.' : 'Ultra pool has no queued job.' }], details: { kind: 'pool-dispatch', ...result } };
+          return { content: [{ type: 'text' as const, text: `Dispatched queued Ultra operation ${result.operationId}; run ${result.runId} is evidence only.` }], details: { kind: 'pool-dispatch', ...result } };
+        } catch (error) { return toolError(`Queued dispatch failed closed: ${boundedMessage(error)}`); }
+      },
     });
 
     pi.registerTool({
@@ -1038,7 +1095,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
           pool.expireLeases();
           const operationId = dependencies.randomId();
           const poolKind = input.lanes.some((lane) => lane.role === 'worker') ? 'writer' : 'read-only';
-          pool.enqueue({ id: operationId, kind: poolKind, objective: input.objective, ownedPaths: input.lanes.flatMap((lane) => lane.ownedPaths ?? []) , ...(input.repairOf ? { repairOf: input.repairOf } : {}) });
+          pool.enqueue({ id: operationId, kind: poolKind, objective: input.objective, ownedPaths: input.lanes.flatMap((lane) => lane.ownedPaths ?? []) , ...(input.repairOf ? { repairOf: input.repairOf } : {}), dispatch: { objective: input.objective, lanes: input.lanes.map((lane) => ({ id: lane.id, role: lane.role, task: lane.task, deliverable: lane.deliverable, ...(lane.ownedPaths ? { ownedPaths: [...lane.ownedPaths] } : {}) })), acceptance: [...input.acceptance], ...(input.repairOf ? { repairOf: input.repairOf } : {}), cwd: ctx.cwd } satisfies UltraPoolDispatch });
           const poolLease = pool.admitExact(operationId, { leaseId: `${operationId}.lease`, expiresAt: Date.now() + 30 * 60_000, maxActive: resolved.poolMaxActive ?? 4 });
           if (!poolLease) return toolError('Ultra pool queued this wave behind an earlier lease; inspect ultra_pool_status. The queue remains unleased until its bound dispatch contract is available.');
           launchAttemptId = ultraLaunchIdempotencyKey({ operationId, attemptIndex: 0 });
@@ -1063,6 +1120,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
           } catch (error) {
             if (launchAttemptId && !signal.aborted && !stale()) operations.markFailedPreSpawn(launchAttemptId, boundedMessage(error));
             if (repairReservationId && !signal.aborted && !stale()) operations.releaseRepair(repairReservationId);
+            if (!signal.aborted && !stale()) try { pool.release(operationId); } catch { /* completion/expiry may already have settled the lease */ }
             throw error;
           }
           if (stale()) throw new Error('Ultra extension reloaded after wave admission; the durable repair reservation remains fail-closed.');
@@ -1256,7 +1314,7 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
         return { block: true, reason: 'Ultra governs new subagent launches. Use ultra_delegate for one exact authorized wave, or let the main model take over directly.' };
       }
       if (!effective?.enabled || effective.orchestrationMode !== 'manager' || !policy?.operational) return;
-      if (event.toolName === 'ultra_begin_scope' || event.toolName === 'ultra_takeover' || event.toolName === 'ultra_delegate' || event.toolName === 'ultra_pool_status' || event.toolName === 'ultra_pool_cancel' || event.toolName === 'ultra_issue_resume_permit' || event.toolName === 'ultra_resume_worker' || event.toolName === 'ultra_materialize_handoff' || event.toolName === 'ultra_review_candidate' || event.toolName === 'ultra_record_review_findings' || event.toolName === 'ultra_dispose_handoff' || MANAGER_READ_ONLY_TOOLS.has(event.toolName)) return;
+      if (event.toolName === 'ultra_begin_scope' || event.toolName === 'ultra_takeover' || event.toolName === 'ultra_delegate' || event.toolName === 'ultra_pool_status' || event.toolName === 'ultra_pool_dispatch' || event.toolName === 'ultra_pool_cancel' || event.toolName === 'ultra_issue_resume_permit' || event.toolName === 'ultra_resume_worker' || event.toolName === 'ultra_materialize_handoff' || event.toolName === 'ultra_review_candidate' || event.toolName === 'ultra_record_review_findings' || event.toolName === 'ultra_dispose_handoff' || MANAGER_READ_ONLY_TOOLS.has(event.toolName)) return;
       // There is no sound heuristic for shell/custom-tool mutability. Unknown
       // tools are therefore denied until a durable takeover matches this turn.
       const scopeId = currentManagerScopeId;

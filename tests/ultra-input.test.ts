@@ -131,7 +131,7 @@ test('registers one command/tool, removes passive input interception, and append
   const h = harness();
   await h.start();
   assert.deepEqual([...h.pi.commands.keys()], ['ultra']);
-  assert.deepEqual([...h.pi.tools.keys()], ['ultra_issue_resume_permit', 'ultra_resume_worker', 'ultra_pool_cancel', 'ultra_pool_status', 'ultra_begin_scope', 'ultra_takeover', 'ultra_record_review_findings', 'ultra_dispose_handoff', 'ultra_review_candidate', 'ultra_materialize_handoff', 'ultra_delegate']);
+  assert.deepEqual([...h.pi.tools.keys()], ['ultra_issue_resume_permit', 'ultra_resume_worker', 'ultra_pool_cancel', 'ultra_pool_dispatch', 'ultra_pool_status', 'ultra_begin_scope', 'ultra_takeover', 'ultra_record_review_findings', 'ultra_dispose_handoff', 'ultra_review_candidate', 'ultra_materialize_handoff', 'ultra_delegate']);
   assert.equal(h.pi.handlerCount('input'), 0);
   const turn = await h.pi.inputToAgentStart('Implement the parser.');
   assert.equal(turn.prompt, 'Implement the parser.');
@@ -238,6 +238,18 @@ test('ultra_delegate prepares one wave, records receipt evidence, and never clai
   const operationEntries = h.pi.entries.filter((entry) => entry.customType === 'ultra.operation.v1');
   assert.deepEqual(operationEntries.map((entry: any) => entry.data.kind ?? 'operation'), ['launch-attempt', 'launch-attempt', 'launch-attempt', 'operation']);
   assert.deepEqual(operationEntries.slice(0, 3).map((entry: any) => entry.data.state), ['queued', 'admitted', 'launched']);
+});
+
+test('a restored durable queued job dispatches through fresh admission and preflight', async () => {
+  const dispatch = { objective: 'Implement parser.', lanes: delegateInput().lanes, acceptance: ['Run tests.'], cwd: '/repo' };
+  const h = harness({ session: { branch: [{ type: 'custom', customType: ULTRA_POOL_ENTRY, data: { version: 1, kind: 'job', id: 'queued-op', jobKind: 'writer', state: 'queued', objective: dispatch.objective, ownedPaths: ['src/parser'], dispatch, createdAt: 1, updatedAt: 1 } }] } });
+  await h.start();
+  const result: any = await h.pi.tool('ultra_pool_dispatch', {});
+  assert.equal(result.isError, undefined);
+  assert.equal(h.launches.length, 1);
+  assert.equal(h.preparedInputs.at(-1)?.input.objective, 'Implement parser.');
+  assert.match(resultText(result), /queued-op/);
+  assert.equal(h.pi.entries.filter((entry: any) => entry.customType === ULTRA_OPERATION_ENTRY && entry.data.status === 'running').length, 1);
 });
 
 test('writer admission denies before preflight or permit spending and keeps read-only authority intact', async () => {

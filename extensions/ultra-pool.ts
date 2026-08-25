@@ -2,6 +2,14 @@ export const ULTRA_POOL_ENTRY = 'ultra.pool.v1' as const;
 
 export type UltraPoolJobKind = 'read-only' | 'writer';
 export type UltraPoolJobState = 'queued' | 'leased' | 'cancelled' | 'completed';
+/** Serialized, schema-normalized launch intent retained solely for fair redispatch. */
+export interface UltraPoolDispatch {
+  objective: string;
+  lanes: Array<{ id: string; role: 'scout' | 'worker' | 'reviewer'; task: string; deliverable: string; ownedPaths?: string[] }>;
+  acceptance: string[];
+  repairOf?: string;
+  cwd: string;
+}
 export interface UltraPoolJob {
   version: 1;
   kind: 'job';
@@ -11,6 +19,7 @@ export interface UltraPoolJob {
   objective: string;
   ownedPaths: string[];
   repairOf?: string;
+  dispatch?: UltraPoolDispatch;
   createdAt: number;
   updatedAt: number;
 }
@@ -55,8 +64,11 @@ export type UltraPoolEntry = UltraPoolJob | UltraPoolLease | UltraPoolSlot | Ult
 function isRecord(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function clone<T>(value: T): T { return JSON.parse(JSON.stringify(value)) as T; }
 function overlap(left: string, right: string): boolean { return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`); }
+function validDispatch(value: unknown): value is UltraPoolDispatch {
+  return isRecord(value) && typeof value.objective === 'string' && typeof value.cwd === 'string' && Array.isArray(value.acceptance) && value.acceptance.every((entry) => typeof entry === 'string') && Array.isArray(value.lanes) && value.lanes.length > 0 && value.lanes.every((lane) => isRecord(lane) && typeof lane.id === 'string' && (lane.role === 'scout' || lane.role === 'worker' || lane.role === 'reviewer') && typeof lane.task === 'string' && typeof lane.deliverable === 'string' && (lane.ownedPaths === undefined || (Array.isArray(lane.ownedPaths) && lane.ownedPaths.every((path) => typeof path === 'string')))) && (value.repairOf === undefined || typeof value.repairOf === 'string');
+}
 function validJob(value: unknown): value is UltraPoolJob {
-  return isRecord(value) && value.version === 1 && value.kind === 'job' && typeof value.id === 'string' && (value.jobKind === 'read-only' || value.jobKind === 'writer') && ['queued', 'leased', 'cancelled', 'completed'].includes(String(value.state)) && typeof value.objective === 'string' && Array.isArray(value.ownedPaths) && value.ownedPaths.every((path) => typeof path === 'string') && Number.isSafeInteger(value.createdAt) && Number.isSafeInteger(value.updatedAt);
+  return isRecord(value) && value.version === 1 && value.kind === 'job' && typeof value.id === 'string' && (value.jobKind === 'read-only' || value.jobKind === 'writer') && ['queued', 'leased', 'cancelled', 'completed'].includes(String(value.state)) && typeof value.objective === 'string' && Array.isArray(value.ownedPaths) && value.ownedPaths.every((path) => typeof path === 'string') && (value.dispatch === undefined || validDispatch(value.dispatch)) && Number.isSafeInteger(value.createdAt) && Number.isSafeInteger(value.updatedAt);
 }
 function validLease(value: unknown): value is UltraPoolLease {
   return isRecord(value) && value.version === 1 && value.kind === 'lease' && typeof value.leaseId === 'string' && typeof value.jobId === 'string' && (value.slotId === undefined || typeof value.slotId === 'string') && Number.isSafeInteger(value.expiresAt) && (value.state === 'active' || value.state === 'expired' || value.state === 'completed') && Number.isSafeInteger(value.createdAt) && Number.isSafeInteger(value.updatedAt);
@@ -102,11 +114,12 @@ export function createUltraPool(input: { append(data: UltraPoolEntry): void; now
         slots.set(slotId, { version: 1, kind: 'slot', id: slotId, state: 'leased', leaseId: lease.leaseId, createdAt: lease.createdAt, updatedAt: lease.updatedAt });
       }
     },
-    enqueue(inputJob: { id: string; kind: UltraPoolJobKind; objective: string; ownedPaths: string[]; repairOf?: string }) {
+    enqueue(inputJob: { id: string; kind: UltraPoolJobKind; objective: string; ownedPaths: string[]; repairOf?: string; dispatch?: UltraPoolDispatch }) {
       if (!inputJob.id || jobs.has(inputJob.id)) throw new Error('Pool job ID is missing or already exists.');
       if (inputJob.kind === 'writer' && inputJob.ownedPaths.length < 1) throw new Error('Writer pool jobs require owned paths.');
       const timestamp = now();
-      return persistJob({ version: 1, kind: 'job', id: inputJob.id, jobKind: inputJob.kind, state: 'queued', objective: inputJob.objective.slice(0, 4096), ownedPaths: [...new Set(inputJob.ownedPaths)].slice(0, 32), ...(inputJob.repairOf ? { repairOf: inputJob.repairOf } : {}), createdAt: timestamp, updatedAt: timestamp });
+      if (inputJob.dispatch && !validDispatch(inputJob.dispatch)) throw new Error('Pool dispatch contract is invalid.');
+      return persistJob({ version: 1, kind: 'job', id: inputJob.id, jobKind: inputJob.kind, state: 'queued', objective: inputJob.objective.slice(0, 4096), ownedPaths: [...new Set(inputJob.ownedPaths)].slice(0, 32), ...(inputJob.repairOf ? { repairOf: inputJob.repairOf } : {}), ...(inputJob.dispatch ? { dispatch: clone(inputJob.dispatch) } : {}), createdAt: timestamp, updatedAt: timestamp });
     },
     configureSlots(capacity: number) {
       if (!Number.isSafeInteger(capacity) || capacity < 1 || capacity > 100) throw new Error('Pool capacity must be an integer from 1 to 100.');
@@ -136,12 +149,14 @@ export function createUltraPool(input: { append(data: UltraPoolEntry): void; now
      * must use this rather than admitNext: leasing somebody else's durable job
      * without its prepared launch contract would strand it after a retry.
      */
+    nextQueued() { return [...jobs.values()].filter((job) => job.state === 'queued').sort((a, b) => Number(Boolean(b.repairOf)) - Number(Boolean(a.repairOf)) || a.createdAt - b.createdAt).map(clone)[0]; },
     admitExact(jobId: string, inputLease: { leaseId: string; expiresAt: number; maxActive?: number }) {
-      const queued = [...jobs.values()].filter((job) => job.state === 'queued').sort((a, b) => Number(Boolean(b.repairOf)) - Number(Boolean(a.repairOf)) || a.createdAt - b.createdAt);
-      if (queued[0]?.id !== jobId) return undefined;
+      const queued = this.nextQueued();
+      if (queued?.id !== jobId) return undefined;
       return this.admitNext(inputLease);
     },
     cancel(jobId: string) { const job = jobs.get(jobId); if (!job || job.state !== 'queued') throw new Error('Only queued pool jobs may be cancelled.'); job.state = 'cancelled'; job.updatedAt = now(); return persistJob(job); },
+    release(jobId: string) { const job = jobs.get(jobId); if (!job || job.state !== 'leased') throw new Error('Only leased pool jobs may be released.'); const timestamp = now(); job.state = 'queued'; job.updatedAt = timestamp; persistJob(job); for (const lease of leases.values()) if (lease.jobId === jobId && lease.state === 'active') { lease.state = 'expired'; lease.updatedAt = timestamp; persistLease(lease); releaseSlot(lease, timestamp); } return clone(job); },
     complete(jobId: string) { const job = jobs.get(jobId); if (!job || job.state !== 'leased') throw new Error('Only leased pool jobs may complete.'); const timestamp = now(); job.state = 'completed'; job.updatedAt = timestamp; persistJob(job); for (const lease of leases.values()) if (lease.jobId === jobId && lease.state === 'active') { lease.state = 'completed'; lease.updatedAt = timestamp; persistLease(lease); releaseSlot(lease, timestamp); } return clone(job); },
     expireLeases() { const expired: UltraPoolLease[] = []; for (const lease of leases.values()) if (lease.state === 'active' && lease.expiresAt <= now()) { const timestamp = now(); lease.state = 'expired'; lease.updatedAt = timestamp; persistLease(lease); releaseSlot(lease, timestamp); const job = jobs.get(lease.jobId); if (job?.state === 'leased') { job.state = 'queued'; job.updatedAt = now(); persistJob(job); } expired.push(clone(lease)); } return expired; },
     issueResumePermit(inputPermit: { id: string; jobId: string; leaseId: string; targetRunId: string; requestDigest: string; worker: UltraPoolResumePermit['worker']; expiresAt: number }) {
@@ -171,7 +186,7 @@ export function createUltraPool(input: { append(data: UltraPoolEntry): void; now
       const values = [...jobs.values()]; const slotValues = [...slots.values()]; const leaseValues = [...leases.values()];
       // Bounded operational evidence: enough to cancel/diagnose a job without
       // leaking the queued objective into model-visible dashboard text.
-      const jobDetails = values.sort((a, b) => a.createdAt - b.createdAt).slice(0, 100).map((job) => ({ id: job.id, kind: job.jobKind, state: job.state, repairOf: job.repairOf, updatedAt: job.updatedAt }));
+      const jobDetails = values.sort((a, b) => a.createdAt - b.createdAt).slice(0, 100).map((job) => ({ id: job.id, kind: job.jobKind, state: job.state, repairOf: job.repairOf, dispatchReady: job.dispatch !== undefined, updatedAt: job.updatedAt }));
       const leaseDetails = leaseValues.sort((a, b) => a.createdAt - b.createdAt).slice(0, 100).map((lease) => ({ leaseId: lease.leaseId, jobId: lease.jobId, slotId: lease.slotId, state: lease.state, expiresAt: lease.expiresAt, updatedAt: lease.updatedAt }));
       return { queued: values.filter((job) => job.state === 'queued').length, active: values.filter((job) => job.state === 'leased').length, cancelled: values.filter((job) => job.state === 'cancelled').length, completed: values.filter((job) => job.state === 'completed').length, repairsQueued: values.filter((job) => job.state === 'queued' && job.repairOf).length, capacity: slotValues.length, slots: { idle: slotValues.filter((slot) => slot.state === 'idle').length, leased: slotValues.filter((slot) => slot.state === 'leased').length }, leases: { active: leaseValues.filter((lease) => lease.state === 'active').length, expired: leaseValues.filter((lease) => lease.state === 'expired').length, completed: leaseValues.filter((lease) => lease.state === 'completed').length }, jobDetails, leaseDetails };
     },
