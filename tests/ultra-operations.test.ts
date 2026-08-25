@@ -42,6 +42,17 @@ test('persists bounded launch snapshots and restores latest state from the activ
   assert.deepEqual(restored.get('op-1'), operation);
 });
 
+test('persists a classified repair failure for later fallback or accountable takeover', () => {
+  const entries: any[] = [];
+  const store = createUltraOperationStore({ append: (data) => entries.push({ type: 'custom', customType: ULTRA_OPERATION_ENTRY, data }), now: () => 100 });
+  launch(store);
+  const recorded = store.recordRepairFailure('op-1', { kind: 'timeout', route: 'fallback-same-role', recordedAt: 0 });
+  assert.deepEqual(recorded.repairFailure, { kind: 'timeout', route: 'fallback-same-role', recordedAt: 100 });
+  const restored = createUltraOperationStore({ append: () => assert.fail('restore must not append'), now: () => 200 });
+  restored.restore(entries);
+  assert.deepEqual(restored.get('op-1')?.repairFailure, recorded.repairFailure);
+});
+
 test('resolves one root repair slot and rejects paused, sibling, repair-of-repair, reload, and second repair attempts', () => {
   const snapshots: any[] = [];
   const store = createUltraOperationStore({ append: (data) => snapshots.push({ type: 'custom', customType: ULTRA_OPERATION_ENTRY, data }), now: () => 100 });

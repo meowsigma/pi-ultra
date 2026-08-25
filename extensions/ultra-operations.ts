@@ -94,6 +94,7 @@ export interface UltraOperation {
   /** Durable evidence that a validated worker patch was materialized elsewhere. */
   handoffCandidate?: { manifestPath: string; candidatePath: string; createdAt: number };
   review?: { state: 'reviewer-running' | 'awaiting-manager-disposition' | 'verified' | 'repair-queued' | 'taken-over'; reviewerRunId?: string; findings?: string; updatedAt: number };
+  repairFailure?: { kind: 'provider' | 'timeout' | 'workspace' | 'reviewer'; route: 'resume-retained' | 'fallback-same-role' | 'manager-takeover'; recordedAt: number };
   createdAt: number;
   updatedAt: number;
 }
@@ -318,6 +319,7 @@ function validSnapshot(value: unknown): value is UltraOperation {
   if (value.writerBase !== undefined && (!isRecord(value.writerBase) || typeof value.writerBase.repositoryRoot !== 'string' || typeof value.writerBase.baseCommit !== 'string')) return false;
   if (value.handoffCandidate !== undefined && (!isRecord(value.handoffCandidate) || typeof value.handoffCandidate.manifestPath !== 'string' || typeof value.handoffCandidate.candidatePath !== 'string' || !Number.isSafeInteger(value.handoffCandidate.createdAt))) return false;
   if (value.review !== undefined && (!isRecord(value.review) || !['reviewer-running', 'awaiting-manager-disposition', 'verified', 'repair-queued', 'taken-over'].includes(String(value.review.state)) || !Number.isSafeInteger(value.review.updatedAt) || (value.review.reviewerRunId !== undefined && typeof value.review.reviewerRunId !== 'string') || (value.review.findings !== undefined && typeof value.review.findings !== 'string'))) return false;
+  if (value.repairFailure !== undefined && (!isRecord(value.repairFailure) || !['provider', 'timeout', 'workspace', 'reviewer'].includes(String(value.repairFailure.kind)) || !['resume-retained', 'fallback-same-role', 'manager-takeover'].includes(String(value.repairFailure.route)) || !Number.isSafeInteger(value.repairFailure.recordedAt))) return false;
   return true;
 }
 
@@ -415,6 +417,14 @@ export function createUltraOperationStore(options: {
 
     list(): UltraOperation[] {
       return [...operations.values()].map(operationClone);
+    },
+
+    recordRepairFailure(operationId: string, failure: NonNullable<UltraOperation['repairFailure']>): UltraOperation {
+      const operation = operations.get(operationId);
+      if (!operation) throw new Error(`Repair operation '${operationId}' was not found.`);
+      operation.repairFailure = { ...failure, recordedAt: now() };
+      operation.updatedAt = now();
+      return persist(operation);
     },
 
     assertRepairAllowed(repairOf: string): { rootOperationId: string; repairCount: 1 } {
