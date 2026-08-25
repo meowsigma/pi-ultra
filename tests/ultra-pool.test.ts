@@ -15,7 +15,7 @@ test('admission is durable, FIFO within priority, and repairs outrank ordinary q
   assert.deepEqual(pool.admitNext({ leaseId: 'lease-1', expiresAt: 200, maxActive: 1 })?.job.id, 'repair');
   assert.equal(pool.admitNext({ leaseId: 'blocked-by-capacity', expiresAt: 200, maxActive: 1 }), undefined);
   assert.deepEqual(pool.admitNext({ leaseId: 'lease-2', expiresAt: 200, maxActive: 2 })?.job.id, 'ordinary-a');
-  assert.deepEqual(entries.map((entry) => entry.data.kind), ['job', 'job', 'job', 'job', 'lease', 'job', 'lease']);
+  assert.deepEqual(entries.map((entry) => entry.data.kind), ['job', 'job', 'job', 'slot', 'job', 'slot', 'lease', 'slot', 'job', 'slot', 'lease']);
 });
 
 test('writer ownership conflicts wait, cancellation is terminal, and expired leases requeue safely', () => {
@@ -59,6 +59,27 @@ test('resume permits are durable, exact-bound, idempotent, and one-use', () => {
   assert.throws(() => restored.consumeResumePermit(intent), /consumed/i);
 });
 
+test('a later lower capacity does not reuse higher-numbered durable slots', () => {
+  const pool = createUltraPool({ append() {}, now: () => 1 });
+  pool.enqueue(job('first'));
+  pool.enqueue(job('second'));
+  pool.enqueue(job('third'));
+  pool.admitNext({ leaseId: 'lease-first', expiresAt: 10, maxActive: 2 });
+  pool.admitNext({ leaseId: 'lease-second', expiresAt: 10, maxActive: 2 });
+  pool.complete('first');
+  assert.throws(() => pool.admitNext({ leaseId: 'lease-third', expiresAt: 10, maxActive: 1 }), /cannot remove an active slot/i);
+});
+
+test('completion releases its durable slot for the next queued job', () => {
+  const pool = createUltraPool({ append() {}, now: () => 1 });
+  pool.enqueue(job('first'));
+  pool.enqueue(job('second'));
+  assert.equal(pool.admitNext({ leaseId: 'lease-first', expiresAt: 10, maxActive: 1 })?.job.id, 'first');
+  pool.complete('first');
+  assert.equal(pool.dashboard().slots.idle, 1);
+  assert.equal(pool.admitNext({ leaseId: 'lease-second', expiresAt: 10, maxActive: 1 })?.job.id, 'second');
+});
+
 test('restore fails closed for malformed entries and exposes dashboard state', () => {
   const entries: any[] = [];
   const pool = createUltraPool({ append: (data) => entries.push({ type: 'custom', customType: ULTRA_POOL_ENTRY, data }), now: () => 1 });
@@ -66,5 +87,5 @@ test('restore fails closed for malformed entries and exposes dashboard state', (
   pool.admitNext({ leaseId: 'lease-1', expiresAt: 20 });
   const restored = createUltraPool({ append: () => assert.fail('restore must not append'), now: () => 2 });
   restored.restore([...entries, { type: 'custom', customType: ULTRA_POOL_ENTRY, data: { nope: true } }]);
-  assert.deepEqual(restored.dashboard(), { queued: 0, active: 1, cancelled: 0, repairsQueued: 0 });
+  assert.deepEqual(restored.dashboard(), { queued: 0, active: 1, cancelled: 0, completed: 0, repairsQueued: 0, capacity: 1, slots: { idle: 0, leased: 1 }, leases: { active: 1, expired: 0, completed: 0 } });
 });

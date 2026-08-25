@@ -19,8 +19,19 @@ export interface UltraPoolLease {
   kind: 'lease';
   leaseId: string;
   jobId: string;
+  /** Durable capacity slot; absent only for pre-slot journal entries. */
+  slotId?: string;
   expiresAt: number;
-  state: 'active' | 'expired';
+  state: 'active' | 'expired' | 'completed';
+  createdAt: number;
+  updatedAt: number;
+}
+export interface UltraPoolSlot {
+  version: 1;
+  kind: 'slot';
+  id: string;
+  state: 'idle' | 'leased';
+  leaseId?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -39,7 +50,7 @@ export interface UltraPoolResumePermit {
   createdAt: number;
   updatedAt: number;
 }
-export type UltraPoolEntry = UltraPoolJob | UltraPoolLease | UltraPoolResumePermit;
+export type UltraPoolEntry = UltraPoolJob | UltraPoolLease | UltraPoolSlot | UltraPoolResumePermit;
 
 function isRecord(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function clone<T>(value: T): T { return JSON.parse(JSON.stringify(value)) as T; }
@@ -48,7 +59,10 @@ function validJob(value: unknown): value is UltraPoolJob {
   return isRecord(value) && value.version === 1 && value.kind === 'job' && typeof value.id === 'string' && (value.jobKind === 'read-only' || value.jobKind === 'writer') && ['queued', 'leased', 'cancelled', 'completed'].includes(String(value.state)) && typeof value.objective === 'string' && Array.isArray(value.ownedPaths) && value.ownedPaths.every((path) => typeof path === 'string') && Number.isSafeInteger(value.createdAt) && Number.isSafeInteger(value.updatedAt);
 }
 function validLease(value: unknown): value is UltraPoolLease {
-  return isRecord(value) && value.version === 1 && value.kind === 'lease' && typeof value.leaseId === 'string' && typeof value.jobId === 'string' && Number.isSafeInteger(value.expiresAt) && (value.state === 'active' || value.state === 'expired') && Number.isSafeInteger(value.createdAt) && Number.isSafeInteger(value.updatedAt);
+  return isRecord(value) && value.version === 1 && value.kind === 'lease' && typeof value.leaseId === 'string' && typeof value.jobId === 'string' && (value.slotId === undefined || typeof value.slotId === 'string') && Number.isSafeInteger(value.expiresAt) && (value.state === 'active' || value.state === 'expired' || value.state === 'completed') && Number.isSafeInteger(value.createdAt) && Number.isSafeInteger(value.updatedAt);
+}
+function validSlot(value: unknown): value is UltraPoolSlot {
+  return isRecord(value) && value.version === 1 && value.kind === 'slot' && typeof value.id === 'string' && (value.state === 'idle' || value.state === 'leased') && (value.leaseId === undefined || typeof value.leaseId === 'string') && Number.isSafeInteger(value.createdAt) && Number.isSafeInteger(value.updatedAt);
 }
 function validResumePermit(value: unknown): value is UltraPoolResumePermit {
   return isRecord(value) && value.version === 1 && value.kind === 'resume-permit' && typeof value.id === 'string' && typeof value.jobId === 'string' && typeof value.leaseId === 'string' && typeof value.targetRunId === 'string' && typeof value.requestDigest === 'string' && isRecord(value.worker) && typeof value.worker.key === 'string' && typeof value.worker.agent === 'string' && Array.isArray(value.worker.modelCandidates) && value.worker.modelCandidates.every((model) => typeof model === 'string') && typeof value.worker.launchContractDigest === 'string' && typeof value.worker.workspaceBase === 'string' && typeof value.worker.promptDigest === 'string' && Number.isSafeInteger(value.expiresAt) && ['issued', 'consumed', 'expired'].includes(String(value.state)) && Number.isSafeInteger(value.createdAt) && Number.isSafeInteger(value.updatedAt);
@@ -59,9 +73,12 @@ export function createUltraPool(input: { append(data: UltraPoolEntry): void; now
   const jobs = new Map<string, UltraPoolJob>();
   const leases = new Map<string, UltraPoolLease>();
   const resumePermits = new Map<string, UltraPoolResumePermit>();
+  const slots = new Map<string, UltraPoolSlot>();
   const now = input.now ?? Date.now;
   const persistJob = (job: UltraPoolJob) => { const copy = clone(job); jobs.set(copy.id, copy); input.append(clone(copy)); return clone(copy); };
   const persistLease = (lease: UltraPoolLease) => { const copy = clone(lease); leases.set(copy.leaseId, copy); input.append(clone(copy)); return clone(copy); };
+  const persistSlot = (slot: UltraPoolSlot) => { const copy = clone(slot); slots.set(copy.id, copy); input.append(clone(copy)); return clone(copy); };
+  const releaseSlot = (lease: UltraPoolLease, timestamp: number) => { if (!lease.slotId) return; const slot = slots.get(lease.slotId); if (slot?.state === 'leased' && slot.leaseId === lease.leaseId) { slot.state = 'idle'; delete slot.leaseId; slot.updatedAt = timestamp; persistSlot(slot); } };
   const persistResumePermit = (permit: UltraPoolResumePermit) => { const copy = clone(permit); resumePermits.set(copy.id, copy); input.append(clone(copy)); return clone(copy); };
   const writerConflicts = (candidate: UltraPoolJob): boolean => candidate.jobKind === 'writer' && [...leases.values()].some((lease) => {
     if (lease.state !== 'active') return false;
@@ -70,12 +87,19 @@ export function createUltraPool(input: { append(data: UltraPoolEntry): void; now
   });
   const api = {
     restore(entries: readonly unknown[]) {
-      jobs.clear(); leases.clear(); resumePermits.clear();
+      jobs.clear(); leases.clear(); slots.clear(); resumePermits.clear();
       for (const entry of entries.slice(-10_000)) {
         if (!isRecord(entry) || entry.type !== 'custom' || entry.customType !== ULTRA_POOL_ENTRY) continue;
         if (validJob(entry.data)) jobs.set(entry.data.id, clone(entry.data));
         else if (validLease(entry.data)) leases.set(entry.data.leaseId, clone(entry.data));
+        else if (validSlot(entry.data)) slots.set(entry.data.id, clone(entry.data));
         else if (validResumePermit(entry.data)) resumePermits.set(entry.data.id, clone(entry.data));
+      }
+      // Journals written before slots were introduced remain active but consume a
+      // reconstructed in-memory slot; restoration itself must not append.
+      for (const lease of leases.values()) if (lease.state === 'active' && !lease.slotId) {
+        const slotId = `slot-${slots.size + 1}`;
+        slots.set(slotId, { version: 1, kind: 'slot', id: slotId, state: 'leased', leaseId: lease.leaseId, createdAt: lease.createdAt, updatedAt: lease.updatedAt });
       }
     },
     enqueue(inputJob: { id: string; kind: UltraPoolJobKind; objective: string; ownedPaths: string[]; repairOf?: string }) {
@@ -84,21 +108,32 @@ export function createUltraPool(input: { append(data: UltraPoolEntry): void; now
       const timestamp = now();
       return persistJob({ version: 1, kind: 'job', id: inputJob.id, jobKind: inputJob.kind, state: 'queued', objective: inputJob.objective.slice(0, 4096), ownedPaths: [...new Set(inputJob.ownedPaths)].slice(0, 32), ...(inputJob.repairOf ? { repairOf: inputJob.repairOf } : {}), createdAt: timestamp, updatedAt: timestamp });
     },
+    configureSlots(capacity: number) {
+      if (!Number.isSafeInteger(capacity) || capacity < 1 || capacity > 100) throw new Error('Pool capacity must be an integer from 1 to 100.');
+      if ([...slots.values()].some((slot) => slot.state === 'leased' && Number(slot.id.slice(5)) > capacity)) throw new Error('Pool capacity cannot remove an active slot.');
+      const timestamp = now();
+      for (let index = 1; index <= capacity; index += 1) if (!slots.has(`slot-${index}`)) persistSlot({ version: 1, kind: 'slot', id: `slot-${index}`, state: 'idle', createdAt: timestamp, updatedAt: timestamp });
+      return this.dashboard();
+    },
     admitNext(inputLease: { leaseId: string; expiresAt: number; maxActive?: number }) {
       if (leases.has(inputLease.leaseId)) throw new Error(`Duplicate pool lease '${inputLease.leaseId}'.`);
       if (inputLease.maxActive !== undefined && (!Number.isSafeInteger(inputLease.maxActive) || inputLease.maxActive < 1)) throw new Error('Pool maxActive must be a positive integer.');
-      if (inputLease.maxActive !== undefined && [...leases.values()].filter((lease) => lease.state === 'active').length >= inputLease.maxActive) return undefined;
+      const capacity = inputLease.maxActive ?? 1;
+      this.configureSlots(capacity);
+      const idleSlot = [...slots.values()].filter((slot) => slot.state === 'idle' && /^slot-\d+$/u.test(slot.id) && Number(slot.id.slice(5)) <= capacity).sort((a, b) => a.id.localeCompare(b.id))[0];
+      if (!idleSlot) return undefined;
       const candidates = [...jobs.values()].filter((job) => job.state === 'queued').sort((a, b) => Number(Boolean(b.repairOf)) - Number(Boolean(a.repairOf)) || a.createdAt - b.createdAt);
       const job = candidates.find((candidate) => !writerConflicts(candidate));
       if (!job) return undefined;
       const timestamp = now();
       job.state = 'leased'; job.updatedAt = timestamp; persistJob(job);
-      const lease = persistLease({ version: 1, kind: 'lease', leaseId: inputLease.leaseId, jobId: job.id, expiresAt: inputLease.expiresAt, state: 'active', createdAt: timestamp, updatedAt: timestamp });
+      idleSlot.state = 'leased'; idleSlot.leaseId = inputLease.leaseId; idleSlot.updatedAt = timestamp; persistSlot(idleSlot);
+      const lease = persistLease({ version: 1, kind: 'lease', leaseId: inputLease.leaseId, jobId: job.id, slotId: idleSlot.id, expiresAt: inputLease.expiresAt, state: 'active', createdAt: timestamp, updatedAt: timestamp });
       return { job: clone(job), lease };
     },
     cancel(jobId: string) { const job = jobs.get(jobId); if (!job || job.state !== 'queued') throw new Error('Only queued pool jobs may be cancelled.'); job.state = 'cancelled'; job.updatedAt = now(); return persistJob(job); },
-    complete(jobId: string) { const job = jobs.get(jobId); if (!job || job.state !== 'leased') throw new Error('Only leased pool jobs may complete.'); job.state = 'completed'; job.updatedAt = now(); return persistJob(job); },
-    expireLeases() { const expired: UltraPoolLease[] = []; for (const lease of leases.values()) if (lease.state === 'active' && lease.expiresAt <= now()) { lease.state = 'expired'; lease.updatedAt = now(); persistLease(lease); const job = jobs.get(lease.jobId); if (job?.state === 'leased') { job.state = 'queued'; job.updatedAt = now(); persistJob(job); } expired.push(clone(lease)); } return expired; },
+    complete(jobId: string) { const job = jobs.get(jobId); if (!job || job.state !== 'leased') throw new Error('Only leased pool jobs may complete.'); const timestamp = now(); job.state = 'completed'; job.updatedAt = timestamp; persistJob(job); for (const lease of leases.values()) if (lease.jobId === jobId && lease.state === 'active') { lease.state = 'completed'; lease.updatedAt = timestamp; persistLease(lease); releaseSlot(lease, timestamp); } return clone(job); },
+    expireLeases() { const expired: UltraPoolLease[] = []; for (const lease of leases.values()) if (lease.state === 'active' && lease.expiresAt <= now()) { const timestamp = now(); lease.state = 'expired'; lease.updatedAt = timestamp; persistLease(lease); releaseSlot(lease, timestamp); const job = jobs.get(lease.jobId); if (job?.state === 'leased') { job.state = 'queued'; job.updatedAt = now(); persistJob(job); } expired.push(clone(lease)); } return expired; },
     issueResumePermit(inputPermit: { id: string; jobId: string; leaseId: string; targetRunId: string; requestDigest: string; worker: UltraPoolResumePermit['worker']; expiresAt: number }) {
       const existing = resumePermits.get(inputPermit.id);
       if (existing) {
@@ -122,7 +157,7 @@ export function createUltraPool(input: { append(data: UltraPoolEntry): void; now
     },
     getResumePermit(id: string) { const permit = resumePermits.get(id); return permit ? clone(permit) : undefined; },
     get(id: string) { const job = jobs.get(id); return job ? clone(job) : undefined; },  
-    dashboard() { const values = [...jobs.values()]; return { queued: values.filter((job) => job.state === 'queued').length, active: values.filter((job) => job.state === 'leased').length, cancelled: values.filter((job) => job.state === 'cancelled').length, repairsQueued: values.filter((job) => job.state === 'queued' && job.repairOf).length }; },
+    dashboard() { const values = [...jobs.values()]; const slotValues = [...slots.values()]; const leaseValues = [...leases.values()]; return { queued: values.filter((job) => job.state === 'queued').length, active: values.filter((job) => job.state === 'leased').length, cancelled: values.filter((job) => job.state === 'cancelled').length, completed: values.filter((job) => job.state === 'completed').length, repairsQueued: values.filter((job) => job.state === 'queued' && job.repairOf).length, capacity: slotValues.length, slots: { idle: slotValues.filter((slot) => slot.state === 'idle').length, leased: slotValues.filter((slot) => slot.state === 'leased').length }, leases: { active: leaseValues.filter((lease) => lease.state === 'active').length, expired: leaseValues.filter((lease) => lease.state === 'expired').length, completed: leaseValues.filter((lease) => lease.state === 'completed').length } }; },
   };
   return api;
 }
