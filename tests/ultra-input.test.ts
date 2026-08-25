@@ -438,7 +438,8 @@ test('shutdown fences delayed policy install, preflight, and spawn continuations
   assert.equal(spawnResult.isError, true);
   // Shutdown after durable admission retains the ambiguous attempt rather than
   // erasing it and risking a blind relaunch after restore.
-  assert.deepEqual(spawnHarness.pi.entries.map((entry: any) => entry.data.state), ['queued', 'admitted']);
+  assert.deepEqual(spawnHarness.pi.entries.filter((entry: any) => entry.customType === 'ultra.operation.v1').map((entry: any) => entry.data.state), ['queued', 'admitted']);
+  assert.deepEqual(spawnHarness.pi.entries.filter((entry: any) => entry.customType === 'ultra.pool.v1').map((entry: any) => entry.data.state), ['queued', 'leased', 'active']);
 });
 
 test('shutdown fences a reconciliation reply resolved immediately before shutdown', async () => {

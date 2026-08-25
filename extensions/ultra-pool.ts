@@ -97,6 +97,7 @@ export function createUltraPool(input: { append(data: UltraPoolEntry): void; now
       return { job: clone(job), lease };
     },
     cancel(jobId: string) { const job = jobs.get(jobId); if (!job || job.state !== 'queued') throw new Error('Only queued pool jobs may be cancelled.'); job.state = 'cancelled'; job.updatedAt = now(); return persistJob(job); },
+    complete(jobId: string) { const job = jobs.get(jobId); if (!job || job.state !== 'leased') throw new Error('Only leased pool jobs may complete.'); job.state = 'completed'; job.updatedAt = now(); return persistJob(job); },
     expireLeases() { const expired: UltraPoolLease[] = []; for (const lease of leases.values()) if (lease.state === 'active' && lease.expiresAt <= now()) { lease.state = 'expired'; lease.updatedAt = now(); persistLease(lease); const job = jobs.get(lease.jobId); if (job?.state === 'leased') { job.state = 'queued'; job.updatedAt = now(); persistJob(job); } expired.push(clone(lease)); } return expired; },
     issueResumePermit(inputPermit: { id: string; jobId: string; leaseId: string; targetRunId: string; requestDigest: string; worker: UltraPoolResumePermit['worker']; expiresAt: number }) {
       const existing = resumePermits.get(inputPermit.id);
