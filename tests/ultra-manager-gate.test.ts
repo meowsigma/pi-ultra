@@ -41,7 +41,7 @@ test('manager mode denies parent mutation when unsupported urgent evidence is on
   assert.equal((before as any).block, true);
   assert.match((before as any).reason, /takeover/i);
 
-  assert.deepEqual([...pi.tools.keys()].sort(), ['ultra_begin_scope', 'ultra_delegate', 'ultra_dispose_handoff', 'ultra_issue_resume_permit', 'ultra_materialize_handoff', 'ultra_pool_status', 'ultra_record_review_findings', 'ultra_resume_worker', 'ultra_review_candidate', 'ultra_takeover']);
+  assert.deepEqual([...pi.tools.keys()].sort(), ['ultra_begin_scope', 'ultra_delegate', 'ultra_dispose_handoff', 'ultra_issue_resume_permit', 'ultra_materialize_handoff', 'ultra_pool_cancel', 'ultra_pool_status', 'ultra_record_review_findings', 'ultra_resume_worker', 'ultra_review_candidate', 'ultra_takeover']);
   const scope = await pi.tool('ultra_begin_scope', { scopeId: 'scope-1' });
   assert.equal((scope as any).isError, undefined);
   const takeover = await pi.tool('ultra_takeover', { scopeId: 'scope-1', reason: 'urgent-user-directed', explanation: 'The user requires a direct urgent fix.' });
