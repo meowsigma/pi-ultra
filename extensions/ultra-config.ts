@@ -44,7 +44,6 @@ export const DEFAULT_ULTRA_SETTINGS: UltraSettings = {
   orchestrationMode: 'collaborator',
   minLanes: 2,
   maxLanes: 4,
-  poolMaxActive: 4,
 };
 
 export interface ValidUltraSettingsResult {
@@ -279,7 +278,7 @@ function mergeOutput(existing: Record<string, unknown>, settings: UltraSettings)
   if (settings.workerModel !== undefined) output.workerModel = settings.workerModel;
   output.minLanes = settings.minLanes;
   output.maxLanes = settings.maxLanes;
-  output.poolMaxActive = settings.poolMaxActive;
+  if (settings.poolMaxActive !== undefined) output.poolMaxActive = settings.poolMaxActive;
   return output;
 }
 
