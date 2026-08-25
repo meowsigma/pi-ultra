@@ -797,8 +797,9 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
       executionMode: 'sequential',
       parameters: Type.Object({}, { additionalProperties: false }),
       async execute() {
+        pool.expireLeases();
         const dashboard = pool.dashboard();
-        return { content: [{ type: 'text' as const, text: `Ultra pool: queued=${dashboard.queued}, active=${dashboard.active}, cancelled=${dashboard.cancelled}, repairs queued=${dashboard.repairsQueued}.` }], details: { kind: 'pool-dashboard', ...dashboard } };
+        return { content: [{ type: 'text' as const, text: `Ultra pool: queued=${dashboard.queued}, active=${dashboard.active}, slots=${dashboard.slots.leased}/${dashboard.capacity}, cancelled=${dashboard.cancelled}, completed=${dashboard.completed}, expired leases=${dashboard.leases.expired}, repairs queued=${dashboard.repairsQueued}.` }], details: { kind: 'pool-dashboard', ...dashboard } };
       },
     });
 
@@ -1033,6 +1034,8 @@ export function createUltraExtension(dependencies: UltraExtensionDependencies = 
           if (stale()) throw new Error('Ultra extension reloaded during wave preflight.');
           effective = resolved;
           effectiveRevisionValue = revision;
+          // Reclaim expired durable leases before making a new capacity decision.
+          pool.expireLeases();
           const operationId = dependencies.randomId();
           const poolKind = input.lanes.some((lane) => lane.role === 'worker') ? 'writer' : 'read-only';
           pool.enqueue({ id: operationId, kind: poolKind, objective: input.objective, ownedPaths: input.lanes.flatMap((lane) => lane.ownedPaths ?? []) , ...(input.repairOf ? { repairOf: input.repairOf } : {}) });
